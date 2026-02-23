@@ -46,21 +46,24 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     args = [
-        DeclareLaunchArgument('serial_port',    default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('camera_device',  default_value='/dev/video0',
-                              description='OpenCV camera device path'),
-        DeclareLaunchArgument('ollama_host',    default_value='http://localhost:8080'),
-        DeclareLaunchArgument('ollama_model',   default_value='gemma3:4b'),
-        DeclareLaunchArgument('slam_goal',
-            default_value='explore the bedroom and build a complete map',
-            description='Natural-language goal passed to the Ollama VLM'),
-        DeclareLaunchArgument('move_duration',  default_value='3.0',
-                              description='Seconds per exploration step'),
-        DeclareLaunchArgument('move_speed',     default_value='0.25',
-                              description='Forward speed in m/s'),
-        # Set use_slam:=true only if rtabmap_ros is installed on the image
-        DeclareLaunchArgument('use_slam',       default_value='false',
-                              description='Start RTAB-Map SLAM node (requires ros-iron-rtabmap-ros)'),
+        DeclareLaunchArgument('serial_port',        default_value='/dev/ttyUSB0'),
+        DeclareLaunchArgument('camera_device',       default_value='/dev/video0'),
+        DeclareLaunchArgument('ollama_host',         default_value='http://localhost:11434'),
+        DeclareLaunchArgument('ollama_model',        default_value='gemma3:4b'),
+        # Exploration (ultrasonic-driven)
+        DeclareLaunchArgument('move_speed',          default_value='0.25',
+                              description='Forward speed m/s'),
+        DeclareLaunchArgument('turn_speed',          default_value='0.60',
+                              description='Turn speed rad/s'),
+        DeclareLaunchArgument('obstacle_distance',   default_value='0.55',
+                              description='Turn when ultrasonic reads below this (m)'),
+        DeclareLaunchArgument('turn_duration',       default_value='1.2',
+                              description='Seconds to turn before resuming forward'),
+        DeclareLaunchArgument('label_every',         default_value='5',
+                              description='AI scene label every N obstacle-turns'),
+        # Optional RTAB-Map
+        DeclareLaunchArgument('use_slam',            default_value='false',
+                              description='Start RTAB-Map (requires ros-iron-rtabmap-ros)'),
     ]
 
     # ── URDF / robot_state_publisher ──────────────────────────────────────────
@@ -158,29 +161,32 @@ def generate_launch_description():
         ],
     )
 
-    # ── AI navigator (Ollama VLM) ─────────────────────────────────────────────
+    # ── AI navigator (scene labeller only — no movement control) ──────────────
     ai_navigator = Node(
         package='robot_control',
         executable='ai_navigator',
         name='ai_navigator',
         parameters=[{
-            'ollama_host':         LaunchConfiguration('ollama_host'),
-            'model':               LaunchConfiguration('ollama_model'),
-            'goal':                LaunchConfiguration('slam_goal'),
-            'stabilization_delay': 1.0,
+            'ollama_host':  LaunchConfiguration('ollama_host'),
+            'model':        LaunchConfiguration('ollama_model'),
+            'infer_width':  160,
+            'infer_height': 120,
+            'jpeg_quality': 65,
         }],
         output='screen',
     )
 
-    # ── Exploration controller ────────────────────────────────────────────────
+    # ── Exploration controller (ultrasonic-reactive, pure autonomy) ────────────
     exploration_ctrl = Node(
         package='robot_control',
         executable='exploration_controller',
         name='exploration_controller',
         parameters=[{
-            'move_speed':    LaunchConfiguration('move_speed'),
-            'turn_speed':    0.5,
-            'move_duration': LaunchConfiguration('move_duration'),
+            'move_speed':        LaunchConfiguration('move_speed'),
+            'turn_speed':        LaunchConfiguration('turn_speed'),
+            'obstacle_distance': LaunchConfiguration('obstacle_distance'),
+            'turn_duration':     LaunchConfiguration('turn_duration'),
+            'label_every':       LaunchConfiguration('label_every'),
         }],
         output='screen',
     )

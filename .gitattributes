@@ -1,0 +1,6 @@
+# Force LF line endings on all files so they work correctly on the Jetson (Linux)
+* text=auto eol=lf
+
+# Explicitly binary
+*.pgm binary
+*.db  binary

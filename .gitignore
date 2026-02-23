@@ -1,0 +1,21 @@
+# ROS2 colcon build artifacts (generated inside container, not in repo)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Maps (large binary files — save separately)
+maps/*.db
+maps/*.pgm
+maps/*.yaml
+
+# Docker
+.env
+
+# OS
+.DS_Store
+Thumbs.db

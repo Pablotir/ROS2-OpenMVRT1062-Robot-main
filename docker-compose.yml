@@ -1,0 +1,39 @@
+services:
+  robot:
+    build:
+      context: .
+      dockerfile: ros2.Dockerfile
+      args:
+        - ROS_DISTRO=iron
+    image: ros2_robot_control        # matches your old image name
+    container_name: ros2_robot       # so: docker exec -it ros2_robot bash
+    network_mode: "host"
+    runtime: nvidia
+    stdin_open: true                 # keeps container alive (equiv to docker run -it)
+    tty: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0   # Arduino serial
+      - /dev/video0:/dev/video0      # camera (try index 0 or 1)
+      - /dev/video1:/dev/video1      # camera (try index 0 or 1)
+    volumes:
+      - ./src:/root/ros2_ws/src      # live-reload Python nodes without rebuild
+      - ./maps:/root/maps            # persists saved SLAM maps across container restarts
+    command: ["bash"]
+
+  # Ollama (VLM server for ai_navigator)
+  # Run once to pull the model:  docker compose run --rm ollama ollama pull gemma3:4b
+  ollama:
+    image: ollama/ollama:latest
+    network_mode: "host"
+    runtime: nvidia
+    environment:
+      - OLLAMA_HOST=0.0.0.0:8080
+    volumes:
+      - ollama_models:/root/.ollama
+    profiles: ["ollama"]   # start only when needed: docker compose --profile ollama up
+
+volumes:
+  ollama_models:

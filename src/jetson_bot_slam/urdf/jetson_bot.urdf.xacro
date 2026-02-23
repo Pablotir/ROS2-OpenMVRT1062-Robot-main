@@ -1,0 +1,164 @@
+<?xml version="1.0"?>
+<!--
+  jetson_bot.urdf.xacro
+  =====================
+  Robot description for the mecanum-drive Jetson bot.
+
+  Physical dimensions (18.5 in wide × 13.5 in long, 4 in diameter wheels)
+  -------------------------------------------------------------------------
+  Base length (x) = 0.343 m  (13.5 in)
+  Base width  (y) = 0.470 m  (18.5 in)
+  Base height (z) = 0.080 m  (approx chassis height)
+  Wheel radius    = 0.0508 m (2 in)
+  Wheel thickness = 0.038 m  (1.5 in)
+  Half wheelbase  = 0.127 m  (5.0 in, Lx)
+  Half track      = 0.217 m  (8.55 in, Ly)
+
+  Sensor placement
+  ----------------
+  Camera:     USB camera mounted ~10 cm above base, at front-centre
+  Ultrasonic: HC-SR04 at front-centre, ~5 cm above base
+-->
+<robot name="jetson_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ── Colours ──────────────────────────────────────────────────────────── -->
+  <material name="dark_grey">
+    <color rgba="0.2 0.2 0.2 1"/>
+  </material>
+  <material name="orange">
+    <color rgba="0.9 0.5 0.1 1"/>
+  </material>
+  <material name="blue">
+    <color rgba="0.2 0.5 0.9 1"/>
+  </material>
+  <material name="black">
+    <color rgba="0.05 0.05 0.05 1"/>
+  </material>
+
+  <!-- ── Properties ───────────────────────────────────────────────────────── -->
+  <xacro:property name="base_length"    value="0.343"/>
+  <xacro:property name="base_width"     value="0.470"/>
+  <xacro:property name="base_height"    value="0.080"/>
+  <xacro:property name="wheel_radius"   value="0.0508"/>
+  <xacro:property name="wheel_width"    value="0.038"/>
+  <xacro:property name="half_lx"        value="0.127"/>   <!-- half wheelbase -->
+  <xacro:property name="half_ly"        value="0.217"/>   <!-- half track     -->
+
+  <!-- ── Wheel macro ──────────────────────────────────────────────────────── -->
+  <xacro:macro name="wheel" params="name x y">
+    <link name="${name}_link">
+      <visual>
+        <geometry><cylinder length="${wheel_width}" radius="${wheel_radius}"/></geometry>
+        <material name="black"/>
+      </visual>
+      <collision>
+        <geometry><cylinder length="${wheel_width}" radius="${wheel_radius}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.3"/>
+        <inertia ixx="0.0003" ixy="0" ixz="0"
+                              iyy="0.0003" iyz="0"
+                                          izz="0.0005"/>
+      </inertial>
+    </link>
+
+    <joint name="${name}_joint" type="continuous">
+      <parent link="base_link"/>
+      <child  link="${name}_link"/>
+      <!-- wheels spin around Y axis; translate to corner positions, drop to ground -->
+      <origin xyz="${x} ${y} ${-base_height/2 + wheel_radius}"
+              rpy="${pi/2} 0 0"/>
+      <axis xyz="0 0 1"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- ===================================================================== -->
+  <!-- base_footprint – ground contact frame used by Nav2                    -->
+  <!-- ===================================================================== -->
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius - base_height/2}"/>
+  </joint>
+
+  <!-- ===================================================================== -->
+  <!-- base_link – robot body                                                 -->
+  <!-- ===================================================================== -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="3.0"/>
+      <!-- Solid box inertia approximation -->
+      <inertia
+        ixx="${(3.0/12.0)*(base_width*base_width + base_height*base_height)}"
+        ixy="0" ixz="0"
+        iyy="${(3.0/12.0)*(base_length*base_length + base_height*base_height)}"
+        iyz="0"
+        izz="${(3.0/12.0)*(base_length*base_length + base_width*base_width)}"/>
+    </inertial>
+  </link>
+
+  <!-- ===================================================================== -->
+  <!-- Wheels: FL, FR, BL, BR                                                -->
+  <!-- ===================================================================== -->
+  <xacro:wheel name="wheel_FL" x=" ${half_lx}" y=" ${half_ly}"/>
+  <xacro:wheel name="wheel_FR" x=" ${half_lx}" y="${-half_ly}"/>
+  <xacro:wheel name="wheel_BL" x="${-half_lx}" y=" ${half_ly}"/>
+  <xacro:wheel name="wheel_BR" x="${-half_lx}" y="${-half_ly}"/>
+
+  <!-- ===================================================================== -->
+  <!-- Camera link (USB camera, front-centre, ~10 cm above base top)         -->
+  <!-- ===================================================================== -->
+  <link name="camera_link">
+    <visual>
+      <geometry><box size="0.025 0.090 0.025"/></geometry>
+      <material name="blue"/>
+    </visual>
+  </link>
+
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="camera_link"/>
+    <!-- 14 cm forward, centre-left, 10 cm above base top -->
+    <origin xyz="${base_length/2 - 0.02} 0 ${base_height/2 + 0.10}"
+            rpy="0 0 0"/>
+  </joint>
+
+  <!-- Optical frame: Z forward, X right, Y down (standard for OpenCV / ROS) -->
+  <link name="camera_optical_link"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child  link="camera_optical_link"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+
+  <!-- ===================================================================== -->
+  <!-- Ultrasonic sensor (HC-SR04, front-centre, ~5 cm above base top)       -->
+  <!-- ===================================================================== -->
+  <link name="ultrasonic_link">
+    <visual>
+      <geometry><box size="0.045 0.020 0.015"/></geometry>
+      <material name="orange"/>
+    </visual>
+  </link>
+
+  <joint name="ultrasonic_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="ultrasonic_link"/>
+    <origin xyz="${base_length/2 - 0.01} 0 ${base_height/2 + 0.05}"
+            rpy="0 0 0"/>
+  </joint>
+
+</robot>

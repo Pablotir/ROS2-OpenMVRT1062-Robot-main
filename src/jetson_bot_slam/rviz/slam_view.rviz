@@ -1,0 +1,96 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Displays:
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Under: false
+      Enabled: true
+      Name: Map (RTAB-Map)
+      Topic: /map
+      Update Topic: /map_updates
+    - Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Name: Robot Model
+      Description Topic: /robot_description
+    - Alpha: 1.0
+      Axes Length: 0.3
+      Axes Radius: 0.01
+      Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Keep: 200
+      Name: Odometry
+      Topic: /odom
+      Shape: Arrow
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Camera
+      Topic: /image_raw
+    - Class: rviz_default_plugins/Range
+      Enabled: true
+      Name: Ultrasonic
+      Topic: /ultrasonic_range
+      Color:
+        R: 0.0
+        G: 1.0
+        B: 0.5
+        A: 0.5
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Frontiers
+      Topic: /explore/frontiers
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Global Path
+      Topic: /plan
+      Color:
+        R: 0.0
+        G: 0.7
+        B: 1.0
+        A: 1.0
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Local Path
+      Topic: /local_plan
+      Color:
+        R: 1.0
+        G: 0.5
+        B: 0.0
+        A: 1.0
+    - Alpha: 0.3
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Enabled: true
+      Name: Global Costmap
+      Topic: /global_costmap/costmap
+    - Alpha: 0.3
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Enabled: false
+      Name: Local Costmap
+      Topic: /local_costmap/costmap
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Name: TF (debug)
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: false
+      Name: RTAB-Map Cloud
+      Topic: /rtabmap/mapData
+  Global Options:
+    Background Color:
+      R: 0.05
+      G: 0.05
+      B: 0.05
+    Fixed Frame: map
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Target Frame: base_link
+      Scale: 50
+      Name: Top-Down (map view)

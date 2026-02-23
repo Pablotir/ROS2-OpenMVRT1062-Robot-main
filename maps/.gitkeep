@@ -1,0 +1,2 @@
+# Saved SLAM maps go here (persisted by docker-compose volume mount)
+# Do not delete this folder — it is mounted into /root/maps inside the container

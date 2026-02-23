@@ -30,7 +30,7 @@ class USBCameraNode(Node):
     def __init__(self):
         super().__init__('usb_camera_node')
 
-        self.declare_parameter('device',    '/dev/video1')
+        self.declare_parameter('device',    '/dev/video0')
         self.declare_parameter('width',     320)
         self.declare_parameter('height',    240)
         self.declare_parameter('slam_fps',  5.0)

@@ -38,6 +38,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -46,7 +47,7 @@ def generate_launch_description():
     # ── Launch arguments ──────────────────────────────────────────────────────
     args = [
         DeclareLaunchArgument('serial_port',    default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('camera_device',  default_value='/dev/video1',
+        DeclareLaunchArgument('camera_device',  default_value='/dev/video0',
                               description='OpenCV camera device path'),
         DeclareLaunchArgument('ollama_host',    default_value='http://localhost:8080'),
         DeclareLaunchArgument('ollama_model',   default_value='gemma3:4b'),
@@ -68,7 +69,7 @@ def generate_launch_description():
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
-        parameters=[{'robot_description': Command(['xacro ', urdf_file]),
+        parameters=[{'robot_description': ParameterValue(Command(['xacro ', urdf_file]), value_type=str),
                      'use_sim_time': False}],
     )
 

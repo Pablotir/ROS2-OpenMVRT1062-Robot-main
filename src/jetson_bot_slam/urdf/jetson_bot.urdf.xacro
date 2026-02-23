@@ -5,7 +5,6 @@
   Robot description for the mecanum-drive Jetson bot.
 
   Physical dimensions (18.5 in wide x 13.5 in long, 4 in diameter wheels)
-  -------------------------------------------------------------------------
   Base length (x) = 0.343 m  (13.5 in)
   Base width  (y) = 0.470 m  (18.5 in)
   Base height (z) = 0.080 m  (approx chassis height)
@@ -14,8 +13,7 @@
   Half wheelbase  = 0.127 m  (5.0 in, Lx)
   Half track      = 0.217 m  (8.55 in, Ly)
 
-  Sensor placement
-  ----------------
+  Sensor placement:
   Camera:     USB camera mounted ~10 cm above base, at front-centre
   Ultrasonic: HC-SR04 at front-centre, ~5 cm above base
 -->
@@ -73,7 +71,7 @@
   </xacro:macro>
 
   <!-- ===================================================================== -->
-  <!-- base_footprint – ground contact frame used by Nav2                    -->
+  <!-- base_footprint - ground contact frame used by Nav2                    -->
   <!-- ===================================================================== -->
   <link name="base_footprint"/>
 
@@ -84,7 +82,7 @@
   </joint>
 
   <!-- ===================================================================== -->
-  <!-- base_link – robot body                                                 -->
+  <!-- base_link - robot body                                                 -->
   <!-- ===================================================================== -->
   <link name="base_link">
     <visual>

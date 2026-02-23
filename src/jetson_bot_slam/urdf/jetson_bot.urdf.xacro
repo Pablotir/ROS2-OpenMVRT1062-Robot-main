@@ -4,7 +4,7 @@
   =====================
   Robot description for the mecanum-drive Jetson bot.
 
-  Physical dimensions (18.5 in wide × 13.5 in long, 4 in diameter wheels)
+  Physical dimensions (18.5 in wide x 13.5 in long, 4 in diameter wheels)
   -------------------------------------------------------------------------
   Base length (x) = 0.343 m  (13.5 in)
   Base width  (y) = 0.470 m  (18.5 in)
@@ -21,7 +21,7 @@
 -->
 <robot name="jetson_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- ── Colours ──────────────────────────────────────────────────────────── -->
+  <!-- Colours -->
   <material name="dark_grey">
     <color rgba="0.2 0.2 0.2 1"/>
   </material>
@@ -35,16 +35,16 @@
     <color rgba="0.05 0.05 0.05 1"/>
   </material>
 
-  <!-- ── Properties ───────────────────────────────────────────────────────── -->
+  <!-- Properties -->
   <xacro:property name="base_length"    value="0.343"/>
   <xacro:property name="base_width"     value="0.470"/>
   <xacro:property name="base_height"    value="0.080"/>
   <xacro:property name="wheel_radius"   value="0.0508"/>
   <xacro:property name="wheel_width"    value="0.038"/>
-  <xacro:property name="half_lx"        value="0.127"/>   <!-- half wheelbase -->
-  <xacro:property name="half_ly"        value="0.217"/>   <!-- half track     -->
+  <xacro:property name="half_lx"        value="0.127"/>   <!-- half wheelbase (Lx) -->
+  <xacro:property name="half_ly"        value="0.217"/>   <!-- half track (Ly) -->
 
-  <!-- ── Wheel macro ──────────────────────────────────────────────────────── -->
+  <!-- Wheel macro -->
   <xacro:macro name="wheel" params="name x y">
     <link name="${name}_link">
       <visual>

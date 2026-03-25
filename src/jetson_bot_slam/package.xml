@@ -24,6 +24,7 @@
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>explore_lite</exec_depend>
   <exec_depend>xacro</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

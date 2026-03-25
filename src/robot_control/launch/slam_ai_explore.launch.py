@@ -3,7 +3,7 @@ slam_ai_explore.launch.py
 ==========================
 Integrated launch: SLAM + AI-guided exploration.
 Combines jetson_bot_slam (hardware + RTAB-Map) with robot_control (AI navigator).
-
+ChangedV3
 Data flow
 ---------
 USB camera → usb_camera_node ──► /image_raw  ──► RTAB-Map (SLAM)
@@ -51,14 +51,22 @@ def generate_launch_description():
         DeclareLaunchArgument('ollama_host',         default_value='http://localhost:11434'),
         DeclareLaunchArgument('ollama_model',        default_value='gemma3:4b'),
         # Exploration (ultrasonic-driven)
-        DeclareLaunchArgument('move_speed',          default_value='0.25',
+        DeclareLaunchArgument('move_speed',          default_value='0.20',
                               description='Forward speed m/s'),
-        DeclareLaunchArgument('turn_speed',          default_value='0.60',
+        DeclareLaunchArgument('turn_speed',          default_value='0.55',
                               description='Turn speed rad/s'),
-        DeclareLaunchArgument('obstacle_distance',   default_value='0.55',
-                              description='Turn when ultrasonic reads below this (m)'),
-        DeclareLaunchArgument('turn_duration',       default_value='1.2',
-                              description='Seconds to turn before resuming forward'),
+        DeclareLaunchArgument('obstacle_distance',   default_value='1.00',
+                              description='Start backing when ultrasonic reads below this (m)'),
+        DeclareLaunchArgument('emergency_stop_dist', default_value='0.10',
+                              description='Enter emergency reverse below this (m)'),
+        DeclareLaunchArgument('backup_clear_dist',   default_value='0.30',
+                              description='Reverse until this distance in emergency (m)'),
+        DeclareLaunchArgument('backup_s',            default_value='2.0',
+                              description='Reverse duration before turning in seconds (~50cm at 0.20 m/s)'),
+        DeclareLaunchArgument('min_turn_s',          default_value='3.0',
+                              description='Minimum seconds to turn before checking clear (~90 deg at 0.55 rad/s)'),
+        DeclareLaunchArgument('max_turn_s',          default_value='10.0',
+                              description='Switch to right turn if still blocked after this many seconds'),
         DeclareLaunchArgument('label_every',         default_value='5',
                               description='AI scene label every N obstacle-turns'),
         # Optional RTAB-Map
@@ -182,11 +190,15 @@ def generate_launch_description():
         executable='exploration_controller',
         name='exploration_controller',
         parameters=[{
-            'move_speed':        LaunchConfiguration('move_speed'),
-            'turn_speed':        LaunchConfiguration('turn_speed'),
-            'obstacle_distance': LaunchConfiguration('obstacle_distance'),
-            'turn_duration':     LaunchConfiguration('turn_duration'),
-            'label_every':       LaunchConfiguration('label_every'),
+            'move_speed':           LaunchConfiguration('move_speed'),
+            'turn_speed':           LaunchConfiguration('turn_speed'),
+            'obstacle_distance':    LaunchConfiguration('obstacle_distance'),
+            'emergency_stop_dist':  LaunchConfiguration('emergency_stop_dist'),
+            'backup_clear_dist':    LaunchConfiguration('backup_clear_dist'),
+            'backup_s':             LaunchConfiguration('backup_s'),
+            'min_turn_s':           LaunchConfiguration('min_turn_s'),
+            'max_turn_s':           LaunchConfiguration('max_turn_s'),
+            'label_every':          LaunchConfiguration('label_every'),
         }],
         output='screen',
     )

@@ -1,0 +1,39 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# VILA 2.7B AI Navigator — ROS2 Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+# Used by vila_scene_labeller node for both exploration guidance and map labels.
+# Override at launch:  ros2 launch ... vila_model:=<other-model>
+
+vila_scene_labeller:
+  ros__parameters:
+    # ── Model ──────────────────────────────────────────────────────────────
+    # VILA 2.7B (4-bit AWQ) — ~1.8-2 GB GPU RAM on Jetson
+    model_name:     "Efficient-Large-Model/VILA-2.7b"
+    api:            "awq"            # AWQ quantisation backend
+    quantization:   "q4f16_ft"       # 4-bit float16 fine-tuned
+
+    # ── Inference image size ───────────────────────────────────────────────
+    # The 720p (1280x720) camera feed is resized to this before sending
+    # to VILA. 384x384 is VILA's native resolution. Smaller = faster.
+    infer_width:    384
+    infer_height:   384
+
+    # ── Generation control ─────────────────────────────────────────────────
+    max_new_tokens: 64               # enough for DIRECTION + LABEL + REASON
+
+    # ── Prompt ─────────────────────────────────────────────────────────────
+    # The AI determines: (1) best direction to explore, (2) scene label.
+    # Ultrasonic sensor on the Arduino handles collision avoidance separately.
+    prompt: >-
+      You are a navigation assistant for a robot exploring a room and
+      building a map. Look at this image and answer in EXACTLY this format:
+      DIRECTION: [forward|left|right|stop]
+      LABEL: [short scene description, 5 words max]
+      REASON: [one short sentence]
+
+      Choose "forward" if the path ahead is clear (>1 meter of open space).
+      Choose "left" or "right" to explore unexplored areas or avoid obstacles
+      like walls, furniture, or clutter.
+      Choose "stop" only if something dangerous is directly in front.
+      For LABEL, describe the area (e.g. "near desk", "open floor", "doorway",
+      "corner by wardrobe").

@@ -1,39 +1,57 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Jetson Bot — Docker Compose (VILA 2.7B via nano_llm)
+# ──────────────────────────────────────────────────────────────────────────────
+# Replaces the old ros2:iron + Ollama setup with dustynv/nano_llm:humble
+# which bundles ROS2 Humble + nano_llm + CUDA/TensorRT/cuDNN.
+#
+# Usage (on Jetson):
+#   docker compose down                     # stop old containers
+#   docker compose up -d                    # start nano_llm container
+#   docker exec -it jetson_bot_vila bash    # enter the container
+#
+# First-time setup (inside container):
+#   bash /root/ros2_ws/src/jetson_bot_slam/setup_vila.sh
+#   OR: bash /root/ros2_ws/setup_vila.sh  (if mounted at root)
+
 services:
   robot:
-    build:
-      context: .
-      dockerfile: ros2.Dockerfile
-      args:
-        - ROS_DISTRO=iron
-    image: ros2_robot_control        # matches your old image name
-    container_name: ros2_robot       # so: docker exec -it ros2_robot bash
+    # dustynv/nano_llm:humble includes ROS2 Humble + nano_llm + CUDA
+    # For JetPack 6 (L4T R36.x), use the r36 tag.
+    # Check available tags: https://hub.docker.com/r/dustynv/nano_llm/tags
+    image: dustynv/nano_llm:humble-r36.3.0
+    container_name: jetson_bot_vila
     network_mode: "host"
     runtime: nvidia
-    stdin_open: true                 # keeps container alive (equiv to docker run -it)
+    stdin_open: true
     tty: true
     environment:
       - DISPLAY=${DISPLAY}
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     devices:
-      - /dev/ttyUSB0:/dev/ttyUSB0   # Arduino serial
-      - /dev/video0:/dev/video0      # camera (try index 0 or 1)
-      - /dev/video1:/dev/video1      # camera (try index 0 or 1)
+      - /dev/ttyUSB0:/dev/ttyUSB0   # Arduino Mega (serial)
+      - /dev/video0:/dev/video0      # USB camera
+      - /dev/video1:/dev/video1      # USB camera (alternate index)
     volumes:
-      - ./src:/root/ros2_ws/src      # live-reload Python nodes without rebuild
-      - ./maps:/root/maps            # persists saved SLAM maps across container restarts
+      - ./src:/root/ros2_ws/src           # live-reload Python nodes
+      - ./maps:/root/maps                 # persisted SLAM maps
+      - ./logs:/root/ros2_ws/logs         # AI decision logs + captured frames
+      - ./setup_vila.sh:/root/ros2_ws/setup_vila.sh  # setup script
+      - nano_llm_models:/root/.cache      # persist downloaded VILA model
     command: ["bash"]
 
-  # Ollama (VLM server for ai_navigator)
-  # Run once to pull the model:  docker compose run --rm ollama ollama pull gemma3:4b
-  ollama:
-    image: ollama/ollama:latest
-    network_mode: "host"
-    runtime: nvidia
-    environment:
-      - OLLAMA_HOST=0.0.0.0:8080
-    volumes:
-      - ollama_models:/root/.ollama
-    profiles: ["ollama"]   # start only when needed: docker compose --profile ollama up
+  # NOTE: Ollama is no longer needed — VILA runs natively via nano_llm
+  # inside the robot container above. Keeping this commented for reference.
+  #
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   network_mode: "host"
+  #   runtime: nvidia
+  #   environment:
+  #     - OLLAMA_HOST=0.0.0.0:8080
+  #   volumes:
+  #     - ollama_models:/root/.ollama
+  #   profiles: ["ollama"]
 
 volumes:
-  ollama_models:
+  nano_llm_models:
+    # Named volume so VILA model weights survive container restarts

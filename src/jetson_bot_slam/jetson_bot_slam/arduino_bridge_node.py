@@ -77,8 +77,23 @@ class ArduinoBridgeNode(Node):
             target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
+        self._lines_received  = 0   # total lines from Arduino
+        self._data_parsed     = 0   # lines that matched DATA format
+        self._range_published = 0   # Range msgs published
+
+        # 5-second diagnostic timer
+        self.create_timer(5.0, self._diag_log)
+
         self.get_logger().info(
             f'arduino_bridge ready on {port} @ {baud} baud')
+
+    def _diag_log(self):
+        """Every 5 s: log serial pipeline counts so you can spot exactly where data stops."""
+        self.get_logger().info(
+            f'[BRIDGE DIAG] lines_from_arduino={self._lines_received}  '
+            f'data_parsed={self._data_parsed}  '
+            f'range_published={self._range_published}  '
+            f'serial_open={self._ser is not None and self._ser.is_open}')
 
     # ── Serial helpers ────────────────────────────────────────────────────────
 
@@ -116,6 +131,8 @@ class ArduinoBridgeNode(Node):
             if not text:
                 continue
 
+            self._lines_received += 1
+
             # Publish raw line for debugging
             raw = String()
             raw.data = text
@@ -132,6 +149,7 @@ class ArduinoBridgeNode(Node):
         """
         parts = text.split()
         if len(parts) < 6:
+            self.get_logger().warn(f'DATA line too short ({len(parts)} fields): "{text}"')
             return
         try:
             pos1 = int(parts[1])    # BL
@@ -139,8 +157,11 @@ class ArduinoBridgeNode(Node):
             pos3 = int(parts[3])    # FL
             pos4 = int(parts[4])    # FR
             dist = float(parts[5])  # metres
-        except ValueError:
+        except ValueError as e:
+            self.get_logger().warn(f'DATA parse error: {e} — line was: "{text}"')
             return
+
+        self._data_parsed += 1
 
         # --- Wheel ticks [BL, BR, FL, FR] ---
         ticks_msg = Int32MultiArray()
@@ -157,6 +178,12 @@ class ArduinoBridgeNode(Node):
         rng.max_range       = self._dmax
         rng.range           = dist
         self._range_pub.publish(rng)
+        self._range_published += 1
+        if self._range_published <= 5 or self._range_published % 30 == 0:
+            # Log the first 5 publishes + every 30th (every ~10 s) to confirm flow
+            self.get_logger().info(
+                f'[BRIDGE] Range published #{self._range_published}: '
+                f'{dist:.3f} m  topic=/ultrasonic_range')
 
     # ── Command subscriber ────────────────────────────────────────────────────
 

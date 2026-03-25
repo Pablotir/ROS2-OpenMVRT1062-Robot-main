@@ -14,4 +14,3 @@ export PYTHONPATH=/opt/ros/iron/lib/python3.10/site-packages:$PYTHONPATH
 
 # Execute command
 exec "$@"
-

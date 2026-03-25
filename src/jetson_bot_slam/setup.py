@@ -28,6 +28,7 @@ setup(
             'arduino_bridge   = jetson_bot_slam.arduino_bridge_node:main',
             'mecanum_odometry = jetson_bot_slam.mecanum_odometry_node:main',
             'motor_driver     = jetson_bot_slam.motor_driver_node:main',
+            'vila_scene_labeller = jetson_bot_slam.vila_scene_labeller_node:main',
         ],
     },
 )

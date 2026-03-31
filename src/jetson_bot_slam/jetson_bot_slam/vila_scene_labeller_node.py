@@ -297,7 +297,7 @@ class VilaSceneLabeller(Node):
             self._model = NanoLLM.from_pretrained(
                 self.model_name,
                 api=self.api,
-                quantization=self.quantization,
+                quantization=self.model_name,
             )
             elapsed = time.time() - t0
             self._model_ready = True

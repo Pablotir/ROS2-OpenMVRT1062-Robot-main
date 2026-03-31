@@ -266,24 +266,20 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_nav2')),
     )
 
-    # ── explore_lite (frontier-based auto-exploration via Nav2) ───────────
-    explore_lite = Node(
-        package='explore_lite',
-        executable='explore',
-        name='explore',
+    # ── Frontier explorer (Python-native, no C++ build needed) ────────────
+    frontier_explorer = Node(
+        package='robot_control',
+        executable='frontier_explorer',
+        name='frontier_explorer',
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_nav2')),
         parameters=[{
-            'robot_base_frame':      'base_link',
-            'costmap_topic':         '/global_costmap/costmap',
-            'costmap_updates_topic': '/global_costmap/costmap_updates',
-            'visualize':             True,
-            'planner_frequency':     0.33,     # re-plan every ~3 s
-            'progress_timeout':      30.0,     # give up on a frontier after 30 s
-            'potential_scale':       3.0,
-            'gain_scale':            1.0,
-            'transform_tolerance':   0.3,
-            'min_frontier_size':     0.75,     # ignore tiny frontiers < 75 cm
+            'robot_base_frame':    'base_link',
+            'planner_frequency':   0.33,
+            'progress_timeout':    30.0,
+            'potential_scale':     3.0,
+            'gain_scale':          1.0,
+            'min_frontier_size':   0.75,
         }],
     )
 
@@ -328,7 +324,7 @@ def generate_launch_description():
         rtabmap,          # LiDAR SLAM (on by default)
         vila_labeller,
         nav2,             # Nav2 path planning (on by default)
-        explore_lite,     # Frontier exploration  (on by default)
-        exploration_ctrl,  # Reactive fallback (only when use_nav2:=false)
+        frontier_explorer,  # Python frontier exploration (on by default)
+        exploration_ctrl,   # Reactive fallback (only when use_nav2:=false)
         rviz,
     ])

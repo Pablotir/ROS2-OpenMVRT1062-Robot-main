@@ -27,6 +27,7 @@ setup(
             'usb_camera_node         = robot_control.usb_camera_node:main',
             'ai_navigator            = robot_control.ai_navigator:main',
             'exploration_controller  = robot_control.exploration_controller:main',
+            'frontier_explorer       = robot_control.frontier_explorer:main',
             'llm_planner             = robot_control.llm_planner:main',
         ],
     },

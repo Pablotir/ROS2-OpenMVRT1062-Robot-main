@@ -44,12 +44,6 @@ echo ""
 echo "▸ Setting up external packages..."
 cd /root/ros2_ws/src
 
-# explore_lite (build from source — not in apt for Humble)
-if [ ! -d "m-explore-ros2" ]; then
-    echo "  Cloning explore_lite..."
-    git clone https://github.com/robo-friends/m-explore-ros2.git
-fi
-
 # STL-27L LiDAR driver
 if [ ! -d "ldlidar_stl_ros2" ]; then
     echo "  Cloning ldlidar_stl_ros2..."
@@ -78,7 +72,6 @@ source /opt/ros/install/setup.bash
 colcon build --symlink-install \
     --packages-select \
     ldlidar_stl_ros2 \
-    explore_lite_msgs explore_lite \
     robot_control jetson_bot_slam
 
 source install/setup.bash

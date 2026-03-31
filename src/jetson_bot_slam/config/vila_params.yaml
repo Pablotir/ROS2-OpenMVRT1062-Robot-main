@@ -9,7 +9,7 @@ vila_scene_labeller:
     # ── Model ──────────────────────────────────────────────────────────────
     # VILA 2.7B (4-bit AWQ) — ~1.8-2 GB GPU RAM on Jetson
     model_name:     "Efficient-Large-Model/VILA-2.7b"
-    api:            "awq"            # AWQ quantisation backend
+    api:            "mlc"            # Default Jetson MLC backend
     quantization:   "q4f16_ft"       # 4-bit float16 fine-tuned
 
     # ── Inference image size ───────────────────────────────────────────────

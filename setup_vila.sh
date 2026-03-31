@@ -94,7 +94,7 @@ echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
 python3 -c "
 from nano_llm import NanoLLM
 print('Downloading VILA 2.7B...')
-model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='awq')
+model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='mlc')
 print('Model downloaded and ready!')
 del model
 " 2>&1 || echo "⚠  Model download skipped (will download on first inference)"

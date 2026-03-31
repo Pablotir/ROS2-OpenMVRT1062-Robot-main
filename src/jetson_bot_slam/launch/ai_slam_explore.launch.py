@@ -188,7 +188,7 @@ def generate_launch_description():
     # ── Image format converter (yuv422 → rgb8) ───────────────────────────
     image_convert = Node(
         package='image_proc',
-        executable='convert_node',
+        executable='rectify_node',
         name='image_convert',
         remappings=[
             ('image_raw',        '/image_raw'),

@@ -27,8 +27,10 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    user: "1000:1000"    # write files as pablo (not root) so maps/logs are accessible on host
     devices:
       - /dev/ttyUSB0:/dev/ttyUSB0   # Arduino Mega (serial)
+      - /dev/ttyUSB1:/dev/ttyUSB1   # STL-27L LiDAR (UART)
       - /dev/video0:/dev/video0      # USB camera
       - /dev/video1:/dev/video1      # USB camera (alternate index)
     volumes:

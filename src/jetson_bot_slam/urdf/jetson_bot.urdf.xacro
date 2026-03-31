@@ -4,18 +4,20 @@
   =====================
   Robot description for the mecanum-drive Jetson bot.
 
-  Physical dimensions (18.5 in wide x 13.5 in long, 4 in diameter wheels)
+  Physical dimensions (18.5 in wide x 13.5 in long, 13 in tall without LiDAR)
   Base length (x) = 0.343 m  (13.5 in)
   Base width  (y) = 0.470 m  (18.5 in)
-  Base height (z) = 0.080 m  (approx chassis height)
+  Base height (z) = 0.080 m  (approx chassis plate height)
   Wheel radius    = 0.0508 m (2 in)
   Wheel thickness = 0.038 m  (1.5 in)
   Half wheelbase  = 0.127 m  (5.0 in, Lx)
   Half track      = 0.217 m  (8.55 in, Ly)
+  Total height    = 0.330 m  (13 in, without LiDAR)
 
   Sensor placement:
   Camera:     USB camera mounted ~10 cm above base, at front-centre
-  Ultrasonic: HC-SR04 at front-centre, ~5 cm above base
+  LiDAR:      LDROBOT STL-27L, rear-right corner, 3.5 cm above chassis top
+  Ultrasonic: HC-SR04 rear-centre, facing backward, ~5 cm above base top
 -->
 <robot name="jetson_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
@@ -32,6 +34,9 @@
   <material name="black">
     <color rgba="0.05 0.05 0.05 1"/>
   </material>
+  <material name="green">
+    <color rgba="0.1 0.8 0.2 1"/>
+  </material>
 
   <!-- Properties -->
   <xacro:property name="base_length"    value="0.343"/>
@@ -41,6 +46,7 @@
   <xacro:property name="wheel_width"    value="0.038"/>
   <xacro:property name="half_lx"        value="0.127"/>   <!-- half wheelbase (Lx) -->
   <xacro:property name="half_ly"        value="0.217"/>   <!-- half track (Ly) -->
+  <xacro:property name="lidar_height"   value="0.035"/>   <!-- 1.37 in above top plate -->
 
   <!-- Wheel macro -->
   <xacro:macro name="wheel" params="name x y">
@@ -143,7 +149,33 @@
   </joint>
 
   <!-- ===================================================================== -->
-  <!-- Ultrasonic sensor (HC-SR04, front-centre, ~5 cm above base top)       -->
+  <!-- LiDAR — LDROBOT STL-27L, rear-right corner, 3.5 cm above top plate   -->
+  <!-- ===================================================================== -->
+  <link name="lidar_link">
+    <visual>
+      <geometry><cylinder length="0.035" radius="0.035"/></geometry>
+      <material name="green"/>
+    </visual>
+  </link>
+
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="lidar_link"/>
+    <!-- Rear-right: -X (rear), -Y (right), above top plate -->
+    <origin xyz="${-base_length/2 + 0.06} ${-base_width/2 + 0.06} ${base_height/2 + lidar_height/2}"
+            rpy="0 0 0"/>
+  </joint>
+
+  <!-- laser_frame: the actual scan plane (required by ldlidar_stl_ros2) -->
+  <link name="laser_frame"/>
+  <joint name="laser_frame_joint" type="fixed">
+    <parent link="lidar_link"/>
+    <child  link="laser_frame"/>
+    <origin xyz="0 0 ${lidar_height/2}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ===================================================================== -->
+  <!-- Ultrasonic sensor (HC-SR04, REAR-centre, facing backward)             -->
   <!-- ===================================================================== -->
   <link name="ultrasonic_link">
     <visual>
@@ -155,8 +187,9 @@
   <joint name="ultrasonic_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="ultrasonic_link"/>
-    <origin xyz="${base_length/2 - 0.01} 0 ${base_height/2 + 0.05}"
-            rpy="0 0 0"/>
+    <!-- Rear-centre facing backward (rotated 180° around Z) -->
+    <origin xyz="${-base_length/2 + 0.01} 0 ${base_height/2 + 0.05}"
+            rpy="0 0 ${pi}"/>
   </joint>
 
 </robot>

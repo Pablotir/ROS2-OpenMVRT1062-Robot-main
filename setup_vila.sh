@@ -8,7 +8,7 @@
 set -e
 
 echo "══════════════════════════════════════════════════════════════"
-echo "  Jetson Bot SLAM + VILA 2.7B — First-Time Setup"
+echo "  Jetson Bot SLAM + VILA 2.7B + STL-27L LiDAR — First-Time Setup"
 echo "══════════════════════════════════════════════════════════════"
 
 # ── 0. Fix expired ROS2 GPG key ──────────────────────────────────────────────
@@ -20,8 +20,6 @@ curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
 echo "  ✔ GPG key refreshed"
 
 # ── 1. Install ROS2 Humble packages from apt ─────────────────────────────────
-# These install to /opt/ros/humble/ alongside the container's source-built
-# ROS2 core at /opt/ros/install/. Both must be sourced at runtime.
 echo ""
 echo "▸ Installing ROS2 Humble packages..."
 apt-get update && apt-get install -y --no-install-recommends \
@@ -35,30 +33,42 @@ apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-tf2-geometry-msgs \
     ros-humble-cv-bridge \
     ros-humble-vision-opencv \
+    ros-humble-image-proc \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Fix any dpkg conflicts (container's opencv-dev 4.8.1 vs apt's 4.5.4 headers)
 dpkg --configure -a --force-overwrite 2>/dev/null || true
 
-# explore_lite (build from source — not in apt for Humble)
+# ── 2. Clone external packages ───────────────────────────────────────────────
 echo ""
-echo "▸ Setting up explore_lite..."
+echo "▸ Setting up external packages..."
 cd /root/ros2_ws/src
+
+# explore_lite (build from source — not in apt for Humble)
 if [ ! -d "m-explore-ros2" ]; then
+    echo "  Cloning explore_lite..."
     git clone https://github.com/robo-friends/m-explore-ros2.git
 fi
 
-# ── 2. Python dependencies ───────────────────────────────────────────────────
-# Use -i to bypass the container's broken jetson.webredirect.org pip index
+# STL-27L LiDAR driver
+if [ ! -d "ldlidar_stl_ros2" ]; then
+    echo "  Cloning ldlidar_stl_ros2..."
+    git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git
+fi
+
+# ── 3. Serial port permissions for LiDAR ─────────────────────────────────────
+echo ""
+echo "▸ Setting serial port permissions..."
+chmod 777 /dev/ttyUSB0 2>/dev/null || echo "  ⚠ /dev/ttyUSB0 not found (Arduino)"
+chmod 777 /dev/ttyUSB1 2>/dev/null || echo "  ⚠ /dev/ttyUSB1 not found (LiDAR)"
+
+# ── 4. Python dependencies ───────────────────────────────────────────────────
 echo ""
 echo "▸ Installing Python dependencies..."
 pip3 install --no-cache-dir -i https://pypi.org/simple/ \
     pyserial pillow "numpy<2,>=1.26" opencv-python-headless
 
-# ── 3. Build the workspace ───────────────────────────────────────────────────
-# Source BOTH ROS2 installations:
-#   /opt/ros/humble/       — apt-installed packages (Nav2, RTAB-Map, etc.)
-#   /opt/ros/install/      — container's source-built ROS2 core
+# ── 5. Build the workspace ───────────────────────────────────────────────────
 echo ""
 echo "▸ Building ROS2 workspace..."
 cd /root/ros2_ws
@@ -66,11 +76,14 @@ source /opt/ros/humble/setup.bash
 source /opt/ros/install/setup.bash
 
 colcon build --symlink-install \
-    --packages-select explore_lite_msgs explore_lite robot_control jetson_bot_slam
+    --packages-select \
+    ldlidar_stl_ros2 \
+    explore_lite_msgs explore_lite \
+    robot_control jetson_bot_slam
 
 source install/setup.bash
 
-# ── 4. Write a convenience source script ─────────────────────────────────────
+# ── 6. Write a convenience source script ─────────────────────────────────────
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
 # Source all three ROS2 layers in the correct order
@@ -82,7 +95,7 @@ EOF
 chmod +x /root/ros2_ws/source_all.bash
 echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc
 
-# ── 5. Pre-download VILA model (optional) ────────────────────────────────────
+# ── 7. Pre-download VILA model (optional) ────────────────────────────────────
 echo ""
 echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
 python3 -c "

@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>
     SLAM and autonomous exploration for a mecanum-drive Jetson robot.
-    Uses RTAB-Map (monocular + wheel odometry), Nav2, and explore_lite.
+    Uses RTAB-Map (LiDAR SLAM), Nav2 (path planning), and a Python frontier explorer.
   </description>
   <maintainer email="robot@example.com">Pablo</maintainer>
   <license>MIT</license>
@@ -22,7 +22,6 @@
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>rtabmap_ros</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
-  <exec_depend>explore_lite</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
 

@@ -2,7 +2,7 @@
 set -e
 
 # Source ROS2
-source /opt/ros/iron/setup.bash
+source /opt/ros/humble/setup.bash
 
 # Source workspace if exists
 if [ -f /root/ros2_ws/install/setup.bash ]; then
@@ -10,7 +10,7 @@ if [ -f /root/ros2_ws/install/setup.bash ]; then
 fi
 
 # Export PYTHONPATH so cv_bridge is found
-export PYTHONPATH=/opt/ros/iron/lib/python3.10/site-packages:$PYTHONPATH
+export PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:$PYTHONPATH
 
 # Execute command
 exec "$@"

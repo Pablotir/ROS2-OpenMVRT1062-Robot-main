@@ -31,7 +31,7 @@ Requires
 Parameters
 ----------
   planner_frequency   float   0.33    Hz — how often to re-evaluate frontiers
-  min_frontier_size   float   0.75    m  — ignore frontiers smaller than this
+  min_frontier_size   float   0.30    m  — ignore frontiers smaller than this
   potential_scale     float   3.0        — cost weight for distance
   gain_scale          float   1.0        — gain weight for frontier size
   robot_base_frame    str     base_link
@@ -63,7 +63,7 @@ class FrontierExplorer(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('planner_frequency',   0.33)
-        self.declare_parameter('min_frontier_size',   0.75)
+        self.declare_parameter('min_frontier_size',   0.30)
         self.declare_parameter('potential_scale',     3.0)
         self.declare_parameter('gain_scale',          1.0)
         self.declare_parameter('robot_base_frame',    'base_link')
@@ -87,6 +87,7 @@ class FrontierExplorer(Node):
         self._enabled = True
         self._start_time = time.monotonic()
         self._nav2_ready = False
+        self._no_frontier_count = 0       # consecutive empty checks
 
         # Blacklist recently-failed goals so we don't retry the same spot
         self._blacklist: list[tuple[float, float]] = []
@@ -97,7 +98,8 @@ class FrontierExplorer(Node):
 
         # ── Map subscriber (transient_local so we get the last published map) ─
         map_qos = QoSProfile(
-            reliability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -166,10 +168,13 @@ class FrontierExplorer(Node):
 
         frontiers = self._find_frontiers()
         if not frontiers:
-            self.get_logger().info(
-                'No frontiers found — exploration complete!')
-            self._enabled = False
+            self._no_frontier_count += 1
+            if self._no_frontier_count % 10 == 1:
+                self.get_logger().info(
+                    f'No frontiers found (check #{self._no_frontier_count}) — '
+                    'waiting for map to grow...')
             return
+        self._no_frontier_count = 0
 
         best = self._select_best_frontier(frontiers)
         if best is None:

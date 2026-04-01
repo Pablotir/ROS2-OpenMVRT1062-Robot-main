@@ -125,12 +125,12 @@ controller_server:
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       # ── Critic weights ──
       # BaseObstacle MUST be high so the planner avoids walls!
-      BaseObstacle.scale: 0.10
+      BaseObstacle.scale: 64.0
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
       GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
+      PathDist.scale: 16.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
@@ -217,7 +217,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5       # gentler falloff keeps robot further from walls
-        inflation_radius: 0.25         # 25 cm — tight enough to fit through doorways
+        inflation_radius: 0.55         # 55 cm — creates a cost 'valley' in doorways
       always_send_full_costmap: true
 
 # ── Global costmap ─────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5
-        inflation_radius: 0.25
+        inflation_radius: 0.55
       always_send_full_costmap: true
 
 map_server:

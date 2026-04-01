@@ -6,8 +6,10 @@
 #   - DWB local planner  (supports holonomic / omnidirectional robots)
 #   - NavFn global planner
 #   - AMCL disabled – we use RTAB-Map for localisation (provides map→odom TF)
-#   - Costmap obstacle layer uses /ultrasonic_range (HC-SR04)
-#     and /scan if a lidar is added later.
+#   - Costmap obstacle layer uses /scan (LiDAR) and /ultrasonic_range (HC-SR04)
+#
+# Robot dimensions: 47 cm wide × 34.3 cm long (rectangular footprint)
+# LiDAR: mounted rear-right corner, 11 cm from rear, 17.5 cm from right edge
 
 amcl:
   ros__parameters:
@@ -78,47 +80,52 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.3
+      movement_time_allowance: 15.0
 
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25        # 25 cm tolerance
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.30        # 30 cm tolerance (generous for exploration)
+      yaw_goal_tolerance: 0.50       # ~29 degrees (don't care about heading for exploration)
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: false
-      min_vel_x: -0.3
-      min_vel_y: -0.3               # mecanum can strafe
-      max_vel_x:  0.4
-      max_vel_y:  0.3               # limit strafe speed
-      max_vel_theta: 0.8            # rad/s
+      # ── Velocity limits (conservative for indoor) ──
+      min_vel_x: -0.15
+      min_vel_y: -0.15              # mecanum can strafe
+      max_vel_x:  0.22              # ~0.2 m/s max forward (SAFE for indoor)
+      max_vel_y:  0.15              # limit strafe speed
+      max_vel_theta: 0.6            # rad/s
       min_speed_xy:  0.0
-      max_speed_xy:  0.4
+      max_speed_xy:  0.22
       min_speed_theta: 0.0
-      acc_lim_x:  0.5
-      acc_lim_y:  0.5
-      acc_lim_theta: 1.0
-      decel_lim_x: -0.5
-      decel_lim_y: -0.5
-      decel_lim_theta: -1.0
+      # ── Acceleration limits ──
+      acc_lim_x:  0.3
+      acc_lim_y:  0.3
+      acc_lim_theta: 0.8
+      decel_lim_x: -0.3
+      decel_lim_y: -0.3
+      decel_lim_theta: -0.8
+      # ── Trajectory sampling ──
       vx_samples: 20
       vy_samples: 10
       vtheta_samples: 20
-      sim_time: 1.5
+      sim_time: 2.0                 # look 2s ahead for obstacle avoidance
       linear_granularity: 0.05
       angular_granularity: 0.025
-      transform_tolerance: 0.2
-      xy_goal_tolerance: 0.25
+      transform_tolerance: 1.0     # HIGH — the Jetson has TF jitter
+      xy_goal_tolerance: 0.30
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
       critics:
         ["RotateToGoal", "Oscillation", "BaseObstacle",
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      # ── Critic weights ──
+      # BaseObstacle MUST be high so the planner avoids walls!
+      BaseObstacle.scale: 0.10
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -154,14 +161,16 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     global_frame: odom
     robot_base_frame: base_link
-    transform_tolerance: 0.1
+    transform_tolerance: 1.0
     use_sim_time: false
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.8
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 1.0
+    max_rotational_vel: 0.6
+    min_rotational_vel: 0.3
+    rotational_acc_lim: 0.8
 
 # ── Local costmap ──────────────────────────────────────────────────────────────
+# CRITICAL: Uses rectangular footprint matching the actual robot chassis.
+# transform_tolerance raised to 1.0 s to prevent LiDAR message drops.
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -171,10 +180,15 @@ local_costmap:
       robot_base_frame: base_link
       use_sim_time: false
       rolling_window: true
-      width: 4            # 4 m × 4 m window (enough for bedroom navigation)
+      width: 4            # 4 m × 4 m window
       height: 4
       resolution: 0.05
-      robot_radius: 0.28  # half-diagonal of 47cm × 34cm = ~29cm, rounded up
+      transform_tolerance: 1.0    # HIGH — prevents LiDAR scan drops
+
+      # Rectangular footprint: 47 cm wide × 34.3 cm long (with 3 cm padding)
+      # Coordinates are [x, y] corners relative to base_link centre
+      footprint: "[[-0.20, -0.26], [-0.20, 0.26], [0.20, 0.26], [0.20, -0.26]]"
+
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -186,9 +200,9 @@ local_costmap:
           clearing: true
           marking: true
           data_type: "LaserScan"
-          obstacle_max_range: 12.0
-          obstacle_min_range: 0.05
-          raytrace_max_range: 12.5
+          obstacle_max_range: 5.0       # reduced from 12 — only trust nearby readings
+          obstacle_min_range: 0.10      # ignore points inside the robot body
+          raytrace_max_range: 5.5
           raytrace_min_range: 0.0
         ultrasonic:
           topic: /ultrasonic_range
@@ -202,8 +216,8 @@ local_costmap:
           raytrace_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.45    # slightly larger than robot radius
+        cost_scaling_factor: 2.5       # gentler falloff keeps robot further from walls
+        inflation_radius: 0.55         # inflate obstacles 55 cm (generous buffer)
       always_send_full_costmap: true
 
 # ── Global costmap ─────────────────────────────────────────────────────────────
@@ -215,9 +229,13 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
-      robot_radius: 0.28
       resolution: 0.05
+      transform_tolerance: 1.0
       track_unknown_space: true
+
+      # Same rectangular footprint as local costmap
+      footprint: "[[-0.20, -0.26], [-0.20, 0.26], [0.20, 0.26], [0.20, -0.26]]"
+
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -232,9 +250,9 @@ global_costmap:
           clearing: true
           marking: true
           data_type: "LaserScan"
-          obstacle_max_range: 12.0
-          obstacle_min_range: 0.05
-          raytrace_max_range: 12.5
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.10
+          raytrace_max_range: 5.5
           raytrace_min_range: 0.0
         ultrasonic:
           topic: /ultrasonic_range
@@ -246,8 +264,8 @@ global_costmap:
           raytrace_max_range: 3.8
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.45
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.55
       always_send_full_costmap: true
 
 map_server:

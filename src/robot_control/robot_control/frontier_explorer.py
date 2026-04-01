@@ -36,6 +36,7 @@ Parameters
   gain_scale          float   1.0        — gain weight for frontier size
   robot_base_frame    str     base_link
   progress_timeout    float   30.0    s  — cancel goal if no progress after this
+  startup_delay       float   15.0    s  — wait for Nav2 to fully boot before sending
 """
 
 import math
@@ -67,12 +68,14 @@ class FrontierExplorer(Node):
         self.declare_parameter('gain_scale',          1.0)
         self.declare_parameter('robot_base_frame',    'base_link')
         self.declare_parameter('progress_timeout',    30.0)
+        self.declare_parameter('startup_delay',       15.0)
 
         self._freq          = self.get_parameter('planner_frequency').value
         self._min_size_m    = self.get_parameter('min_frontier_size').value
         self._pot_scale     = self.get_parameter('potential_scale').value
         self._gain_scale    = self.get_parameter('gain_scale').value
         self._timeout       = self.get_parameter('progress_timeout').value
+        self._startup_delay = self.get_parameter('startup_delay').value
 
         # ── State ─────────────────────────────────────────────────────────────
         self._map: OccupancyGrid | None = None
@@ -82,6 +85,12 @@ class FrontierExplorer(Node):
         self._goal_handle = None
         self._goal_sent_t = 0.0
         self._enabled = True
+        self._start_time = time.monotonic()
+        self._nav2_ready = False
+
+        # Blacklist recently-failed goals so we don't retry the same spot
+        self._blacklist: list[tuple[float, float]] = []
+        self._blacklist_radius = 0.5   # metres
 
         # ── Nav2 action client ────────────────────────────────────────────────
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -112,7 +121,8 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             f'Frontier Explorer ready | freq={self._freq:.2f} Hz | '
             f'min_size={self._min_size_m} m | '
-            f'potential_scale={self._pot_scale} | gain_scale={self._gain_scale}')
+            f'potential_scale={self._pot_scale} | gain_scale={self._gain_scale} | '
+            f'startup_delay={self._startup_delay:.0f} s')
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -134,12 +144,20 @@ class FrontierExplorer(Node):
         if not self._enabled or self._map is None:
             return
 
+        # Wait for Nav2 to finish booting before sending the first goal
+        if not self._nav2_ready:
+            elapsed = time.monotonic() - self._start_time
+            if elapsed < self._startup_delay:
+                return
+            self._nav2_ready = True
+            self.get_logger().info('Startup delay elapsed — beginning exploration')
+
         # Check if current goal has timed out
         if self._navigating:
             elapsed = time.monotonic() - self._goal_sent_t
             if elapsed > self._timeout:
                 self.get_logger().warn(
-                    f'Goal timeout after {elapsed:.0f} s — cancelling and replanning')
+                    f'Goal timeout after {elapsed:.0f} s — blacklisting and replanning')
                 if self._goal_handle is not None:
                     self._goal_handle.cancel_goal_async()
                 self._navigating = False
@@ -155,6 +173,8 @@ class FrontierExplorer(Node):
 
         best = self._select_best_frontier(frontiers)
         if best is None:
+            self.get_logger().info('All frontiers are blacklisted — clearing blacklist')
+            self._blacklist.clear()
             return
 
         bx, by = best
@@ -219,6 +239,12 @@ class FrontierExplorer(Node):
 
         return clusters
 
+    def _is_blacklisted(self, x: float, y: float) -> bool:
+        for bx, by in self._blacklist:
+            if math.hypot(x - bx, y - by) < self._blacklist_radius:
+                return True
+        return False
+
     def _select_best_frontier(
             self, clusters: list[list[tuple[float, float]]]
     ) -> tuple[float, float] | None:
@@ -232,6 +258,8 @@ class FrontierExplorer(Node):
             dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
             if dist < 0.3:
                 continue   # already there, skip
+            if self._is_blacklisted(cx, cy):
+                continue
             size = len(cluster)
             score = self._gain_scale * size - self._pot_scale * dist
             if score > best_score:
@@ -243,9 +271,14 @@ class FrontierExplorer(Node):
     # ── Nav2 goal sending ─────────────────────────────────────────────────────
 
     def _send_goal(self, x: float, y: float):
-        if not self._nav_client.wait_for_server(timeout_sec=2.0):
+        if not self._nav_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().warn('Nav2 action server not available yet')
             return
+
+        # Compute orientation facing toward the goal
+        dx = x - self._robot_x
+        dy = y - self._robot_y
+        yaw = math.atan2(dy, dx)
 
         goal = NavigateToPose.Goal()
         goal.pose = PoseStamped()
@@ -253,10 +286,13 @@ class FrontierExplorer(Node):
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
-        goal.pose.pose.orientation.w = 1.0   # face forward
+        # Convert yaw to quaternion (rotation about Z only)
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self._navigating = True
         self._goal_sent_t = time.monotonic()
+        self._current_goal = (x, y)
 
         future = self._nav_client.send_goal_async(goal)
         future.add_done_callback(self._on_goal_response)
@@ -264,16 +300,24 @@ class FrontierExplorer(Node):
     def _on_goal_response(self, future):
         self._goal_handle = future.result()
         if not self._goal_handle.accepted:
-            self.get_logger().warn('Goal rejected by Nav2')
+            self.get_logger().warn('Goal rejected by Nav2 — blacklisting')
+            self._blacklist.append(self._current_goal)
             self._navigating = False
             return
+        self.get_logger().info('Goal accepted — navigating...')
         result_future = self._goal_handle.get_result_async()
         result_future.add_done_callback(self._on_result)
 
     def _on_result(self, future):
         self._navigating = False
         status = future.result().status
-        self.get_logger().info(f'Navigation result: status={status}')
+        if status == 4:   # STATUS_SUCCEEDED
+            self.get_logger().info('Navigation succeeded — replanning for next frontier')
+        elif status == 6:  # STATUS_CANCELED
+            self.get_logger().warn('Navigation cancelled')
+        else:
+            self.get_logger().warn(f'Navigation failed (status={status}) — blacklisting goal')
+            self._blacklist.append(self._current_goal)
 
 
 def main(args=None):

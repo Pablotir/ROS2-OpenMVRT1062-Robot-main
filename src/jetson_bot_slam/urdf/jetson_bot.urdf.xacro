@@ -14,10 +14,10 @@
   Half track      = 0.217 m  (8.55 in, Ly)
   Total height    = 0.330 m  (13 in, without LiDAR)
 
-  Sensor placement:
-  Camera:     USB camera mounted ~10 cm above base, at front-centre
-  LiDAR:      LDROBOT STL-27L, rear-right corner, 3.5 cm above chassis top
-  Ultrasonic: HC-SR04 rear-centre, facing backward, ~5 cm above base top
+  Sensor placement (all centred widthwise, heights measured from ground):
+  LiDAR:      LDROBOT STL-27L, DEAD CENTRE of robot, scan plane at 14⅝"–15"
+  Camera:     USB camera at front-centre, sensor at 7⅝" height
+  Ultrasonic: HC-SR04 rear-centre, facing backward, at 6½" height
 -->
 <robot name="jetson_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
@@ -46,7 +46,12 @@
   <xacro:property name="wheel_width"    value="0.038"/>
   <xacro:property name="half_lx"        value="0.127"/>   <!-- half wheelbase (Lx) -->
   <xacro:property name="half_ly"        value="0.217"/>   <!-- half track (Ly) -->
-  <xacro:property name="lidar_height"   value="0.035"/>   <!-- 1.37 in above top plate -->
+  <xacro:property name="lidar_height"   value="0.010"/>   <!-- spinning cylinder ~3/8 in -->
+
+  <!-- Ground-to-base_link offset: base_link is at centre of chassis plate,
+       chassis bottom sits at wheel-axle height (wheel_radius above ground) -->
+  <xacro:property name="base_z"  value="${wheel_radius + base_height/2}"/>
+  <!--  = 0.0508 + 0.040 = 0.0908 m above ground  -->
 
   <!-- Wheel macro -->
   <xacro:macro name="wheel" params="name x y">
@@ -69,8 +74,8 @@
     <joint name="${name}_joint" type="continuous">
       <parent link="base_link"/>
       <child  link="${name}_link"/>
-      <!-- wheels spin around Y axis; translate to corner positions, drop to ground -->
-      <origin xyz="${x} ${y} ${-base_height/2 + wheel_radius}"
+      <!-- Wheel axle is at the bottom of the chassis: z = -(base_height/2) -->
+      <origin xyz="${x} ${y} ${-base_height/2}"
               rpy="${pi/2} 0 0"/>
       <axis xyz="0 0 1"/>
     </joint>
@@ -84,7 +89,8 @@
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
     <child  link="base_link"/>
-    <origin xyz="0 0 ${wheel_radius - base_height/2}"/>
+    <!-- base_link centre = wheel_radius + base_height/2 above ground -->
+    <origin xyz="0 0 ${base_z}"/>
   </joint>
 
   <!-- ===================================================================== -->
@@ -123,7 +129,7 @@
   <xacro:wheel name="wheel_BR" x="${-half_lx}" y="${-half_ly}"/>
 
   <!-- ===================================================================== -->
-  <!-- Camera link (USB camera, front-centre, ~10 cm above base top)         -->
+  <!-- Camera link (USB camera, front-centre, sensor at 7⅝" = 0.1937 m)    -->
   <!-- ===================================================================== -->
   <link name="camera_link">
     <visual>
@@ -135,8 +141,9 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="camera_link"/>
-    <!-- 14 cm forward, centre-left, 10 cm above base top -->
-    <origin xyz="${base_length/2 - 0.02} 0 ${base_height/2 + 0.10}"
+    <!-- Front-centre: x = base_length/2, y = 0
+         Height: 7.625" = 0.1937 m above ground → z relative to base_link -->
+    <origin xyz="${base_length/2} 0 ${0.1937 - base_z}"
             rpy="0 0 0"/>
   </joint>
 
@@ -149,11 +156,12 @@
   </joint>
 
   <!-- ===================================================================== -->
-  <!-- LiDAR — LDROBOT STL-27L, rear-right corner, 3.5 cm above top plate   -->
+  <!-- LiDAR — LDROBOT STL-27L, DEAD CENTRE of robot                        -->
+  <!-- Spinning bit: 14⅝" (0.3716 m) to 15" (0.381 m) above ground         -->
   <!-- ===================================================================== -->
   <link name="lidar_link">
     <visual>
-      <geometry><cylinder length="0.035" radius="0.035"/></geometry>
+      <geometry><cylinder length="${lidar_height}" radius="0.035"/></geometry>
       <material name="green"/>
     </visual>
   </link>
@@ -161,12 +169,13 @@
   <joint name="lidar_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="lidar_link"/>
-    <!-- Rear-right: -X (rear), -Y (right), above top plate -->
-    <origin xyz="${-base_length/2 + 0.06} ${-base_width/2 + 0.06} ${base_height/2 + lidar_height/2}"
+    <!-- Dead centre: x=0, y=0
+         LiDAR mid-height = (14.625+15)/2 = 14.8125" = 0.3763 m above ground -->
+    <origin xyz="0 0 ${0.3763 - base_z}"
             rpy="0 0 0"/>
   </joint>
 
-  <!-- laser_frame: the actual scan plane (required by ldlidar_stl_ros2) -->
+  <!-- laser_frame: the actual scan plane (top of spinning bit, required by ldlidar_stl_ros2) -->
   <link name="laser_frame"/>
   <joint name="laser_frame_joint" type="fixed">
     <parent link="lidar_link"/>
@@ -176,6 +185,7 @@
 
   <!-- ===================================================================== -->
   <!-- Ultrasonic sensor (HC-SR04, REAR-centre, facing backward)             -->
+  <!-- Height: 6½" = 0.1651 m above ground                                   -->
   <!-- ===================================================================== -->
   <link name="ultrasonic_link">
     <visual>
@@ -187,8 +197,9 @@
   <joint name="ultrasonic_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="ultrasonic_link"/>
-    <!-- Rear-centre facing backward (rotated 180° around Z) -->
-    <origin xyz="${-base_length/2 + 0.01} 0 ${base_height/2 + 0.05}"
+    <!-- Rear-centre facing backward: x = -(base_length/2 - 0.01), y = 0
+         Height: 6.5" = 0.1651 m above ground → z relative to base_link -->
+    <origin xyz="${-(base_length/2 - 0.01)} 0 ${0.1651 - base_z}"
             rpy="0 0 ${pi}"/>
   </joint>
 

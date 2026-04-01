@@ -109,9 +109,9 @@ controller_server:
       decel_lim_y: -0.5
       decel_lim_theta: -1.2
       # ── Trajectory sampling ──
-      vx_samples: 20
-      vy_samples: 10
-      vtheta_samples: 40
+      vx_samples: 15
+      vy_samples: 3
+      vtheta_samples: 30
       sim_time: 2.0                 # look 2s ahead for obstacle avoidance
       linear_granularity: 0.05
       angular_granularity: 0.025

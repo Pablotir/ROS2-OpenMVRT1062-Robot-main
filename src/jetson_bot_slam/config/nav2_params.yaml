@@ -111,7 +111,7 @@ controller_server:
       # ── Trajectory sampling ──
       vx_samples: 20
       vy_samples: 10
-      vtheta_samples: 20
+      vtheta_samples: 40
       sim_time: 2.0                 # look 2s ahead for obstacle avoidance
       linear_granularity: 0.05
       angular_granularity: 0.025
@@ -124,13 +124,13 @@ controller_server:
         ["RotateToGoal", "Oscillation", "BaseObstacle",
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       # ── Critic weights ──
-      # BaseObstacle MUST be high so the planner avoids walls!
-      BaseObstacle.scale: 64.0
+      # BaseObstacle scale was paralyzed by inflation cost; reducing to 2.0
+      BaseObstacle.scale: 2.0
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
       GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 16.0
+      PathDist.scale: 32.0          # Strictly adhere to the globally-planned centerline
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
@@ -144,7 +144,7 @@ planner_server:
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 1.0
-      use_astar: true
+      use_astar: false
       allow_unknown: true
 
 behavior_server:

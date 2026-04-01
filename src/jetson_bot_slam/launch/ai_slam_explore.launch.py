@@ -203,42 +203,19 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
-    # ── RTAB-Map SLAM (LiDAR mode) ───────────────────────────────────────
-    rtabmap = Node(
-        package='rtabmap_slam',
-        executable='rtabmap',
-        name='rtabmap',
+    # ── SLAM Toolbox (2D LiDAR mode) ──────────────────────────────────────
+    slam_toolbox_pkg = get_package_share_directory('slam_toolbox')
+    slam_params_file = os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml')
+    
+    slam_toolbox = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(slam_toolbox_pkg, 'launch', 'online_async_launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': 'false',
+            'slam_params_file': slam_params_file,
+        }.items(),
         condition=IfCondition(LaunchConfiguration('use_slam')),
-        output='screen',
-        parameters=[{
-            'subscribe_depth':          False,
-            'subscribe_rgb':            False,
-            'subscribe_scan':           True,
-            'subscribe_odom':           True,
-            'approx_sync':              True,
-            'approx_sync_max_interval': 0.3,
-            'Reg/Strategy':             '1',       # ICP for LiDAR
-            'Reg/Force3DoF':            'true',
-            'RGBD/NeighborLinkRefining': 'true',
-            'RGBD/ProximityPathMaxNeighbors': '0', # Disable local loop closures that cause 8m teleports on flat surfaces
-            'Icp/PointToPlane':         'false',
-            'Icp/VoxelSize':            '0.05',
-            'Icp/MaxCorrespondenceDistance': '0.1',
-            'Icp/MaxTranslation':       '0.2',     # Reject any jump larger than 20cm between scans
-            'Grid/3D':                  'false',
-            'Grid/CellSize':            '0.05',
-            'Grid/RayTracing':          'true',
-            'Grid/RangeMax':            '12.0',
-            'RGBD/AngularUpdate':       '0.05',
-            'RGBD/LinearUpdate':        '0.05',
-            'Optimizer/Strategy':       '1',       # g2o
-            'database_path':            '/root/maps/bedroom.db',
-            'wait_for_transform':       0.5,
-        }],
-        remappings=[
-            ('scan',  '/scan'),
-            ('odom',  '/odom'),
-        ],
     )
 
     # ── VILA scene labeller ───────────────────────────────────────────────
@@ -330,7 +307,7 @@ def generate_launch_description():
         lidar,            # STL-27L → /scan
         usb_camera,       # Only when use_camera:=true
         image_convert,    # Only when use_camera:=true
-        rtabmap,          # LiDAR SLAM (on by default)
+        slam_toolbox,     # LiDAR SLAM (on by default)
         vila_labeller,    # Only when use_camera:=true
         nav2,             # Nav2 path planning (on by default)
         frontier_explorer,  # Python frontier exploration (on by default)

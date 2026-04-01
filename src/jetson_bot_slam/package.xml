@@ -20,7 +20,7 @@
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>usb_cam</exec_depend>
-  <exec_depend>rtabmap_ros</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>cv_bridge</exec_depend>

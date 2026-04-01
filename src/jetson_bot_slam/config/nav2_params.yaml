@@ -189,11 +189,11 @@ local_costmap:
       # Coordinates are [x, y] corners relative to base_link centre
       footprint: "[[-0.20, -0.26], [-0.20, 0.26], [0.20, 0.26], [0.20, -0.26]]"
 
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "range_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan ultrasonic
+        observation_sources: scan
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -204,16 +204,16 @@ local_costmap:
           obstacle_min_range: 0.10      # ignore points inside the robot body
           raytrace_max_range: 5.5
           raytrace_min_range: 0.0
-        ultrasonic:
-          topic: /ultrasonic_range
-          max_obstacle_height: 2.0
-          clearing: true
-          marking: true
-          data_type: "LaserScan"
-          obstacle_max_range: 3.5
-          obstacle_min_range: 0.0
-          raytrace_max_range: 3.8
-          raytrace_min_range: 0.0
+      range_layer:
+        plugin: "nav2_costmap_2d::RangeSensorLayer"
+        enabled: true
+        topics: ["/ultrasonic_range"]
+        phi: 0.26
+        inflate_cone: 1.0
+        no_readings_timeout: 0.0
+        clear_threshold: 0.2
+        mark_threshold: 0.8
+        clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5       # gentler falloff keeps robot further from walls
@@ -236,14 +236,14 @@ global_costmap:
       # Same rectangular footprint as local costmap
       footprint: "[[-0.20, -0.26], [-0.20, 0.26], [0.20, 0.26], [0.20, -0.26]]"
 
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "range_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan ultrasonic
+        observation_sources: scan
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -254,14 +254,16 @@ global_costmap:
           obstacle_min_range: 0.10
           raytrace_max_range: 5.5
           raytrace_min_range: 0.0
-        ultrasonic:
-          topic: /ultrasonic_range
-          max_obstacle_height: 2.0
-          clearing: true
-          marking: true
-          data_type: "LaserScan"
-          obstacle_max_range: 3.5
-          raytrace_max_range: 3.8
+      range_layer:
+        plugin: "nav2_costmap_2d::RangeSensorLayer"
+        enabled: true
+        topics: ["/ultrasonic_range"]
+        phi: 0.26
+        inflate_cone: 1.0
+        no_readings_timeout: 0.0
+        clear_threshold: 0.2
+        mark_threshold: 0.8
+        clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5

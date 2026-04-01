@@ -220,9 +220,11 @@ def generate_launch_description():
             'Reg/Strategy':             '1',       # ICP for LiDAR
             'Reg/Force3DoF':            'true',
             'RGBD/NeighborLinkRefining': 'true',
+            'RGBD/ProximityPathMaxNeighbors': '0', # Disable local loop closures that cause 8m teleports on flat surfaces
             'Icp/PointToPlane':         'false',
             'Icp/VoxelSize':            '0.05',
             'Icp/MaxCorrespondenceDistance': '0.1',
+            'Icp/MaxTranslation':       '0.2',     # Reject any jump larger than 20cm between scans
             'Grid/3D':                  'false',
             'Grid/CellSize':            '0.05',
             'Grid/RayTracing':          'true',

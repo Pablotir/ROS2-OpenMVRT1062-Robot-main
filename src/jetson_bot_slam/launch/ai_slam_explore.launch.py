@@ -69,7 +69,7 @@ def generate_launch_description():
         # VILA model overrides
         DeclareLaunchArgument('vila_model',
                               default_value='Efficient-Large-Model/VILA-2.7b'),
-        DeclareLaunchArgument('vila_api',            default_value='awq'),
+        DeclareLaunchArgument('vila_api',            default_value='mlc'),
         DeclareLaunchArgument('vila_quantization',   default_value='q4f16_ft'),
         # Exploration (LiDAR-driven)
         DeclareLaunchArgument('move_speed',          default_value='0.20'),
@@ -279,7 +279,7 @@ def generate_launch_description():
             'progress_timeout':    30.0,
             'potential_scale':     3.0,
             'gain_scale':          1.0,
-            'min_frontier_size':   0.75,
+            'min_frontier_size':   0.30,
         }],
     )
 

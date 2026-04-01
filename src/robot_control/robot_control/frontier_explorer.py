@@ -78,7 +78,7 @@ class FrontierExplorer(Node):
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('planner_frequency',   0.33)
         self.declare_parameter('min_frontier_size',   0.30)
-        self.declare_parameter('potential_scale',     3.0)
+        self.declare_parameter('potential_scale',     5.0)
         self.declare_parameter('gain_scale',          1.0)
         self.declare_parameter('robot_base_frame',    'base_link')
         self.declare_parameter('progress_timeout',    30.0)
@@ -102,6 +102,10 @@ class FrontierExplorer(Node):
         self._start_time = time.monotonic()
         self._nav2_ready = False
         self._no_frontier_count = 0
+
+        # Goal cooldown to prevent slamming Nav2 during recovery
+        self._last_fail_t = 0.0
+        self._fail_cooldown = 5.0
 
         # Spin-in-place bootstrap state
         self._spin_done = False
@@ -219,15 +223,21 @@ class FrontierExplorer(Node):
         if self._spinning:
             return
 
+        # Cooldown after a navigation failure to let Nav2 recover
+        if not self._navigating and time.monotonic() - self._last_fail_t < self._fail_cooldown:
+            return
+
         # Check if current goal has timed out
         if self._navigating:
             elapsed = time.monotonic() - self._goal_sent_t
             if elapsed > self._timeout:
                 self.get_logger().warn(
                     f'Goal timeout after {elapsed:.0f} s — blacklisting and replanning')
+                self._blacklist.append(self._current_goal)
                 if self._goal_handle is not None:
                     self._goal_handle.cancel_goal_async()
                 self._navigating = False
+                self._last_fail_t = time.monotonic()
             else:
                 return
 
@@ -397,10 +407,19 @@ class FrontierExplorer(Node):
             dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
             if dist < 0.3:
                 continue
+            
+            # Cap maximum frontier distance to 3.0 meters
+            # The robot shouldn't try to navigate through huge swaths of unknown
+            if dist > 3.0:
+                continue
+                
             if self._is_blacklisted(cx, cy):
                 continue
+                
             size = len(cluster)
-            score = self._gain_scale * size - self._pot_scale * dist
+            # Quadratic distance penalty forces the planner to pick nearby goals
+            score = self._gain_scale * size - self._pot_scale * (dist ** 2)
+            
             if score > best_score:
                 best_score = score
                 best_xy = (cx, cy)
@@ -440,6 +459,7 @@ class FrontierExplorer(Node):
             self.get_logger().warn('Goal rejected by Nav2 — blacklisting')
             self._blacklist.append(self._current_goal)
             self._navigating = False
+            self._last_fail_t = time.monotonic()
             return
         self.get_logger().info('Goal accepted — navigating...')
         result_future = self._goal_handle.get_result_async()
@@ -451,10 +471,15 @@ class FrontierExplorer(Node):
         if status == 4:
             self.get_logger().info('Navigation succeeded — replanning for next frontier')
         elif status == 6:
-            self.get_logger().warn('Navigation cancelled')
-        else:
-            self.get_logger().warn(f'Navigation failed (status={status}) — blacklisting goal')
+            self.get_logger().warn('Navigation cancelled (e.g. by recovery behaviour)')
+            self._last_fail_t = time.monotonic()
+        elif status == 5:
+            self.get_logger().warn('Navigation aborted/failed completely (status=5) — blacklisting goal')
             self._blacklist.append(self._current_goal)
+            self._last_fail_t = time.monotonic()
+        else:
+            self.get_logger().warn(f'Navigation ended (status={status}) — waiting for cooldown')
+            self._last_fail_t = time.monotonic()
 
 
 def main(args=None):

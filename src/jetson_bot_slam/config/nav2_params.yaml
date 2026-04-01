@@ -116,7 +116,7 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 1.0     # HIGH — the Jetson has TF jitter
-      xy_goal_tolerance: 0.30
+      xy_goal_tolerance: 1.0       # HIGH — just get near the frontier
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
@@ -143,8 +143,8 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: false
+      tolerance: 1.0
+      use_astar: true
       allow_unknown: true
 
 behavior_server:
@@ -217,7 +217,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5       # gentler falloff keeps robot further from walls
-        inflation_radius: 0.40         # 40 cm — tight enough to fit through doorways
+        inflation_radius: 0.25         # 25 cm — tight enough to fit through doorways
       always_send_full_costmap: true
 
 # ── Global costmap ─────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5
-        inflation_radius: 0.40
+        inflation_radius: 0.25
       always_send_full_costmap: true
 
 map_server:

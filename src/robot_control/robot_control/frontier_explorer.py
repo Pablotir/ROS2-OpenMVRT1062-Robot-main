@@ -12,17 +12,24 @@ Algorithm
 1. Subscribe to /map (nav_msgs/OccupancyGrid).
 2. Every `planner_frequency` seconds:
    a. Find all frontier cells — free cells (0) adjacent to unknown cells (-1).
+      Map-edge cells treat out-of-bounds as unknown (implicit frontier).
    b. Cluster frontier cells into contiguous frontier groups.
    c. Score each cluster: gain = size, cost = distance_from_robot.
       Best frontier = argmax(gain_scale * size - potential_scale * distance).
    d. If best frontier is far enough away and bigger than min_frontier_size,
       send a NavigateToPose action goal to Nav2.
-3. If no frontiers remain → exploration is complete, node logs and stops.
+3. If no frontiers are found for several cycles, perform a one-time
+   spin-in-place (~360°) to grow the map before retrying.
+4. If no frontiers remain after spinning → exploration is complete.
 
 Subscribes
 ----------
   /map              nav_msgs/OccupancyGrid    RTAB-Map 2D occupancy grid
   /odom             nav_msgs/Odometry         Robot pose (fallback if no TF)
+
+Publishes
+---------
+  /cmd_vel          geometry_msgs/Twist       Spin-in-place bootstrap only
 
 Requires
 --------
@@ -46,7 +53,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from nav_msgs.msg import OccupancyGrid, Odometry
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
 
@@ -55,6 +62,11 @@ from std_msgs.msg import Bool
 FREE     = 0
 UNKNOWN  = -1
 OCCUPIED_THRESHOLD = 50    # cells ≥ this value are considered occupied
+
+# ── Spin-in-place bootstrap ──────────────────────────────────────────────────
+_SPIN_TRIGGER     = 5      # consecutive empty checks before spinning
+_SPIN_SPEED       = 0.35   # rad/s  (~10 s for full 360°)
+_SPIN_DURATION    = 10.0   # seconds (slightly over one full rotation)
 
 
 class FrontierExplorer(Node):
@@ -89,12 +101,20 @@ class FrontierExplorer(Node):
         self._nav2_ready = False
         self._no_frontier_count = 0       # consecutive empty checks
 
+        # Spin-in-place bootstrap state
+        self._spin_done = False           # True after we've done (or skipped) the spin
+        self._spinning = False            # True while actively spinning
+        self._spin_start_t = 0.0
+
         # Blacklist recently-failed goals so we don't retry the same spot
         self._blacklist: list[tuple[float, float]] = []
         self._blacklist_radius = 0.5   # metres
 
         # ── Nav2 action client ────────────────────────────────────────────────
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # ── cmd_vel publisher (for spin-in-place only) ────────────────────────
+        self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # ── Map subscriber (transient_local so we get the last published map) ─
         map_qos = QoSProfile(
@@ -154,6 +174,26 @@ class FrontierExplorer(Node):
             self._nav2_ready = True
             self.get_logger().info('Startup delay elapsed — beginning exploration')
 
+        # ── Handle spin-in-place bootstrap ────────────────────────────────
+        if self._spinning:
+            elapsed = time.monotonic() - self._spin_start_t
+            if elapsed < _SPIN_DURATION:
+                # Keep publishing rotation command
+                twist = Twist()
+                twist.angular.z = _SPIN_SPEED
+                self._cmd_pub.publish(twist)
+                return
+            else:
+                # Spin complete — stop and resume normal planning
+                twist = Twist()
+                self._cmd_pub.publish(twist)
+                self._spinning = False
+                self._spin_done = True
+                self._no_frontier_count = 0
+                self.get_logger().info(
+                    'Spin-in-place complete — resuming frontier search')
+                return
+
         # Check if current goal has timed out
         if self._navigating:
             elapsed = time.monotonic() - self._goal_sent_t
@@ -166,9 +206,23 @@ class FrontierExplorer(Node):
             else:
                 return   # still navigating, wait
 
+        # ── Log map stats for diagnostics ─────────────────────────────────
+        self._log_map_stats()
+
         frontiers = self._find_frontiers()
         if not frontiers:
             self._no_frontier_count += 1
+
+            # Trigger spin-in-place if stuck and haven't spun yet
+            if (not self._spin_done
+                    and self._no_frontier_count >= _SPIN_TRIGGER):
+                self.get_logger().info(
+                    f'No frontiers for {self._no_frontier_count} checks — '
+                    'starting spin-in-place to grow the map...')
+                self._spinning = True
+                self._spin_start_t = time.monotonic()
+                return
+
             if self._no_frontier_count % 10 == 1:
                 self.get_logger().info(
                     f'No frontiers found (check #{self._no_frontier_count}) — '
@@ -188,10 +242,36 @@ class FrontierExplorer(Node):
             f'Sending goal to frontier ({bx:.2f}, {by:.2f}) | dist={dist:.2f} m')
         self._send_goal(bx, by)
 
+    # ── Map diagnostics ──────────────────────────────────────────────────────
+
+    def _log_map_stats(self):
+        """Log map dimensions and cell-type counts once every 10 planning cycles."""
+        if not hasattr(self, '_stats_counter'):
+            self._stats_counter = 0
+        self._stats_counter += 1
+        if self._stats_counter % 10 != 1:
+            return
+
+        m = self._map
+        total = m.info.width * m.info.height
+        data = m.data
+        n_free = sum(1 for v in data if v == FREE)
+        n_unk  = sum(1 for v in data if v == UNKNOWN)
+        n_occ  = total - n_free - n_unk
+        self.get_logger().info(
+            f'Map stats: {m.info.width}x{m.info.height} '
+            f'({m.info.width * m.info.resolution:.1f}x'
+            f'{m.info.height * m.info.resolution:.1f} m) | '
+            f'free={n_free} unk={n_unk} occ={n_occ}')
+
     # ── Frontier discovery ────────────────────────────────────────────────────
 
     def _find_frontiers(self) -> list[list[tuple[float, float]]]:
-        """Return a list of frontier clusters, each a list of (x, y) world coords."""
+        """Return a list of frontier clusters, each a list of (x, y) world coords.
+
+        A frontier cell is a FREE cell adjacent to at least one UNKNOWN cell.
+        Cells outside the map boundary are treated as UNKNOWN (implicit frontier).
+        """
         m = self._map
         w, h   = m.info.width, m.info.height
         res    = m.info.resolution
@@ -202,20 +282,25 @@ class FrontierExplorer(Node):
         def world(r, c):
             return ox + (c + 0.5) * res, oy + (r + 0.5) * res
 
+        def get_cell(r, c):
+            """Return cell value, treating out-of-bounds as UNKNOWN."""
+            if r < 0 or r >= h or c < 0 or c >= w:
+                return UNKNOWN
+            return data[idx(r, c)]
+
         # Find frontier cells: FREE cells that have at least one UNKNOWN neighbour
+        # (including implicit UNKNOWN beyond map edges)
         frontier_mask = [False] * (w * h)
-        for row in range(1, h - 1):
-            for col in range(1, w - 1):
+        for row in range(h):
+            for col in range(w):
                 i = idx(row, col)
                 if data[i] != FREE:
                     continue
-                neighbours = [
-                    data[idx(row - 1, col)],
-                    data[idx(row + 1, col)],
-                    data[idx(row, col - 1)],
-                    data[idx(row, col + 1)],
-                ]
-                if UNKNOWN in neighbours:
+                # Check 4-connected neighbours (out-of-bounds → UNKNOWN)
+                if (get_cell(row - 1, col) == UNKNOWN or
+                    get_cell(row + 1, col) == UNKNOWN or
+                    get_cell(row, col - 1) == UNKNOWN or
+                    get_cell(row, col + 1) == UNKNOWN):
                     frontier_mask[i] = True
 
         # BFS cluster frontier cells

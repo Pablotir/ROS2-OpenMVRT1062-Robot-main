@@ -55,8 +55,8 @@ class MotorDriverNode(Node):
         self.declare_parameter('half_track_width', 0.2172)   # Ly (m)
         self.declare_parameter('control_hz',       10.0)     # cmd frequency
         self.declare_parameter('cmd_vel_timeout',  0.5)      # s – stale guard
-        self.declare_parameter('max_speed_mps',    0.5)      # m/s velocity cap
-        self.declare_parameter('max_deg_per_step', 720.0)    # safety deg cap
+        self.declare_parameter('max_speed_mps',    0.6)      # m/s velocity cap
+        self.declare_parameter('max_deg_per_step', 1000.0)   # safety deg cap
 
         R    = self.get_parameter('wheel_radius').value
         Lx   = self.get_parameter('half_wheelbase').value

@@ -87,6 +87,9 @@ def generate_launch_description():
         # Nav2 + Frontier exploration
         DeclareLaunchArgument('use_nav2',            default_value='true',
                               description='Use Nav2 + explore_lite instead of reactive controller'),
+        # Camera + AI (disabled by default until SLAM is validated)
+        DeclareLaunchArgument('use_camera',          default_value='false',
+                              description='Enable USB camera + VILA AI labeller'),
         # Room identification
         DeclareLaunchArgument('room_hints_enabled',  default_value='true',
                               description='Enable AI room identification from labels'),
@@ -162,7 +165,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── USB Camera ────────────────────────────────────────────────────────
+    # ── USB Camera (only when use_camera:=true) ────────────────────────
     usb_camera = Node(
         package='usb_cam',
         executable='usb_cam_node_exe',
@@ -183,9 +186,10 @@ def generate_launch_description():
             ('/usb_cam/camera_info', '/camera_info'),
         ],
         output='screen',
+        condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
-    # ── Image format converter (yuv422 → rgb8) ───────────────────────────
+    # ── Image format converter (only when use_camera:=true) ──────────────
     image_convert = Node(
         package='image_proc',
         executable='rectify_node',
@@ -196,6 +200,7 @@ def generate_launch_description():
             ('image',            '/image_rect_color'),
         ],
         output='screen',
+        condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
     # ── RTAB-Map SLAM (LiDAR mode) ───────────────────────────────────────
@@ -240,6 +245,7 @@ def generate_launch_description():
         package='jetson_bot_slam',
         executable='vila_scene_labeller',
         name='vila_scene_labeller',
+        condition=IfCondition(LaunchConfiguration('use_camera')),
         parameters=[
             vila_params_file,
             {
@@ -320,10 +326,10 @@ def generate_launch_description():
         mecanum_odom,
         motor_driver,
         lidar,            # STL-27L → /scan
-        usb_camera,
-        image_convert,    # yuv422 → rgb8
+        usb_camera,       # Only when use_camera:=true
+        image_convert,    # Only when use_camera:=true
         rtabmap,          # LiDAR SLAM (on by default)
-        vila_labeller,
+        vila_labeller,    # Only when use_camera:=true
         nav2,             # Nav2 path planning (on by default)
         frontier_explorer,  # Python frontier exploration (on by default)
         exploration_ctrl,   # Reactive fallback (only when use_nav2:=false)

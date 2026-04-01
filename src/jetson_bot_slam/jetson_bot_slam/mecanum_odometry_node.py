@@ -74,6 +74,7 @@ class MecanumOdometryNode(Node):
         self.declare_parameter('odom_frame',         'odom')
         self.declare_parameter('base_frame',         'base_link')
         self.declare_parameter('publish_tf',         True)
+        self.declare_parameter('tf_republish_hz',    20.0)     # TF keep-alive rate
 
         R   = self.get_parameter('wheel_radius').value
         TPR = self.get_parameter('ticks_per_rev').value
@@ -83,6 +84,7 @@ class MecanumOdometryNode(Node):
         self._odom_frame = self.get_parameter('odom_frame').value
         self._base_frame = self.get_parameter('base_frame').value
         self._pub_tf     = self.get_parameter('publish_tf').value
+        tf_hz            = self.get_parameter('tf_republish_hz').value
 
         # meters of arc per encoder tick
         self._m_per_tick = (2.0 * math.pi * R) / TPR
@@ -95,9 +97,15 @@ class MecanumOdometryNode(Node):
         self._y     = 0.0
         self._theta = 0.0
 
+        # Latest velocities (updated by encoder callback, re-used by keep-alive)
+        self._vx    = 0.0
+        self._vy    = 0.0
+        self._omega = 0.0
+
         # Previous encoder counts (initialised on first message)
         self._prev_enc: list[int] | None = None   # [BL, BR, FL, FR]
         self._prev_time = None
+        self._got_first_data = False
 
         # ── QoS ───────────────────────────────────────────────────────────────
         sensor_qos = QoSProfile(
@@ -112,6 +120,14 @@ class MecanumOdometryNode(Node):
 
         self.create_subscription(
             Int32MultiArray, 'wheel_ticks', self._tick_callback, sensor_qos)
+
+        # ── 20 Hz TF keep-alive timer ─────────────────────────────────────────
+        # Re-publishes odom TF + odom msg at 20 Hz with fresh timestamps,
+        # filling gaps between Arduino DATA messages (~1-3 Hz).
+        # This prevents the TF starvation cascade that blocks Nav2 + RTAB-Map.
+        if tf_hz > 0:
+            self.create_timer(1.0 / tf_hz, self._tf_keepalive)
+            self.get_logger().info(f'TF keep-alive enabled at {tf_hz:.0f} Hz')
 
         self.get_logger().info(
             f'mecanum_odometry ready | R={R} m | Lx={Lx} m | Ly={Ly} m | '
@@ -132,6 +148,7 @@ class MecanumOdometryNode(Node):
         if self._prev_enc is None:
             self._prev_enc  = enc
             self._prev_time = now
+            self._got_first_data = True
             return
 
         dt = (now - self._prev_time).nanoseconds * 1e-9
@@ -169,14 +186,20 @@ class MecanumOdometryNode(Node):
         # Normalise heading to [-π, π]
         self._theta = math.atan2(math.sin(self._theta), math.cos(self._theta))
 
-        # ── Velocities ────────────────────────────────────────────────────────
-        vx    = dx_body / dt
-        vy    = dy_body / dt
-        omega = dtheta  / dt
+        # ── Cache velocities (re-used by keep-alive timer) ────────────────────
+        self._vx    = dx_body / dt
+        self._vy    = dy_body / dt
+        self._omega = dtheta  / dt
 
-        # ── Publish Odometry ──────────────────────────────────────────────────
+        # ── Publish odom + TF ─────────────────────────────────────────────────
+        self._publish_odom(now)
+
+    # ── Shared odom + TF publisher ────────────────────────────────────────────
+
+    def _publish_odom(self, stamp):
+        """Publish Odometry message and broadcast odom→base_link TF."""
         odom = Odometry()
-        odom.header.stamp    = now.to_msg()
+        odom.header.stamp    = stamp.to_msg()
         odom.header.frame_id = self._odom_frame
         odom.child_frame_id  = self._base_frame
 
@@ -186,7 +209,6 @@ class MecanumOdometryNode(Node):
         odom.pose.pose.orientation = euler_to_quaternion(self._theta)
 
         # Diagonal position covariance (x, y, z, roll, pitch, yaw)
-        # Mecanum odometry is less accurate laterally (vy) than axially (vx)
         pos_cov = [0.0] * 36
         pos_cov[0]  = 0.001   # x–x
         pos_cov[7]  = 0.002   # y–y  (higher: lateral slip uncertainty)
@@ -203,9 +225,9 @@ class MecanumOdometryNode(Node):
         vel_cov[21] = 1e6
         vel_cov[28] = 1e6
         vel_cov[35] = 0.005
-        odom.twist.twist.linear.x  = vx
-        odom.twist.twist.linear.y  = vy
-        odom.twist.twist.angular.z = omega
+        odom.twist.twist.linear.x  = self._vx
+        odom.twist.twist.linear.y  = self._vy
+        odom.twist.twist.angular.z = self._omega
         odom.twist.covariance = vel_cov
 
         self._odom_pub.publish(odom)
@@ -213,7 +235,7 @@ class MecanumOdometryNode(Node):
         # ── Broadcast TF odom → base_link ────────────────────────────────────
         if self._pub_tf:
             tf = TransformStamped()
-            tf.header.stamp            = now.to_msg()
+            tf.header.stamp            = stamp.to_msg()
             tf.header.frame_id         = self._odom_frame
             tf.child_frame_id          = self._base_frame
             tf.transform.translation.x = self._x
@@ -221,6 +243,19 @@ class MecanumOdometryNode(Node):
             tf.transform.translation.z = 0.0
             tf.transform.rotation      = euler_to_quaternion(self._theta)
             self._tf_br.sendTransform(tf)
+
+    # ── TF keep-alive ─────────────────────────────────────────────────────────
+
+    def _tf_keepalive(self):
+        """Re-broadcast odom→base_link TF at 20 Hz with fresh timestamps.
+
+        The Arduino sends encoder data at ~1-3 Hz. Without this timer,
+        Nav2 and RTAB-Map can't resolve TF lookups for LiDAR scans that
+        arrive between encoder updates → cascade of extrapolation errors.
+        """
+        if not self._got_first_data:
+            return   # Don't publish until we have at least one encoder reading
+        self._publish_odom(self.get_clock().now())
 
 
 def main(args=None):

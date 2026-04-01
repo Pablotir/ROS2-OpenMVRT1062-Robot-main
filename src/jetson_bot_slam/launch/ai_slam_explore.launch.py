@@ -226,6 +226,7 @@ def generate_launch_description():
             'RGBD/LinearUpdate':        '0.05',
             'Optimizer/Strategy':       '1',       # g2o
             'database_path':            '/root/maps/bedroom.db',
+            'wait_for_transform':       0.5,
         }],
         remappings=[
             ('scan',  '/scan'),

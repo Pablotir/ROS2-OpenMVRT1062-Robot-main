@@ -293,6 +293,11 @@ class VilaSceneLabeller(Node):
     def _load_model(self):
         """Load the VILA model on a background thread (GPU-heavy)."""
         try:
+            # Ensure MLC dist directory exists (nano_llm expects it for symlinks)
+            import os
+            mlc_dist = '/data/models/mlc/dist/models'
+            os.makedirs(mlc_dist, exist_ok=True)
+
             t0 = time.time()
             self._model = NanoLLM.from_pretrained(
                 self.model_name,
@@ -303,6 +308,13 @@ class VilaSceneLabeller(Node):
             self._model_ready = True
             self.get_logger().info(
                 f'VILA model loaded in {elapsed:.1f}s — ready for inference')
+        except FileNotFoundError as e:
+            self.get_logger().error(
+                f'VILA model files not found: {e}\n'
+                f'If using api=mlc, the model may need to be compiled first.\n'
+                f'Try: python3 -m nano_llm.utils.compile_model '
+                f'--model {self.model_name} --quantization {self.quantization}')
+            self._model_ready = False
         except Exception as e:
             self.get_logger().error(f'Failed to load VILA model: {e}')
             self._model_ready = False

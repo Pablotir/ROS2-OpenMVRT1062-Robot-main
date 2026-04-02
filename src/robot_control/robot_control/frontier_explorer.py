@@ -98,10 +98,15 @@ class FrontierExplorer(Node):
         self._navigating = False
         self._goal_handle = None
         self._goal_sent_t = 0.0
+        self._current_goal = (0.0, 0.0)
         self._enabled = True
         self._start_time = time.monotonic()
         self._nav2_ready = False
         self._no_frontier_count = 0
+
+        # Generation counter — prevents stale callbacks from
+        # cancelled goals from corrupting _navigating state
+        self._goal_gen = 0
 
         # Goal cooldown to prevent slamming Nav2 during recovery
         self._last_fail_t = 0.0
@@ -234,6 +239,7 @@ class FrontierExplorer(Node):
                 self.get_logger().warn(
                     f'Goal timeout after {elapsed:.0f} s — blacklisting and replanning')
                 self._blacklist.append(self._current_goal)
+                self._goal_gen += 1  # Invalidate stale callbacks
                 if self._goal_handle is not None:
                     self._goal_handle.cancel_goal_async()
                 self._navigating = False
@@ -449,11 +455,15 @@ class FrontierExplorer(Node):
         self._navigating = True
         self._goal_sent_t = time.monotonic()
         self._current_goal = (x, y)
+        self._goal_gen += 1
+        gen = self._goal_gen  # Capture for closure
 
         future = self._nav_client.send_goal_async(goal)
-        future.add_done_callback(self._on_goal_response)
+        future.add_done_callback(lambda f: self._on_goal_response(f, gen))
 
-    def _on_goal_response(self, future):
+    def _on_goal_response(self, future, gen):
+        if gen != self._goal_gen:
+            return  # Stale callback from a preempted goal
         self._goal_handle = future.result()
         if not self._goal_handle.accepted:
             self.get_logger().warn('Goal rejected by Nav2 — blacklisting')
@@ -463,9 +473,11 @@ class FrontierExplorer(Node):
             return
         self.get_logger().info('Goal accepted — navigating...')
         result_future = self._goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_result)
+        result_future.add_done_callback(lambda f: self._on_result(f, gen))
 
-    def _on_result(self, future):
+    def _on_result(self, future, gen):
+        if gen != self._goal_gen:
+            return  # Stale callback from a preempted goal — ignore
         self._navigating = False
         status = future.result().status
         if status == 4:

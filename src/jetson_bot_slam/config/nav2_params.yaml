@@ -215,8 +215,8 @@ local_costmap:
         clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5       # gentler falloff keeps robot further from walls
-        inflation_radius: 0.55         # 55 cm — creates a cost 'valley' in doorways
+        cost_scaling_factor: 4.0       # fast falloff keeps corridor centers cheap
+        inflation_radius: 0.35         # 35 cm — tight enough for doorways
       always_send_full_costmap: true
 
 # ── Global costmap ─────────────────────────────────────────────────────────────
@@ -268,8 +268,8 @@ global_costmap:
         clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.55
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.35
       always_send_full_costmap: true
 
 map_server:

@@ -82,7 +82,7 @@ class FrontierExplorer(Node):
         self.declare_parameter('gain_scale',          1.0)
         self.declare_parameter('robot_base_frame',    'base_link')
         self.declare_parameter('progress_timeout',    30.0)
-        self.declare_parameter('startup_delay',       15.0)
+        self.declare_parameter('startup_delay',       10.0)
 
         self._freq          = self.get_parameter('planner_frequency').value
         self._min_size_m    = self.get_parameter('min_frontier_size').value
@@ -410,7 +410,7 @@ class FrontierExplorer(Node):
             
             # Cap maximum frontier distance to 3.0 meters
             # The robot shouldn't try to navigate through huge swaths of unknown
-            if dist > 3.0:
+            if dist > 5.0:
                 continue
                 
             if self._is_blacklisted(cx, cy):

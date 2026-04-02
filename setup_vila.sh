@@ -67,7 +67,7 @@ pip3 install --no-cache-dir -i https://pypi.org/simple/ \
 echo ""
 echo "▸ Building ROS2 workspace..."
 cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
+source /opt/ros/install/setup.bash
 source /opt/ros/install/setup.bash
 
 colcon build --symlink-install \
@@ -80,8 +80,8 @@ source install/setup.bash
 # ── 6. Write a convenience source script ─────────────────────────────────────
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
-# Source all three ROS2 layers in the correct order
-source /opt/ros/humble/setup.bash
+# Source all ROS2 layers in the correct order
+source /opt/ros/install/setup.bash
 source /opt/ros/install/setup.bash
 source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -95,7 +95,7 @@ echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
 python3 -c "
 from nano_llm import NanoLLM
 print('Downloading VILA 2.7B...')
-model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='awq', quantization='Efficient-Large-Model/VILA-2.7b')
+model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='mlc', quantization='q4f16_ft')
 print('Model downloaded and ready!')
 del model
 " 2>&1 || echo "⚠  Model download skipped (will download on first inference)"

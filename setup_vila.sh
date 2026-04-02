@@ -54,8 +54,8 @@ fi
 # ── 3. Serial port permissions for LiDAR ─────────────────────────────────────
 echo ""
 echo "▸ Setting serial port permissions..."
-chmod 777 /dev/ttyUSB0 2>/dev/null || echo "  ⚠ /dev/ttyUSB0 not found (Arduino)"
-chmod 777 /dev/ttyUSB1 2>/dev/null || echo "  ⚠ /dev/ttyUSB1 not found (LiDAR)"
+chmod 777 /dev/arduino 2>/dev/null || echo "  ⚠ /dev/arduino not found (Arduino)"
+chmod 777 /dev/lidar 2>/dev/null || echo "  ⚠ /dev/lidar not found (LiDAR)"
 
 # ── 4. Python dependencies ───────────────────────────────────────────────────
 echo ""

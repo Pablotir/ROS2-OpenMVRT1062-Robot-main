@@ -26,11 +26,12 @@ services:
     tty: true
     environment:
       - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.docker.xauth
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     user: "1000:1000"    # write files as pablo (not root) so maps/logs are accessible on host
     devices:
-      - /dev/ttyUSB0:/dev/ttyUSB0   # Arduino Mega (serial)
-      - /dev/ttyUSB1:/dev/ttyUSB1   # STL-27L LiDAR (UART)
+      - /dev/arduino:/dev/arduino   # Arduino Mega (serial)
+      - /dev/lidar:/dev/lidar       # STL-27L LiDAR (UART)
       - /dev/video0:/dev/video0      # USB camera
       - /dev/video1:/dev/video1      # USB camera (alternate index)
     volumes:
@@ -39,6 +40,8 @@ services:
       - ./logs:/root/ros2_ws/logs         # AI decision logs + captured frames
       - ./setup_vila.sh:/root/ros2_ws/setup_vila.sh  # setup script
       - nano_llm_models:/root/.cache      # persist downloaded VILA model
+      - /tmp/.X11-unix:/tmp/.X11-unix     # X11 display socket for RViz
+      - /tmp/.docker.xauth:/tmp/.docker.xauth  # X11 auth cookie
     command: ["bash"]
 
   # NOTE: Ollama is no longer needed — VILA runs natively via nano_llm

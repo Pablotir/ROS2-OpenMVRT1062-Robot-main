@@ -59,9 +59,9 @@ def generate_launch_description():
     # ── Launch arguments ──────────────────────────────────────────────────
     args = [
         # Hardware ports
-        DeclareLaunchArgument('serial_port',        default_value='/dev/ttyUSB0',
+        DeclareLaunchArgument('serial_port',        default_value='/dev/arduino',
                               description='Arduino Mega serial port'),
-        DeclareLaunchArgument('lidar_port',         default_value='/dev/ttyUSB1',
+        DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar',
                               description='STL-27L LiDAR serial port'),
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
         DeclareLaunchArgument('rviz',               default_value='false',

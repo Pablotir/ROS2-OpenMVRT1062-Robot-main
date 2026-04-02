@@ -25,6 +25,7 @@ echo "▸ Installing ROS2 Humble packages..."
 apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-usb-cam \
     ros-humble-rtabmap-ros \
+    ros-humble-slam-toolbox \
     ros-humble-navigation2 \
     ros-humble-nav2-bringup \
     ros-humble-xacro \

@@ -80,8 +80,8 @@ class ExplorationController(Node):
         # ── Parameters ────────────────────────────────────────────────────
         self.declare_parameter('move_speed',           0.20)
         self.declare_parameter('turn_speed',           0.55)
-        self.declare_parameter('obstacle_distance',    0.30)
-        self.declare_parameter('emergency_stop_dist',  0.08)
+        self.declare_parameter('obstacle_distance',    0.40)
+        self.declare_parameter('emergency_stop_dist',  0.12)
         self.declare_parameter('rear_safety_dist',     0.15)
         self.declare_parameter('backup_s',             2.0)
         self.declare_parameter('min_turn_s',           3.0)
@@ -175,11 +175,11 @@ class ExplorationController(Node):
             angle = math.atan2(math.sin(angle), math.cos(angle))
             deg = math.degrees(angle)
 
-            if -60.0 <= deg <= 60.0:
+            if -75.0 <= deg <= 75.0:
                 front_vals.append(r)
-            elif 60.0 < deg <= 120.0:
+            elif 75.0 < deg <= 120.0:
                 left_vals.append(r)
-            elif -120.0 <= deg < -60.0:
+            elif -120.0 <= deg < -75.0:
                 right_vals.append(r)
             else:
                 rear_vals.append(r)

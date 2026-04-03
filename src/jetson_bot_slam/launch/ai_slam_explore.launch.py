@@ -1,45 +1,20 @@
 """
 ai_slam_explore.launch.py
 ==========================
-Full autonomy stack: LiDAR SLAM + Nav2 path planning + frontier exploration
-+ AI semantic labelling using VILA 2.7B.
+Minimal autonomous mapping stack:
 
-Data flow (Nav2 mode — default)
---------------------------------
-STL-27L LiDAR ──► /scan  ──► RTAB-Map (SLAM → /map)
-                           ──► Nav2 costmaps (obstacle avoidance)
+  STL-27L LiDAR  ──► /scan ──► slam_toolbox (builds /map)
+  Arduino Mega   ──► arduino_bridge ──► /wheel_ticks ──► mecanum_odometry ──► /odom
+  exploration_controller reads /scan and writes /cmd_vel (linear.x + angular.z only)
+  motor_driver reads /cmd_vel and drives the wheels
 
-RTAB-Map /map ──► Nav2 global_costmap ──► explore_lite (pick frontier goal)
-                                       ──► Nav2 planner (path to frontier)
-                                       ──► Nav2 DWB controller ──► /cmd_vel ──► motor_driver
+No Nav2. No costmaps. No path planner. No frontier logic.
+The robot drives forward, avoids obstacles via LiDAR, turns toward
+open space, and slam_toolbox builds the map in the background.
 
-USB camera ──► /image_raw  ──► image_proc (yuv→rgb)
-                            ──► vila_scene_labeller (VILA 2.7B scene label)
-
-Arduino ──► arduino_bridge ──► /wheel_ticks ──► mecanum_odometry ──► /odom ──► RTAB-Map
-                            ──► /ultrasonic_range ──► Nav2 costmaps (rear backup)
-
-vila_scene_labeller    ──► /ai/semantic_label    (map annotation)
-                       ──► /ai/room              (inferred room)
-
-Usage (inside dustynv/nano_llm container)
------------------------------------------
-    ros2 launch jetson_bot_slam ai_slam_explore.launch.py
-    ros2 launch jetson_bot_slam ai_slam_explore.launch.py use_nav2:=false    # reactive fallback
-    ros2 launch jetson_bot_slam ai_slam_explore.launch.py use_slam:=false
-    ros2 launch jetson_bot_slam ai_slam_explore.launch.py room_hints_enabled:=false
-
-Stop/resume frontier exploration at runtime:
-    ros2 topic pub /explore/resume std_msgs/Bool "data: false" --once
-    ros2 topic pub /explore/resume std_msgs/Bool "data: true"  --once
-
-Requirements
-------------
-- Running inside dustynv/nano_llm:humble container with GPU passthrough
-- VILA model: Efficient-Large-Model/VILA-2.7b (auto-downloaded on first run)
-- STL-27L LiDAR on /dev/ttyUSB1
-- Arduino Mega on /dev/ttyUSB0
-- Nav2 + explore_lite installed (handled by setup_vila.sh)
+Optional:
+  rviz:=true           — launch RViz2 (needs $DISPLAY)
+  use_camera:=true     — enable USB camera + VILA AI labeller
 """
 
 import os
@@ -48,7 +23,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, Command, PythonExpression
+from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -58,41 +33,27 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────
     args = [
-        # Hardware ports
-        DeclareLaunchArgument('serial_port',        default_value='/dev/arduino',
-                              description='Arduino Mega serial port'),
-        DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar',
-                              description='STL-27L LiDAR serial port'),
+        DeclareLaunchArgument('serial_port',        default_value='/dev/arduino'),
+        DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar'),
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
-        DeclareLaunchArgument('rviz',               default_value='false',
-                              description='Launch RViz2 (needs display)'),
-        # VILA model overrides
+        DeclareLaunchArgument('rviz',               default_value='false'),
+        # Motion tuning
+        DeclareLaunchArgument('move_speed',          default_value='0.20'),
+        DeclareLaunchArgument('turn_speed',          default_value='0.55'),
+        DeclareLaunchArgument('obstacle_distance',   default_value='0.35'),
+        DeclareLaunchArgument('emergency_stop_dist', default_value='0.10'),
+        DeclareLaunchArgument('rear_safety_dist',    default_value='0.15'),
+        DeclareLaunchArgument('backup_s',            default_value='1.5'),
+        DeclareLaunchArgument('min_turn_s',          default_value='2.0'),
+        DeclareLaunchArgument('max_turn_s',          default_value='8.0'),
+        # Camera / AI (off by default)
+        DeclareLaunchArgument('use_camera',          default_value='false'),
         DeclareLaunchArgument('vila_model',
                               default_value='Efficient-Large-Model/VILA-2.7b'),
         DeclareLaunchArgument('vila_api',            default_value='mlc'),
         DeclareLaunchArgument('vila_quantization',   default_value='q4f16_ft'),
-        # Exploration (LiDAR-driven)
-        DeclareLaunchArgument('move_speed',          default_value='0.20'),
-        DeclareLaunchArgument('turn_speed',          default_value='0.55'),
-        DeclareLaunchArgument('obstacle_distance',   default_value='0.30'),
-        DeclareLaunchArgument('emergency_stop_dist', default_value='0.08'),
-        DeclareLaunchArgument('rear_safety_dist',    default_value='0.15'),
-        DeclareLaunchArgument('backup_s',            default_value='2.0'),
-        DeclareLaunchArgument('min_turn_s',          default_value='3.0'),
-        DeclareLaunchArgument('max_turn_s',          default_value='10.0'),
+        DeclareLaunchArgument('room_hints_enabled',  default_value='true'),
         DeclareLaunchArgument('label_every',         default_value='5'),
-        # SLAM
-        DeclareLaunchArgument('use_slam',            default_value='true',
-                              description='Start RTAB-Map LiDAR SLAM'),
-        # Nav2 + Frontier exploration
-        DeclareLaunchArgument('use_nav2',            default_value='false',
-                              description='Use Nav2 path planning (not needed for exploration)'),
-        # Camera + AI (disabled by default until SLAM is validated)
-        DeclareLaunchArgument('use_camera',          default_value='false',
-                              description='Enable USB camera + VILA AI labeller'),
-        # Room identification
-        DeclareLaunchArgument('room_hints_enabled',  default_value='true',
-                              description='Enable AI room identification from labels'),
     ]
 
     # ── URDF / robot_state_publisher ──────────────────────────────────────
@@ -108,7 +69,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Hardware layer (jetson_bot_slam) ───────────────────────────────────
+    # ── Arduino bridge ────────────────────────────────────────────────────
     arduino_bridge = Node(
         package='jetson_bot_slam',
         executable='arduino_bridge',
@@ -120,6 +81,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ── Mecanum odometry ──────────────────────────────────────────────────
     mecanum_odom = Node(
         package='jetson_bot_slam',
         executable='mecanum_odometry',
@@ -134,6 +96,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ── Motor driver ──────────────────────────────────────────────────────
     motor_driver = Node(
         package='jetson_bot_slam',
         executable='motor_driver',
@@ -148,7 +111,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── STL-27L LiDAR ────────────────────────────────────────────────────
+    # ── STL-27L LiDAR ─────────────────────────────────────────────────────
     lidar = Node(
         package='ldlidar_stl_ros2',
         executable='ldlidar_stl_ros2_node',
@@ -160,12 +123,45 @@ def generate_launch_description():
             'frame_id':        'laser_frame',
             'port_name':       LaunchConfiguration('lidar_port'),
             'port_baudrate':   921600,
-            'laser_scan_dir':  True,   # CCW positive (ROS convention)
+            'laser_scan_dir':  True,
             'enable_angle_crop_func': False,
         }],
     )
 
-    # ── USB Camera (only when use_camera:=true) ────────────────────────
+    # ── SLAM Toolbox ──────────────────────────────────────────────────────
+    slam_toolbox_pkg  = get_package_share_directory('slam_toolbox')
+    slam_params_file  = os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml')
+    slam_toolbox = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(slam_toolbox_pkg, 'launch', 'online_async_launch.py')),
+        launch_arguments={
+            'use_sim_time':    'false',
+            'slam_params_file': slam_params_file,
+        }.items(),
+    )
+
+    # ── Exploration controller ─────────────────────────────────────────────
+    # The ONLY node that publishes /cmd_vel.
+    # Drives forward, avoids obstacles (linear.x + angular.z only — no strafe).
+    exploration_ctrl = Node(
+        package='robot_control',
+        executable='exploration_controller',
+        name='exploration_controller',
+        parameters=[{
+            'move_speed':          LaunchConfiguration('move_speed'),
+            'turn_speed':          LaunchConfiguration('turn_speed'),
+            'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
+            'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
+            'rear_safety_dist':    LaunchConfiguration('rear_safety_dist'),
+            'backup_s':            LaunchConfiguration('backup_s'),
+            'min_turn_s':          LaunchConfiguration('min_turn_s'),
+            'max_turn_s':          LaunchConfiguration('max_turn_s'),
+            'label_every':         LaunchConfiguration('label_every'),
+        }],
+        output='screen',
+    )
+
+    # ── USB Camera + VILA AI (opt-in) ─────────────────────────────────────
     usb_camera = Node(
         package='usb_cam',
         executable='usb_cam_node_exe',
@@ -189,36 +185,19 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
-    # ── Image format converter (only when use_camera:=true) ──────────────
     image_convert = Node(
         package='image_proc',
         executable='rectify_node',
         name='image_convert',
         remappings=[
-            ('image_raw',        '/image_raw'),
-            ('camera_info',      '/camera_info'),
-            ('image',            '/image_rect_color'),
+            ('image_raw',   '/image_raw'),
+            ('camera_info', '/camera_info'),
+            ('image',       '/image_rect_color'),
         ],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_camera')),
     )
 
-    # ── SLAM Toolbox (2D LiDAR mode) ──────────────────────────────────────
-    slam_toolbox_pkg = get_package_share_directory('slam_toolbox')
-    slam_params_file = os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml')
-    
-    slam_toolbox = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(slam_toolbox_pkg, 'launch', 'online_async_launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': 'false',
-            'slam_params_file': slam_params_file,
-        }.items(),
-        condition=IfCondition(LaunchConfiguration('use_slam')),
-    )
-
-    # ── VILA scene labeller ───────────────────────────────────────────────
     vila_params_file = os.path.join(slam_pkg, 'config', 'vila_params.yaml')
     vila_labeller = Node(
         package='jetson_bot_slam',
@@ -237,41 +216,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── Nav2 path planning (replaces reactive controller) ─────────────────
-    nav2_pkg = get_package_share_directory('nav2_bringup')
-    nav2_params = os.path.join(slam_pkg, 'config', 'nav2_params.yaml')
-
-    nav2 = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(nav2_pkg, 'launch', 'navigation_launch.py')),
-        launch_arguments={
-            'use_sim_time':  'false',
-            'params_file':    nav2_params,
-            'autostart':     'true',
-        }.items(),
-        condition=IfCondition(LaunchConfiguration('use_nav2')),
-    )
-
-    # ── Frontier explorer (direct LiDAR control — NO Nav2 required) ────────
-    frontier_explorer = Node(
-        package='robot_control',
-        executable='frontier_explorer',
-        name='frontier_explorer',
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('use_slam')),
-        parameters=[{
-            'move_speed':          LaunchConfiguration('move_speed'),
-            'turn_speed':          LaunchConfiguration('turn_speed'),
-            'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
-            'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
-            'planner_frequency':   2.0,
-            'min_frontier_size':   0.30,
-            'startup_delay':       8.0,
-        }],
-    )
-
-
-    # ── RViz2 (optional, needs display) ───────────────────────────────────
+    # ── RViz2 (optional) ──────────────────────────────────────────────────
     rviz_cfg = os.path.join(slam_pkg, 'rviz', 'slam_view.rviz')
     rviz = Node(
         package='rviz2',
@@ -282,16 +227,15 @@ def generate_launch_description():
     )
 
     return LaunchDescription(args + [
-        robot_state_pub,
-        arduino_bridge,
-        mecanum_odom,
-        motor_driver,
-        lidar,            # STL-27L → /scan
-        usb_camera,       # Only when use_camera:=true
-        image_convert,    # Only when use_camera:=true
-        slam_toolbox,     # LiDAR SLAM
-        vila_labeller,    # Only when use_camera:=true
-        nav2,             # Nav2 (opt-in with use_nav2:=true, off by default)
-        frontier_explorer,  # Frontier exploration (only /cmd_vel publisher)
-        rviz,
+        robot_state_pub,    # TF / URDF
+        arduino_bridge,     # Wheel encoders + ultrasonic
+        mecanum_odom,       # /odom from encoders
+        motor_driver,       # /cmd_vel → wheel speeds
+        lidar,              # /scan from STL-27L
+        slam_toolbox,       # /scan + /odom → /map
+        exploration_ctrl,   # /scan → /cmd_vel (only motion publisher)
+        usb_camera,         # opt-in: use_camera:=true
+        image_convert,      # opt-in
+        vila_labeller,      # opt-in
+        rviz,               # opt-in: rviz:=true
     ])

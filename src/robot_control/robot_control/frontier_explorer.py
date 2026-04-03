@@ -1,55 +1,33 @@
 #!/usr/bin/env python3
 """
-frontier_explorer.py — Direct LiDAR frontier exploration (NO Nav2)
-===================================================================
-Combines frontier detection (from the SLAM map) with direct LiDAR-based
-obstacle avoidance. No costmaps, no DWB, no global planner, no behavior
-trees. Just: find unexplored space → drive toward it → don't hit anything.
+frontier_explorer.py — SLAM-guided direct LiDAR exploration
+============================================================
+The only node that publishes /cmd_vel.
 
-How it works
+Two loops run in parallel:
+  1. Frontier planner  (2 Hz)  — reads /map, finds the best unexplored
+     direction, sets self._goal as a heading angle (in robot frame).
+  2. Control loop      (10 Hz) — drives toward that heading while using
+     live /scan to repel away from nearby obstacles in real time.
+
+No Nav2. No costmaps. No action clients. No global planner.
+
+Startup gate
 ------------
-1. Read the SLAM map (/map) to find frontier clusters (free space near
-   unknown space).
-2. Score each frontier by size (prefer large) and direction clearance
-   (prefer directions with no LiDAR obstacles).
-3. Compute the desired heading toward the best frontier.
-4. Drive the robot using a simple potential-field-like controller:
-   - Translate toward the goal at `move_speed`
-   - Steer away from any close LiDAR obstacles
-   - Emergency stop if something is within `emergency_stop_dist`
-   - The mecanum drive allows simultaneous strafe + turn, so the robot
-     can slide around obstacles naturally.
+The node will NOT publish any velocity until:
+  - A /scan has been received
+  - A /map has been received
+  - The map→base_link TF is available (SLAM has initialised)
+  - startup_delay seconds have elapsed
 
-Why not Nav2?
--------------
-Nav2 (costmaps + DWB planner + NavFn + behavior trees) is designed for
-navigating in a KNOWN map. For exploration, where the map is being built
-in real-time, it creates more problems than it solves:
-  - Costmap inflation fights with the expanding SLAM frontiers
-  - DWB critics designed for diff-drive cause mecanum robots to spin
-  - "No valid trajectories" when the planner can't find a clean path
-  - Recovery behaviors (spin, backup) conflict with exploration goals
-Direct LiDAR control is simpler, faster, and more reliable for this task.
+Motion model (mecanum)
+----------------------
+  linear.x  = forward/back
+  linear.y  = strafe left/right  (mecanum only)
+  angular.z = turn
 
-Subscribes
-----------
-  /map    nav_msgs/OccupancyGrid   SLAM map from slam_toolbox
-  /scan   sensor_msgs/LaserScan    360° LiDAR for obstacle avoidance
-  /odom   nav_msgs/Odometry        Robot pose (fallback if no TF)
-
-Publishes
----------
-  /cmd_vel   geometry_msgs/Twist   Velocity commands (mecanum strafe supported)
-
-Parameters
-----------
-  move_speed          float  0.22   m/s  — forward speed
-  turn_speed          float  0.6    rad/s — max turn rate
-  obstacle_distance   float  0.40   m    — start steering away at this range
-  emergency_stop_dist float  0.12   m    — full stop, back up
-  planner_frequency   float  2.0    Hz   — how often to re-evaluate frontiers
-  min_frontier_size   float  0.30   m    — ignore tiny frontier clusters
-  startup_delay       float  8.0    s    — wait for SLAM to produce first map
+All three axes are used simultaneously, so the robot can slide around
+obstacles rather than stopping and spinning.
 """
 
 import math
@@ -57,14 +35,12 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool
 
 import tf2_ros
 
-# ── Occupancy values ──────────────────────────────────────────────────────────
 FREE    = 0
 UNKNOWN = -1
 
@@ -74,13 +50,13 @@ class FrontierExplorer(Node):
         super().__init__('frontier_explorer')
 
         # ── Parameters ────────────────────────────────────────────────────────
-        self.declare_parameter('move_speed',          0.22)
-        self.declare_parameter('turn_speed',          0.6)
-        self.declare_parameter('obstacle_distance',   0.40)
-        self.declare_parameter('emergency_stop_dist', 0.12)
-        self.declare_parameter('planner_frequency',   2.0)
-        self.declare_parameter('min_frontier_size',   0.30)
-        self.declare_parameter('startup_delay',       8.0)
+        self.declare_parameter('move_speed',          0.20)   # m/s forward
+        self.declare_parameter('turn_speed',          0.55)   # rad/s
+        self.declare_parameter('obstacle_distance',   0.35)   # m — start repelling
+        self.declare_parameter('emergency_stop_dist', 0.10)   # m — full stop
+        self.declare_parameter('planner_frequency',   1.0)    # Hz
+        self.declare_parameter('min_frontier_size',   0.25)   # m
+        self.declare_parameter('startup_delay',       8.0)    # s
 
         self._move_spd   = self.get_parameter('move_speed').value
         self._turn_spd   = self.get_parameter('turn_speed').value
@@ -88,184 +64,154 @@ class FrontierExplorer(Node):
         self._estop_dist = self.get_parameter('emergency_stop_dist').value
         self._plan_freq  = self.get_parameter('planner_frequency').value
         self._min_size_m = self.get_parameter('min_frontier_size').value
-        self._startup_delay = self.get_parameter('startup_delay').value
+        self._startup    = self.get_parameter('startup_delay').value
 
         # ── State ─────────────────────────────────────────────────────────────
-        self._map: OccupancyGrid | None = None
-        self._scan: LaserScan | None = None
-        self._robot_x = 0.0
-        self._robot_y = 0.0
-        self._robot_yaw = 0.0
-        self._start_time = time.monotonic()
-        self._ready = False
-        self._enabled = True
+        self._map:  OccupancyGrid | None = None
+        self._scan: LaserScan     | None = None
 
-        # Current goal in map frame (set by frontier planner)
-        self._goal_x = None
-        self._goal_y = None
-        self._no_frontier_count = 0
+        # Robot pose in map frame — set only when TF succeeds
+        self._pos_x  = None   # None = TF not yet available
+        self._pos_y  = None
+        self._pos_yaw = 0.0
 
-        # ── TF2 ──────────────────────────────────────────────────────────────
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # Current goal heading in ROBOT-LOCAL frame (radians)
+        # 0 = straight ahead, +π/2 = left, -π/2 = right
+        self._goal_heading: float | None = None
 
-        # ── Publishers ────────────────────────────────────────────────────────
-        self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._start_time  = time.monotonic()
+        self._ready       = False   # True once startup conditions all met
+        self._log_tick    = 0
+
+        # ── TF ────────────────────────────────────────────────────────────────
+        self._tf_buf = tf2_ros.Buffer()
+        self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
+
+        # ── Publisher ─────────────────────────────────────────────────────────
+        self._cmd = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # ── Subscribers ───────────────────────────────────────────────────────
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.create_subscription(OccupancyGrid, '/map', self._on_map, map_qos)
+        self.create_subscription(OccupancyGrid, '/map', self._cb_map, map_qos)
 
         scan_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.create_subscription(LaserScan, '/scan', self._on_scan, scan_qos)
-
-        odom_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST, depth=5)
-        self.create_subscription(Odometry, '/odom', self._on_odom, odom_qos)
-
-        self.create_subscription(Bool, '/explore/resume', self._on_resume, 10)
+        self.create_subscription(LaserScan, '/scan', self._cb_scan, scan_qos)
 
         # ── Timers ────────────────────────────────────────────────────────────
-        # Fast control loop (10 Hz) — obstacle avoidance + driving
-        self.create_timer(0.1, self._control_loop)
-
-        # Slower frontier planner
-        plan_period = 1.0 / max(self._plan_freq, 0.1)
-        self.create_timer(plan_period, self._plan_frontiers)
-
-        self._log_tick = 0
+        self.create_timer(0.1, self._control_loop)                         # 10 Hz
+        self.create_timer(1.0 / max(self._plan_freq, 0.1), self._plan)    # planner
 
         self.get_logger().info(
-            f'Frontier Explorer (NO Nav2) ready | '
+            f'FrontierExplorer ready | '
             f'speed={self._move_spd} m/s | turn={self._turn_spd} rad/s | '
-            f'obstacle={self._obs_dist} m | estop={self._estop_dist} m | '
-            f'planner_freq={self._plan_freq} Hz | '
-            f'startup_delay={self._startup_delay:.0f} s')
+            f'obs={self._obs_dist} m | estop={self._estop_dist} m | '
+            f'startup_delay={self._startup:.0f} s')
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _on_map(self, msg: OccupancyGrid):
-        self._map = msg
+    def _cb_map(self, msg):  self._map  = msg
+    def _cb_scan(self, msg): self._scan = msg
 
-    def _on_scan(self, msg: LaserScan):
-        self._scan = msg
+    # ── TF lookup ─────────────────────────────────────────────────────────────
 
-    def _on_odom(self, msg: Odometry):
-        # Fallback position (used before TF is available)
-        pass
-
-    def _on_resume(self, msg: Bool):
-        self._enabled = msg.data
-        self.get_logger().info(
-            f'Exploration {"resumed" if self._enabled else "paused"}')
-        if not self._enabled:
-            self._cmd_pub.publish(Twist())
-
-    # ── TF ────────────────────────────────────────────────────────────────────
-
-    def _update_pose(self):
+    def _update_tf(self) -> bool:
+        """Update robot pose from TF. Returns True if succeeded."""
         try:
-            t = self._tf_buffer.lookup_transform('map', 'base_link',
-                                                  rclpy.time.Time())
-            self._robot_x = t.transform.translation.x
-            self._robot_y = t.transform.translation.y
+            t = self._tf_buf.lookup_transform('map', 'base_link',
+                                               rclpy.time.Time())
+            self._pos_x = t.transform.translation.x
+            self._pos_y = t.transform.translation.y
             q = t.transform.rotation
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            self._robot_yaw = math.atan2(siny_cosp, cosy_cosp)
+            self._pos_yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            return True
         except Exception:
-            pass  # Keep previous values
+            return False
 
-    # ── Frontier planner (runs at planner_frequency Hz) ───────────────────────
+    # ── Readiness check ────────────────────────────────────────────────────────
 
-    def _plan_frontiers(self):
-        if not self._enabled or self._map is None or self._scan is None:
+    def _check_ready(self) -> bool:
+        if self._ready:
+            return True
+        if self._scan is None:
+            return False
+        if self._map is None:
+            return False
+        if not self._update_tf():
+            return False
+        if time.monotonic() - self._start_time < self._startup:
+            return False
+        self._ready = True
+        self.get_logger().info(
+            f'All sensors ready — starting exploration | '
+            f'robot at ({self._pos_x:.2f}, {self._pos_y:.2f})')
+        return True
+
+    # ── Frontier planner ──────────────────────────────────────────────────────
+
+    def _plan(self):
+        if not self._check_ready():
             return
-
-        if not self._ready:
-            if time.monotonic() - self._start_time < self._startup_delay:
-                return
-            self._ready = True
-            self.get_logger().info('Startup delay elapsed — beginning exploration')
-
-        self._update_pose()
+        if not self._update_tf():
+            return   # Lost TF — don't update goal, keep last heading
 
         clusters = self._find_frontiers()
         if not clusters:
-            self._no_frontier_count += 1
-            if self._no_frontier_count % 20 == 1:
-                self.get_logger().info(
-                    f'No frontiers (#{self._no_frontier_count}) — '
-                    'area may be fully mapped')
-            # Keep driving toward last goal or forward
+            self._log_tick += 1
+            if self._log_tick % 10 == 0:
+                self.get_logger().info('No frontiers found — area may be fully mapped')
             return
-        self._no_frontier_count = 0
 
-        # Score and pick the best frontier
         best = self._pick_frontier(clusters)
         if best is None:
             return
 
         gx, gy = best
-        dist = math.hypot(gx - self._robot_x, gy - self._robot_y)
+        # Convert goal world position → robot-local heading angle
+        dx = gx - self._pos_x
+        dy = gy - self._pos_y
+        goal_angle_world = math.atan2(dy, dx)
+        self._goal_heading = math.atan2(
+            math.sin(goal_angle_world - self._pos_yaw),
+            math.cos(goal_angle_world - self._pos_yaw))
 
-        # Only update goal if it's substantially different from current
-        if (self._goal_x is None or
-            math.hypot(gx - self._goal_x, gy - self._goal_y) > 0.3):
-            self._goal_x, self._goal_y = gx, gy
-            self.get_logger().info(
-                f'New frontier goal ({gx:.2f}, {gy:.2f}) | '
-                f'dist={dist:.2f} m | {len(clusters)} clusters')
+        dist = math.hypot(dx, dy)
+        self.get_logger().info(
+            f'Frontier → ({gx:.2f}, {gy:.2f}) | '
+            f'dist={dist:.2f} m | heading={math.degrees(self._goal_heading):.0f}° local | '
+            f'{len(clusters)} clusters')
 
     def _find_frontiers(self) -> list[list[tuple[float, float]]]:
-        """Find frontier clusters on the SLAM map."""
-        m = self._map
+        m   = self._map
         w, h = m.info.width, m.info.height
-        res = m.info.resolution
-        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+        res  = m.info.resolution
+        ox   = m.info.origin.position.x
+        oy   = m.info.origin.position.y
         data = m.data
 
-        def idx(r, c):
-            return r * w + c
+        def get(r, c):
+            if r < 0 or r >= h or c < 0 or c >= w:
+                return UNKNOWN
+            return data[r * w + c]
 
         def world(r, c):
             return ox + (c + 0.5) * res, oy + (r + 0.5) * res
 
-        def get_cell(r, c):
-            if r < 0 or r >= h or c < 0 or c >= w:
-                return UNKNOWN
-            return data[idx(r, c)]
-
-        # Cells within 1 cell of unknown
-        near_unknown = set()
+        # Frontier: FREE cell adjacent to UNKNOWN
+        frontier = [False] * (w * h)
         for row in range(h):
             for col in range(w):
-                if (get_cell(row - 1, col) == UNKNOWN or
-                    get_cell(row + 1, col) == UNKNOWN or
-                    get_cell(row, col - 1) == UNKNOWN or
-                    get_cell(row, col + 1) == UNKNOWN):
-                    near_unknown.add((row, col))
-
-        # Frontier: FREE cell within 2 cells of UNKNOWN
-        frontier_mask = [False] * (w * h)
-        for row in range(h):
-            for col in range(w):
-                i = idx(row, col)
-                if data[i] != FREE:
+                if get(row, col) != FREE:
                     continue
-                if (row, col) in near_unknown:
-                    frontier_mask[i] = True
-                    continue
-                for nr, nc in ((row-1, col), (row+1, col),
-                               (row, col-1), (row, col+1)):
-                    if (nr, nc) in near_unknown:
-                        frontier_mask[i] = True
+                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                    if get(row+dr, col+dc) == UNKNOWN:
+                        frontier[row * w + col] = True
                         break
 
         # BFS cluster
@@ -274,196 +220,167 @@ class FrontierExplorer(Node):
         min_cells = max(1, int(self._min_size_m / res))
 
         for start in range(w * h):
-            if not frontier_mask[start] or visited[start]:
+            if not frontier[start] or visited[start]:
                 continue
-            pts = []
-            queue = [start]
+            pts, queue = [], [start]
             visited[start] = True
             while queue:
                 cur = queue.pop()
                 r, c = divmod(cur, w)
                 pts.append(world(r, c))
-                for nr, nc in ((r-1, c), (r+1, c), (r, c-1), (r, c+1)):
-                    if 0 <= nr < h and 0 <= nc < w:
-                        ni = idx(nr, nc)
-                        if frontier_mask[ni] and not visited[ni]:
-                            visited[ni] = True
-                            queue.append(ni)
+                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                    nr, nc = r+dr, c+dc
+                    ni = nr * w + nc
+                    if 0 <= nr < h and 0 <= nc < w and frontier[ni] and not visited[ni]:
+                        visited[ni] = True
+                        queue.append(ni)
             if len(pts) >= min_cells:
                 clusters.append(pts)
 
         return clusters
 
     def _pick_frontier(self, clusters) -> tuple[float, float] | None:
-        """Pick the best frontier considering size, distance, and LiDAR clearance."""
+        """Score each frontier cluster; return best world (x, y)."""
         best_score = -float('inf')
-        best = None
+        best_pos   = None
 
         for cluster in clusters:
             cx = sum(p[0] for p in cluster) / len(cluster)
             cy = sum(p[1] for p in cluster) / len(cluster)
-            dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
+            dist = math.hypot(cx - self._pos_x, cy - self._pos_y)
 
             if dist < 0.3 or dist > 8.0:
                 continue
 
-            size = len(cluster)
-            clearance = self._clearance_toward(cx, cy)
+            # Heading to this frontier in robot-local frame
+            goal_angle_world = math.atan2(cy - self._pos_y, cx - self._pos_x)
+            heading_local = math.atan2(
+                math.sin(goal_angle_world - self._pos_yaw),
+                math.cos(goal_angle_world - self._pos_yaw))
 
-            # Score: prefer large, close, unblocked frontiers
-            score = size * 1.0 - dist * 3.0
+            # LiDAR clearance in that direction
+            clearance = self._lidar_clearance(heading_local)
+
+            size  = len(cluster)
+            score = size * 1.0 - dist * 2.0
+
             if clearance < self._obs_dist:
-                score -= 500.0   # Heavily penalize blocked directions
+                score -= 300.0   # heavy penalty if blocked
             else:
-                score += min(clearance, 3.0) * 2.0  # Bonus for clearance
+                score += min(clearance, 3.0) * 3.0   # reward open paths
 
             if score > best_score:
                 best_score = score
-                best = (cx, cy)
+                best_pos   = (cx, cy)
 
-        return best
+        return best_pos
 
-    def _clearance_toward(self, gx: float, gy: float) -> float:
-        """Minimum LiDAR range in a ±30° cone toward the goal."""
+    def _lidar_clearance(self, heading_local: float) -> float:
+        """Minimum LiDAR range in ±30° cone around heading_local (robot frame)."""
         scan = self._scan
         if scan is None:
             return float('inf')
-
-        dx = gx - self._robot_x
-        dy = gy - self._robot_y
-        goal_local = math.atan2(dy, dx) - self._robot_yaw
-        goal_local = math.atan2(math.sin(goal_local), math.cos(goal_local))
-
         cone = math.radians(30.0)
         min_r = float('inf')
-
         for i, r in enumerate(scan.ranges):
-            if r < scan.range_min or r > scan.range_max or math.isinf(r) or math.isnan(r):
+            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r):
                 continue
             ray = scan.angle_min + i * scan.angle_increment
-            diff = abs(math.atan2(math.sin(ray - goal_local),
-                                   math.cos(ray - goal_local)))
+            diff = abs(math.atan2(math.sin(ray - heading_local),
+                                   math.cos(ray - heading_local)))
             if diff <= cone and r < min_r:
                 min_r = r
-
         return min_r
 
-    # ── 10 Hz control loop — direct LiDAR driving ────────────────────────────
+    # ── 10 Hz control loop ────────────────────────────────────────────────────
 
     def _control_loop(self):
-        if not self._ready or not self._enabled or self._scan is None:
+        if not self._ready:
             return
 
-        self._update_pose()
         scan = self._scan
+        if scan is None:
+            return
+
         twist = Twist()
 
-        # ── Build obstacle repulsion from raw LiDAR ──────────────────────
-        # Sum up repulsive vectors from all nearby obstacles
-        repulse_x = 0.0
-        repulse_y = 0.0
+        # ── Compute obstacle repulsion from raw LiDAR ─────────────────────
+        repulse_x = 0.0   # in robot frame: +x = forward
+        repulse_y = 0.0   # +y = left
         closest_front = float('inf')
-        closest_any = float('inf')
+        closest_any   = float('inf')
 
         for i, r in enumerate(scan.ranges):
-            if r < scan.range_min or r > scan.range_max or math.isinf(r) or math.isnan(r):
+            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
                 continue
+
+            ray = scan.angle_min + i * scan.angle_increment
+            norm = math.atan2(math.sin(ray), math.cos(ray))  # [-π, π]
 
             if r < closest_any:
                 closest_any = r
-
-            ray_angle = scan.angle_min + i * scan.angle_increment
-
-            # Check if this is roughly "in front" (±90°)
-            norm_angle = math.atan2(math.sin(ray_angle), math.cos(ray_angle))
-            if abs(norm_angle) < math.radians(90) and r < closest_front:
+            if abs(norm) < math.radians(90) and r < closest_front:
                 closest_front = r
 
-            # Only repulse from obstacles within obstacle_distance
+            # Repulse only from obstacles closer than obs_dist
             if r < self._obs_dist:
-                # Repulsion force: inverse-square, direction away from obstacle
-                strength = (self._obs_dist - r) / self._obs_dist
-                strength = strength ** 2  # Quadratic for stronger close repulsion
-                # Obstacle is at (r*cos(angle), r*sin(angle)) in robot frame
-                # Push AWAY from it
-                repulse_x -= strength * math.cos(ray_angle)
-                repulse_y -= strength * math.sin(ray_angle)
+                strength = ((self._obs_dist - r) / self._obs_dist) ** 2
+                repulse_x -= strength * math.cos(ray)
+                repulse_y -= strength * math.sin(ray)
 
-        # ── Emergency stop ───────────────────────────────────────────────
+        # ── Emergency stop ────────────────────────────────────────────────
         if closest_any < self._estop_dist:
-            self._cmd_pub.publish(Twist())  # Full stop
-            self._log_tick += 1
+            self._cmd.publish(Twist())
             if self._log_tick % 10 == 0:
                 self.get_logger().warn(
                     f'EMERGENCY STOP — obstacle at {closest_any:.2f} m')
+            self._log_tick += 1
             return
 
-        # ── Determine desired direction ──────────────────────────────────
-        if self._goal_x is not None:
-            # Direction to frontier goal in robot-local frame
-            dx = self._goal_x - self._robot_x
-            dy = self._goal_y - self._robot_y
-            goal_dist = math.hypot(dx, dy)
-            goal_angle_map = math.atan2(dy, dx)
-            goal_angle_local = goal_angle_map - self._robot_yaw
-            goal_angle_local = math.atan2(math.sin(goal_angle_local),
-                                           math.cos(goal_angle_local))
-
-            if goal_dist < 0.3:
-                # Reached the goal, clear it
-                self.get_logger().info(
-                    f'Reached frontier goal ({self._goal_x:.2f}, {self._goal_y:.2f})')
-                self._goal_x = None
-                self._goal_y = None
-                self._cmd_pub.publish(Twist())
-                return
-
-            # Attraction toward goal
-            attract_strength = min(goal_dist, 1.0)  # Cap at 1.0
-            attract_x = attract_strength * math.cos(goal_angle_local)
-            attract_y = attract_strength * math.sin(goal_angle_local)
+        # ── Attraction toward frontier goal ───────────────────────────────
+        if self._goal_heading is not None:
+            # Unit vector in goal direction
+            attract_x = math.cos(self._goal_heading)
+            attract_y = math.sin(self._goal_heading)
         else:
-            # No frontier goal — just drive forward slowly
-            attract_x = 0.3
+            # No frontier yet — drive straight forward
+            attract_x = 1.0
             attract_y = 0.0
 
-        # ── Combine attraction + repulsion ───────────────────────────────
-        # Repulsion is scaled up so the robot STRONGLY avoids obstacles
-        repulsion_gain = 3.0
-        combined_x = attract_x + repulse_x * repulsion_gain
-        combined_y = attract_y + repulse_y * repulsion_gain
+        # ── Combine (repulsion weighted 2× attraction) ────────────────────
+        nav_x = attract_x + repulse_x * 2.0
+        nav_y = attract_y + repulse_y * 2.0
 
-        # Convert to velocity commands
-        # Forward/backward (clamp to max speed)
-        fwd = max(-self._move_spd, min(self._move_spd, combined_x * self._move_spd))
-        # Strafe (mecanum)
-        strafe = max(-self._move_spd * 0.7, min(self._move_spd * 0.7,
-                      combined_y * self._move_spd))
-        # Turn toward combined direction
-        desired_heading = math.atan2(combined_y, combined_x)
-        turn = max(-self._turn_spd, min(self._turn_spd,
-                    desired_heading * 1.5))
+        # Don't drive forward if something is close ahead
+        if closest_front < self._obs_dist and nav_x > 0:
+            nav_x = 0.0
 
-        # If front is too close, don't go forward at all
-        if closest_front < self._obs_dist and fwd > 0:
-            fwd = 0.0
+        # Scale to configured speeds
+        fwd    = max(-self._move_spd, min(self._move_spd, nav_x * self._move_spd))
+        strafe = max(-self._move_spd * 0.6, min(self._move_spd * 0.6,
+                      nav_y * self._move_spd))
 
-        twist.linear.x = fwd
-        twist.linear.y = strafe
+        # Steer: turn to face the combined nav direction
+        desired_heading = math.atan2(nav_y, nav_x) if (abs(nav_x) + abs(nav_y)) > 0.01 else 0.0
+        turn = max(-self._turn_spd, min(self._turn_spd, desired_heading * 1.5))
+
+        twist.linear.x  = fwd
+        twist.linear.y  = strafe
         twist.angular.z = turn
+        self._cmd.publish(twist)
 
-        self._cmd_pub.publish(twist)
-
-        # ── Periodic logging ─────────────────────────────────────────────
+        # ── Status log every 2 s ──────────────────────────────────────────
         self._log_tick += 1
-        if self._log_tick % 20 == 0:  # Every 2 seconds
-            goal_str = (f'({self._goal_x:.2f}, {self._goal_y:.2f})'
-                       if self._goal_x is not None else 'none')
+        if self._log_tick % 20 == 0:
+            goal_deg = (f'{math.degrees(self._goal_heading):.0f}°'
+                        if self._goal_heading is not None else 'none')
+            pos_str  = (f'({self._pos_x:.2f}, {self._pos_y:.2f})'
+                        if self._pos_x is not None else 'no-TF')
             self.get_logger().info(
-                f'pos=({self._robot_x:.2f}, {self._robot_y:.2f}) | '
-                f'goal={goal_str} | '
+                f'pos={pos_str} | '
+                f'goal_heading={goal_deg} | '
                 f'front={closest_front:.2f} m | '
-                f'vel=({fwd:.2f}, {strafe:.2f}, {turn:.2f})')
+                f'cmd=({fwd:.2f} fwd, {strafe:.2f} str, {turn:.2f} turn)')
 
 
 def main(args=None):
@@ -474,8 +391,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # Stop motors on exit
-        node._cmd_pub.publish(Twist())
+        node._cmd.publish(Twist())   # stop motors on exit
         node.destroy_node()
         rclpy.shutdown()
 

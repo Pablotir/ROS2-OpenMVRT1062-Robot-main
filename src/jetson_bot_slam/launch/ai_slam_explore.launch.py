@@ -46,7 +46,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command, PythonExpression
 from launch_ros.actions import Node
@@ -270,25 +270,6 @@ def generate_launch_description():
         }],
     )
 
-    # ── Reactive exploration controller (FALLBACK — only when Nav2 off) ───
-    exploration_ctrl = Node(
-        package='robot_control',
-        executable='exploration_controller',
-        name='exploration_controller',
-        condition=UnlessCondition(LaunchConfiguration('use_nav2')),
-        parameters=[{
-            'move_speed':          LaunchConfiguration('move_speed'),
-            'turn_speed':          LaunchConfiguration('turn_speed'),
-            'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
-            'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
-            'rear_safety_dist':    LaunchConfiguration('rear_safety_dist'),
-            'backup_s':            LaunchConfiguration('backup_s'),
-            'min_turn_s':          LaunchConfiguration('min_turn_s'),
-            'max_turn_s':          LaunchConfiguration('max_turn_s'),
-            'label_every':         LaunchConfiguration('label_every'),
-        }],
-        output='screen',
-    )
 
     # ── RViz2 (optional, needs display) ───────────────────────────────────
     rviz_cfg = os.path.join(slam_pkg, 'rviz', 'slam_view.rviz')
@@ -308,10 +289,9 @@ def generate_launch_description():
         lidar,            # STL-27L → /scan
         usb_camera,       # Only when use_camera:=true
         image_convert,    # Only when use_camera:=true
-        slam_toolbox,     # LiDAR SLAM (on by default)
+        slam_toolbox,     # LiDAR SLAM
         vila_labeller,    # Only when use_camera:=true
-        nav2,             # Nav2 path planning (opt-in with use_nav2:=true)
-        frontier_explorer,  # Direct LiDAR frontier exploration (on with SLAM)
-        exploration_ctrl,   # Old reactive fallback (only when use_nav2:=false AND use_slam:=false)
+        nav2,             # Nav2 (opt-in with use_nav2:=true, off by default)
+        frontier_explorer,  # Frontier exploration (only /cmd_vel publisher)
         rviz,
     ])

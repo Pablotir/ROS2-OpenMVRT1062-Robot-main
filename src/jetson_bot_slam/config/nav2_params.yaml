@@ -108,32 +108,26 @@ controller_server:
       decel_lim_y: -0.5
       decel_lim_theta: -1.2
       # ── Trajectory sampling ──
-      vx_samples: 15
-      vy_samples: 3
-      vtheta_samples: 30
-      sim_time: 2.0                 # look 2s ahead for obstacle avoidance
+      vx_samples: 20
+      vy_samples: 5               # mecanum can strafe — sample it
+      vtheta_samples: 10          # LOW — don't over-sample rotation
+      sim_time: 1.5               # look 1.5s ahead
       linear_granularity: 0.05
-      angular_granularity: 0.025
-      transform_tolerance: 1.0     # HIGH — the Jetson has TF jitter
-      xy_goal_tolerance: 1.0       # HIGH — just get near the frontier
+      angular_granularity: 0.05
+      transform_tolerance: 1.0    # HIGH — the Jetson has TF jitter
+      xy_goal_tolerance: 0.30     # match the general_goal_checker
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
+      # ── Critics for MECANUM / HOLONOMIC robot ──
+      # No RotateToGoal: the robot doesn't need to face any direction
+      # No GoalAlign: heading-based alignment causes spinning on omni
+      # No PathAlign: same issue — forces facing the path direction
       critics:
-        ["RotateToGoal", "Oscillation", "BaseObstacle",
-         "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      # ── Critic weights ──
-      # BaseObstacle scale was paralyzed by inflation cost; reducing to 2.0
-      BaseObstacle.scale: 2.0
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0          # Strictly adhere to the globally-planned centerline
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+        ["Oscillation", "BaseObstacle", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.02    # low — let inflation handle avoidance
+      PathDist.scale: 32.0        # follow the planned path closely
+      GoalDist.scale: 24.0        # move toward the goal
 
 planner_server:
   ros__parameters:
@@ -242,7 +236,10 @@ global_costmap:
       # Same rectangular footprint as local costmap
       footprint: "[[-0.20, -0.26], [-0.20, 0.26], [0.20, 0.26], [0.20, -0.26]]"
 
-      plugins: ["obstacle_layer", "range_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "range_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true

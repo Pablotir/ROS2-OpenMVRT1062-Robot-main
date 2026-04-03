@@ -4,7 +4,7 @@ frontier_explorer.py
 ====================
 Python-native frontier-based exploration node for ROS2/Nav2.
 
-Reads the RTAB-Map occupancy grid (/map) and automatically navigates
+Reads the slam_toolbox occupancy grid (/map) and automatically navigates
 the robot to unexplored frontiers using the Nav2 NavigateToPose action.
 
 Algorithm
@@ -12,26 +12,26 @@ Algorithm
 1. Subscribe to /map (nav_msgs/OccupancyGrid).
 2. Every `planner_frequency` seconds:
    a. Find all frontier cells — free cells within 2 cells of unknown space.
-      This 2-cell-deep check handles RTAB-Map ray tracing, which always
+      This 2-cell-deep check handles ray tracing, which always
       places a wall (occupied cell) between free and unknown space.
    b. Map-edge free cells are also frontiers (space beyond grid is unknown).
    c. Cluster frontier cells into contiguous groups.
    d. Score each cluster: gain = size, cost = distance_from_robot.
-      Best frontier = argmax(gain_scale * size - potential_scale * distance).
+      Best frontier = argmax(gain_scale * size - potential_scale * distance²).
    e. If best frontier is far enough away and big enough, send a
       NavigateToPose action goal to Nav2.
-3. If no frontiers are found for several cycles, perform a one-time
-   spin-in-place (~360°) to grow the map before retrying.
-4. If no frontiers remain after spinning → exploration is complete.
+3. If the robot is stuck spinning (barely translating for 10s), stop with
+   a fatal diagnostic printout.
+4. If navigation fails 3 times consecutively, stop with diagnostic output.
 
 Subscribes
 ----------
-  /map              nav_msgs/OccupancyGrid    RTAB-Map 2D occupancy grid
+  /map              nav_msgs/OccupancyGrid    slam_toolbox 2D occupancy grid
   /odom             nav_msgs/Odometry         Robot pose (fallback if no TF)
 
 Publishes
 ---------
-  /cmd_vel          geometry_msgs/Twist       Spin-in-place bootstrap only
+  /cmd_vel          geometry_msgs/Twist       Emergency stop only
 
 Requires
 --------
@@ -41,34 +41,37 @@ Parameters
 ----------
   planner_frequency   float   0.33    Hz — how often to re-evaluate frontiers
   min_frontier_size   float   0.30    m  — ignore frontiers smaller than this
-  potential_scale     float   3.0        — cost weight for distance
+  potential_scale     float   5.0        — cost weight for distance
   gain_scale          float   1.0        — gain weight for frontier size
   robot_base_frame    str     base_link
   progress_timeout    float   30.0    s  — cancel goal if no progress after this
-  startup_delay       float   15.0    s  — wait for Nav2 to fully boot before sending
+  startup_delay       float   10.0    s  — wait for Nav2 to fully boot before sending
 """
 
 import math
 import time
+import collections
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from nav_msgs.msg import OccupancyGrid, Odometry
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
+from builtin_interfaces.msg import Time as TimeMsg
+
+import tf2_ros
 
 
 # ── Occupancy values ──────────────────────────────────────────────────────────
 FREE     = 0
 UNKNOWN  = -1
 
-# ── Spin-in-place bootstrap ──────────────────────────────────────────────────
-_SPIN_TRIGGER     = 5      # consecutive empty checks before spinning
-_SPIN_SPEED       = 0.5    # rad/s
-_SPIN_DURATION    = 13.0   # seconds (~full 360° + margin)
-_SPIN_PUB_HZ     = 20     # publish rate — must outpace velocity_smoother (10 Hz)
+# ── Spin detection ────────────────────────────────────────────────────────────
+_STUCK_WINDOW     = 10.0   # seconds of position history to check
+_STUCK_THRESHOLD  = 0.10   # if robot moves less than 10 cm in the window, it's stuck
+_STUCK_CHECK_HZ   = 2.0    # how often to sample position for spin detection
 
 
 class FrontierExplorer(Node):
@@ -93,8 +96,10 @@ class FrontierExplorer(Node):
 
         # ── State ─────────────────────────────────────────────────────────────
         self._map: OccupancyGrid | None = None
-        self._robot_x = 0.0
+        self._robot_x = 0.0       # position in MAP frame (via TF)
         self._robot_y = 0.0
+        self._robot_x_odom = 0.0  # fallback: position in ODOM frame
+        self._robot_y_odom = 0.0
         self._navigating = False
         self._goal_handle = None
         self._goal_sent_t = 0.0
@@ -112,11 +117,6 @@ class FrontierExplorer(Node):
         self._last_fail_t = 0.0
         self._fail_cooldown = 5.0
 
-        # Spin-in-place bootstrap state
-        self._spin_done = False
-        self._spinning = False
-        self._spin_start_t = 0.0
-
         # Blacklist recently-failed goals
         self._blacklist: list[tuple[float, float]] = []
         self._blacklist_radius = 0.5
@@ -129,14 +129,20 @@ class FrontierExplorer(Node):
         self._max_consecutive_fails = 3
         self._error_log: list[str] = []
 
+        # ── Spin/stuck detection ──────────────────────────────────────────────
+        # Ring buffer of (time, x, y) samples in map frame
+        self._pos_history: collections.deque = collections.deque(maxlen=100)
+        self._stuck_reported = False
+
+        # ── TF2 buffer ────────────────────────────────────────────────────────
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
         # ── Nav2 action client ────────────────────────────────────────────────
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # ── cmd_vel publisher (for spin-in-place only) ────────────────────────
+        # ── cmd_vel publisher (emergency stop only) ───────────────────────────
         self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        # ── Spin timer (created on demand, publishes at 20 Hz) ────────────────
-        self._spin_timer = None
 
         # ── Map subscriber (transient_local so we get the last published map) ─
         map_qos = QoSProfile(
@@ -147,7 +153,7 @@ class FrontierExplorer(Node):
         )
         self.create_subscription(OccupancyGrid, '/map', self._on_map, map_qos)
 
-        # ── Odometry subscriber (robot pose) ──────────────────────────────────
+        # ── Odometry subscriber (robot pose fallback) ─────────────────────────
         odom_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -162,6 +168,9 @@ class FrontierExplorer(Node):
         period = 1.0 / max(self._freq, 0.01)
         self.create_timer(period, self._plan)
 
+        # ── Position sampling timer (for spin detection) ──────────────────────
+        self.create_timer(1.0 / _STUCK_CHECK_HZ, self._sample_position)
+
         self.get_logger().info(
             f'Frontier Explorer ready | freq={self._freq:.2f} Hz | '
             f'min_size={self._min_size_m} m | '
@@ -174,46 +183,76 @@ class FrontierExplorer(Node):
         self._map = msg
 
     def _on_odom(self, msg: Odometry):
-        self._robot_x = msg.pose.pose.position.x
-        self._robot_y = msg.pose.pose.position.y
+        self._robot_x_odom = msg.pose.pose.position.x
+        self._robot_y_odom = msg.pose.pose.position.y
 
     def _on_resume(self, msg: Bool):
         self._enabled = msg.data
         self.get_logger().info(
             f'Exploration {"resumed" if self._enabled else "paused"}')
 
-    # ── Spin-in-place helpers ─────────────────────────────────────────────────
+    # ── TF-based position in MAP frame ────────────────────────────────────────
 
-    def _start_spin(self):
-        """Begin spinning in place at high publish rate."""
-        self._spinning = True
-        self._spin_start_t = time.monotonic()
-        self.get_logger().info(
-            f'Starting spin-in-place ({_SPIN_SPEED:.1f} rad/s, '
-            f'{_SPIN_DURATION:.0f}s, {_SPIN_PUB_HZ} Hz publish)')
-        # Create a fast timer that publishes the spin command
-        self._spin_timer = self.create_timer(
-            1.0 / _SPIN_PUB_HZ, self._spin_tick)
+    def _update_robot_pose_map(self):
+        """Look up robot position in map frame via TF. Falls back to odom."""
+        try:
+            t: TransformStamped = self._tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time())
+            self._robot_x = t.transform.translation.x
+            self._robot_y = t.transform.translation.y
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            # Fallback to odom (at startup, map→odom may not exist yet)
+            self._robot_x = self._robot_x_odom
+            self._robot_y = self._robot_y_odom
 
-    def _spin_tick(self):
-        """Called at 20 Hz during spin to outpace velocity_smoother."""
-        elapsed = time.monotonic() - self._spin_start_t
-        if elapsed < _SPIN_DURATION:
-            twist = Twist()
-            twist.angular.z = _SPIN_SPEED
-            self._cmd_pub.publish(twist)
-        else:
-            # Spin complete — stop and clean up
-            twist = Twist()
-            self._cmd_pub.publish(twist)
-            if self._spin_timer is not None:
-                self._spin_timer.cancel()
-                self._spin_timer = None
-            self._spinning = False
-            self._spin_done = True
-            self._no_frontier_count = 0
-            self.get_logger().info(
-                'Spin-in-place complete — resuming frontier search')
+    # ── Spin/stuck detection ──────────────────────────────────────────────────
+
+    def _sample_position(self):
+        """Sample current position for spin detection."""
+        if not self._nav2_ready or not self._navigating:
+            self._pos_history.clear()
+            return
+
+        self._update_robot_pose_map()
+        now = time.monotonic()
+        self._pos_history.append((now, self._robot_x, self._robot_y))
+
+        # Check if stuck (barely moving over the window)
+        if len(self._pos_history) < 5:
+            return
+
+        oldest_t, oldest_x, oldest_y = self._pos_history[0]
+        window = now - oldest_t
+        if window < _STUCK_WINDOW:
+            return  # Not enough history yet
+
+        # Calculate total displacement over the window
+        displacement = math.hypot(
+            self._robot_x - oldest_x,
+            self._robot_y - oldest_y)
+
+        if displacement < _STUCK_THRESHOLD and not self._stuck_reported:
+            self._stuck_reported = True
+            msg = (f'STUCK/SPINNING detected: moved only {displacement:.3f} m '
+                   f'in {window:.1f} s while navigating to {self._current_goal}')
+            self.get_logger().error(msg)
+            self._error_log.append(f'[STUCK] {msg}')
+
+            # Cancel the current goal and blacklist it
+            self._blacklist.append(self._current_goal)
+            self._goal_gen += 1
+            if self._goal_handle is not None:
+                self._goal_handle.cancel_goal_async()
+            self._navigating = False
+            self._last_fail_t = time.monotonic()
+            self._pos_history.clear()
+
+            # Count this as a consecutive failure
+            self._consecutive_fails += 1
+            if self._consecutive_fails >= self._max_consecutive_fails:
+                self._fatal_shutdown()
 
     # ── Main planning callback ────────────────────────────────────────────────
 
@@ -228,10 +267,6 @@ class FrontierExplorer(Node):
                 return
             self._nav2_ready = True
             self.get_logger().info('Startup delay elapsed — beginning exploration')
-
-        # Don't plan while spinning
-        if self._spinning:
-            return
 
         # Cooldown after a navigation failure to let Nav2 recover
         if not self._navigating and time.monotonic() - self._last_fail_t < self._fail_cooldown:
@@ -252,20 +287,19 @@ class FrontierExplorer(Node):
             else:
                 return
 
+        # Update position in map frame before planning
+        self._update_robot_pose_map()
+
         # ── Log map stats for diagnostics ─────────────────────────────────
         self._log_map_stats()
 
         frontiers = self._find_frontiers()
         if not frontiers:
             self._no_frontier_count += 1
-
-            # With a 360° LiDAR, no frontiers means the area is fully
-            # mapped.  Just log and wait for the map to grow (e.g. if
-            # slam_toolbox corrects a loop closure and reveals gaps).
             if self._no_frontier_count % 10 == 1:
                 self.get_logger().info(
                     f'No frontiers found (check #{self._no_frontier_count}) — '
-                    'waiting for map to grow...')
+                    'area appears fully mapped')
             return
         self._no_frontier_count = 0
 
@@ -308,7 +342,7 @@ class FrontierExplorer(Node):
         """Return frontier clusters. Each cluster is a list of (x, y) coords.
 
         A frontier cell is a FREE cell that is within 2 cells of UNKNOWN space.
-        This handles RTAB-Map ray tracing, where occupied cells (walls) always
+        This handles ray tracing, where occupied cells (walls) always
         separate free from unknown: FREE → OCCUPIED → UNKNOWN.
 
         Map-edge cells treat out-of-bounds as UNKNOWN (implicit frontier).
@@ -332,23 +366,18 @@ class FrontierExplorer(Node):
             return data[idx(r, c)]
 
         # Build a set of cells that are within 1 cell of UNKNOWN.
-        # These are "near-unknown" cells — they may be occupied walls.
         near_unknown = set()
         for row in range(h):
             for col in range(w):
-                # Check if this cell has any UNKNOWN neighbor (including OOB)
                 if (get_cell(row - 1, col) == UNKNOWN or
                     get_cell(row + 1, col) == UNKNOWN or
                     get_cell(row, col - 1) == UNKNOWN or
                     get_cell(row, col + 1) == UNKNOWN):
                     near_unknown.add((row, col))
-                # Also check if the cell itself is at the map edge
-                # (OOB neighbors handled by get_cell returning UNKNOWN)
 
         # A frontier cell is a FREE cell that is:
         #   - in near_unknown (directly adjacent to unknown), OR
-        #   - adjacent to a cell in near_unknown (2 cells from unknown —
-        #     handles the FREE→OCCUPIED→UNKNOWN wall pattern)
+        #   - adjacent to a cell in near_unknown (2 cells from unknown)
         frontier_mask = [False] * (w * h)
         for row in range(h):
             for col in range(w):
@@ -356,12 +385,10 @@ class FrontierExplorer(Node):
                 if data[i] != FREE:
                     continue
 
-                # Check: is this free cell in near_unknown?
                 if (row, col) in near_unknown:
                     frontier_mask[i] = True
                     continue
 
-                # Check: is any 4-connected neighbor in near_unknown?
                 for nr, nc in ((row-1, col), (row+1, col),
                                (row, col-1), (row, col+1)):
                     if (nr, nc) in near_unknown:
@@ -406,9 +433,7 @@ class FrontierExplorer(Node):
         """Score and return the best frontier goal.
 
         The navigation target is pulled 0.4 m toward the robot from the
-        frontier centroid.  The centroid sits on the free/unknown boundary —
-        the robot only needs to get *close enough* to see the unknown area,
-        not stand on top of the boundary (which may be outside the costmap).
+        frontier centroid so it's always in explored space.
         """
         best_score = -float('inf')
         best_xy = None
@@ -419,18 +444,18 @@ class FrontierExplorer(Node):
             dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
             if dist < 0.3:
                 continue
-            
+
             # Cap maximum frontier distance
             if dist > 5.0:
                 continue
-                
+
             if self._is_blacklisted(cx, cy):
                 continue
-                
+
             size = len(cluster)
             # Quadratic distance penalty forces the planner to pick nearby goals
             score = self._gain_scale * size - self._pot_scale * (dist ** 2)
-            
+
             if score > best_score:
                 best_score = score
                 best_xy = (cx, cy)
@@ -458,28 +483,27 @@ class FrontierExplorer(Node):
             self.get_logger().warn('Nav2 action server not available yet')
             return
 
-        dx = x - self._robot_x
-        dy = y - self._robot_y
-        yaw = math.atan2(dy, dx)
-
         goal = NavigateToPose.Goal()
         goal.pose = PoseStamped()
         goal.pose.header.frame_id = 'map'
-        # Use Time(0) = "latest available transform", avoids TF
-        # extrapolation errors when slam_toolbox hasn't published
-        # the map→odom transform at the exact requested timestamp.
-        from builtin_interfaces.msg import Time as TimeMsg
+        # Use Time(0) = "latest available transform" — avoids TF
+        # extrapolation errors at startup.
         goal.pose.header.stamp = TimeMsg()
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
-        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
-        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        # IDENTITY quaternion — no heading preference.
+        # The mecanum robot doesn't need to face any specific direction.
+        # RotateToGoal/GoalAlign critics have been removed from DWB.
+        goal.pose.pose.orientation.z = 0.0
+        goal.pose.pose.orientation.w = 1.0
 
         self._navigating = True
         self._goal_sent_t = time.monotonic()
         self._current_goal = (x, y)
         self._goal_gen += 1
         gen = self._goal_gen  # Capture for closure
+        self._stuck_reported = False  # Reset for new goal
+        self._pos_history.clear()
 
         future = self._nav_client.send_goal_async(goal)
         future.add_done_callback(lambda f: self._on_goal_response(f, gen))
@@ -555,11 +579,11 @@ class FrontierExplorer(Node):
             '',
             '',
             border,
-            'FRONTIER EXPLORER — FATAL: Too many consecutive navigation failures',
+            'FRONTIER EXPLORER — FATAL: Too many consecutive failures',
             border,
             '',
             f'Consecutive failures: {self._consecutive_fails}',
-            f'Robot position: ({self._robot_x:.2f}, {self._robot_y:.2f})',
+            f'Robot position (map frame): ({self._robot_x:.2f}, {self._robot_y:.2f})',
             f'Last goal sent: {self._current_goal}',
             f'Blacklisted goals: {len(self._blacklist)}',
             '',
@@ -569,12 +593,17 @@ class FrontierExplorer(Node):
             lines.append(f'  {entry}')
         lines.append('')
         lines.append('Possible causes:')
-        lines.append('  1. TF extrapolation error  — slam_toolbox not publishing map→odom fast enough')
-        lines.append('  2. Planner failure         — goal is unreachable (outside costmap or blocked)')
-        lines.append('  3. Controller failure      — no valid trajectories (inflation too aggressive)')
-        lines.append('  4. Hardware issue           — LiDAR or Arduino disconnected')
+        lines.append('  1. STUCK/SPINNING  — DWB controller choosing rotation over translation')
+        lines.append('  2. Planner failure — goal is unreachable (blocked by inflation or walls)')
+        lines.append('  3. TF error        — slam_toolbox map→odom transform missing or stale')
+        lines.append('  4. Controller fail — no valid trajectories (all paths hit obstacles)')
+        lines.append('  5. Hardware issue   — LiDAR or Arduino disconnected')
         lines.append('')
-        lines.append('To debug, check the full log above for [ERROR] and [WARN] lines.')
+        lines.append('To debug:')
+        lines.append('  • Check the full log above for [ERROR] and [WARN] lines')
+        lines.append('  • Look for "No valid trajectories" — means inflation too aggressive')
+        lines.append('  • Look for "Failed to make progress" — means robot barely moving')
+        lines.append('  • Look for "Extrapolation" — means TF timing issue')
         lines.append(border)
         lines.append('')
 

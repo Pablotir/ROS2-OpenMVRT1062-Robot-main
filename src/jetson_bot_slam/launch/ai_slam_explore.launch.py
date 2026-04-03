@@ -40,12 +40,8 @@ def generate_launch_description():
         # Motion tuning
         DeclareLaunchArgument('move_speed',          default_value='0.20'),
         DeclareLaunchArgument('turn_speed',          default_value='0.55'),
-        DeclareLaunchArgument('obstacle_distance',   default_value='0.35'),
+        DeclareLaunchArgument('obstacle_distance',   default_value='0.40'),
         DeclareLaunchArgument('emergency_stop_dist', default_value='0.10'),
-        DeclareLaunchArgument('rear_safety_dist',    default_value='0.15'),
-        DeclareLaunchArgument('backup_s',            default_value='1.5'),
-        DeclareLaunchArgument('min_turn_s',          default_value='2.0'),
-        DeclareLaunchArgument('max_turn_s',          default_value='8.0'),
         # Camera / AI (off by default)
         DeclareLaunchArgument('use_camera',          default_value='false'),
         DeclareLaunchArgument('vila_model',
@@ -53,7 +49,6 @@ def generate_launch_description():
         DeclareLaunchArgument('vila_api',            default_value='mlc'),
         DeclareLaunchArgument('vila_quantization',   default_value='q4f16_ft'),
         DeclareLaunchArgument('room_hints_enabled',  default_value='true'),
-        DeclareLaunchArgument('label_every',         default_value='5'),
     ]
 
     # ── URDF / robot_state_publisher ──────────────────────────────────────
@@ -142,7 +137,7 @@ def generate_launch_description():
 
     # ── Exploration controller ─────────────────────────────────────────────
     # The ONLY node that publishes /cmd_vel.
-    # Drives forward, avoids obstacles (linear.x + angular.z only — no strafe).
+    # Smooth reactive: steers toward open space, scales speed by clearance.
     exploration_ctrl = Node(
         package='robot_control',
         executable='exploration_controller',
@@ -152,11 +147,6 @@ def generate_launch_description():
             'turn_speed':          LaunchConfiguration('turn_speed'),
             'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
             'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
-            'rear_safety_dist':    LaunchConfiguration('rear_safety_dist'),
-            'backup_s':            LaunchConfiguration('backup_s'),
-            'min_turn_s':          LaunchConfiguration('min_turn_s'),
-            'max_turn_s':          LaunchConfiguration('max_turn_s'),
-            'label_every':         LaunchConfiguration('label_every'),
         }],
         output='screen',
     )

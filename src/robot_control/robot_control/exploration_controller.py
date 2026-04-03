@@ -1,399 +1,259 @@
 #!/usr/bin/env python3
 """
-exploration_controller.py  — LiDAR + ultrasonic exploration
-=============================================================
-Drives the robot autonomously using the STL-27L 360° LiDAR as the PRIMARY
-obstacle sensor and the rear-mounted HC-SR04 ultrasonic as a BACKUP for
-reverse maneuvers.
+exploration_controller.py — Smooth reactive exploration for slam_toolbox
+=========================================================================
+Drives the robot through the environment so slam_toolbox can build a map.
+slam_toolbox only needs the robot to MOVE; it handles mapping on its own.
 
-State machine
--------------
-  FORWARD  → drive forward at move_speed
-           → if front_min < obstacle_distance → BACKING
+Behaviour (NO states, NO stop-and-go)
+--------------------------------------
+Every 100 ms the controller:
+  1. Reads the full 360° LiDAR scan.
+  2. Finds the most open direction (largest clearance).
+  3. Steers toward that direction with smooth proportional control.
+  4. Scales forward speed by how much clearance is ahead.
+  5. Emergency-stops ONLY if an obstacle is within 10 cm.
 
-  BACKING  → reverse for backup_s seconds to create clearance
-           → if rear too close (LiDAR rear zone OR ultrasonic) → emergency stop reverse
-           → then → TURNING
+The result is smooth, continuous motion that flows around obstacles —
+exactly like the slam_toolbox demo videos.
 
-  TURNING  → spin toward the zone with the most open space
-           → until BOTH: min_turn_s elapsed AND front_min >= clear_distance
-           → then → FORWARD
+Why no backup/turn states?
+--------------------------
+The old controller did: FORWARD → stop → BACKING → TURNING → FORWARD.
+This wasted time and produced zero exploration progress because the
+clearance thresholds were too close together (0.35 m trigger vs 0.39 m
+clear), causing immediate re-triggering.
 
-Exploration strategy
---------------------
-  When an obstacle is detected in front, the robot picks the turn direction
-  based on which side (left vs right LiDAR zone) has more open space.
-  This replaces the old fixed left-hand rule and produces better coverage.
-
-  If still blocked after max_turn_s, switches direction (corner escape),
-  then forces forward after a second timeout.
-
-360° LiDAR zones
------------------
-  FRONT:  ±60°  (0° = dead ahead)
-  LEFT:   60° to 120°
-  RIGHT:  -60° to -120° (i.e. 240° to 300°)
-  REAR:   120° to 240°
+A reactive controller never stops unless something is dangerously close.
+It just steers toward open space while maintaining forward speed.
 
 Subscribes
 ----------
-  /scan              sensor_msgs/LaserScan   STL-27L 360° LiDAR (PRIMARY)
-  /ultrasonic_range  sensor_msgs/Range        rear HC-SR04 (BACKUP, best-effort)
+  /scan              sensor_msgs/LaserScan   STL-27L 360° LiDAR
 
 Publishes
 ---------
-  /cmd_vel                    geometry_msgs/Twist
-  /robot/movement_complete    std_msgs/Bool
-
-Parameters
-----------
-move_speed          float   0.20   m/s forward speed
-turn_speed          float   0.55   rad/s turn speed
-obstacle_distance   float   0.30   m — start backing/turning below this (front zone)
-emergency_stop_dist float   0.08   m — enter emergency reverse below this (any zone)
-rear_safety_dist    float   0.15   m — stop reversing if rear obstacle (LiDAR or ultrasonic)
-backup_s            float   2.0    s — reverse duration before turning
-min_turn_s          float   3.0    s — minimum turn time before checking clear
-max_turn_s          float   10.0   s — switch direction if still blocked (corner escape)
-label_every         int     5      turns between AI label requests
-sensor_timeout      float   8.0    s — halt if no LiDAR data for this long
+  /cmd_vel           geometry_msgs/Twist     (linear.x + angular.z ONLY)
 """
 
 import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from std_msgs.msg import Bool
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan, Range
+from sensor_msgs.msg import LaserScan
 
-FORWARD        = 'forward'
-BACKING        = 'backing'
-EMERGENCY_BACK = 'emergency_back'
-TURNING        = 'turning'
+
+# Number of angular sectors to divide the scan into
+N_SECTORS = 24   # 360° / 24 = 15° per sector
 
 
 class ExplorationController(Node):
     def __init__(self):
         super().__init__('exploration_controller')
 
-        # ── Parameters ────────────────────────────────────────────────────
+        # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('move_speed',           0.20)
         self.declare_parameter('turn_speed',           0.55)
         self.declare_parameter('obstacle_distance',    0.40)
-        self.declare_parameter('emergency_stop_dist',  0.12)
-        self.declare_parameter('rear_safety_dist',     0.15)
-        self.declare_parameter('backup_s',             2.0)
-        self.declare_parameter('min_turn_s',           3.0)
-        self.declare_parameter('max_turn_s',           10.0)
-        self.declare_parameter('label_every',          5)
+        self.declare_parameter('emergency_stop_dist',  0.10)
         self.declare_parameter('sensor_timeout',       8.0)
 
-        self._move_spd      = self.get_parameter('move_speed').value
-        self._turn_spd      = self.get_parameter('turn_speed').value
-        self._obs_dist      = self.get_parameter('obstacle_distance').value
-        self._estop_dist    = self.get_parameter('emergency_stop_dist').value
-        self._rear_safe     = self.get_parameter('rear_safety_dist').value
-        self._backup_s      = self.get_parameter('backup_s').value
-        self._min_turn_s    = self.get_parameter('min_turn_s').value
-        self._max_turn_s    = self.get_parameter('max_turn_s').value
-        self._label_every   = int(self.get_parameter('label_every').value)
-        self._sensor_timeout = self.get_parameter('sensor_timeout').value
+        self._move_spd   = self.get_parameter('move_speed').value
+        self._turn_spd   = self.get_parameter('turn_speed').value
+        self._obs_dist   = self.get_parameter('obstacle_distance').value
+        self._estop_dist = self.get_parameter('emergency_stop_dist').value
+        self._timeout    = self.get_parameter('sensor_timeout').value
 
-        # clear_dist: how far ahead must be open before we resume FORWARD.
-        self._clear_dist = self._obs_dist * 1.1
+        # ── State ─────────────────────────────────────────────────────────────
+        self._scan_received = False
+        self._start_t = self.get_clock().now().nanoseconds * 1e-9
+        self._last_scan_t = None
+        self._log_tick = 0
 
-        # ── Publishers ────────────────────────────────────────────────────
-        self._cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
-        self._done_pub = self.create_publisher(Bool,  '/robot/movement_complete', 10)
+        # ── Publisher ─────────────────────────────────────────────────────────
+        self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # ── Subscribers ───────────────────────────────────────────────────
-        # LiDAR — primary sensor (RELIABLE QoS, standard for LaserScan)
-        self.create_subscription(LaserScan, '/scan', self._on_scan, 10)
-
-        # Rear ultrasonic — backup (BEST_EFFORT to match arduino_bridge)
-        sensor_qos = QoSProfile(
+        # ── Subscriber ────────────────────────────────────────────────────────
+        scan_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-        self.create_subscription(Range, '/ultrasonic_range', self._on_ultrasonic, sensor_qos)
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.create_subscription(LaserScan, '/scan', self._on_scan, scan_qos)
 
-        # ── State ─────────────────────────────────────────────────────────
-        self._state            = FORWARD
-        self._turn_dir         = 1.0      # +1 left, -1 right (chosen dynamically)
-        self._turn_count       = 0
-        self._flipped          = False
-        self._phase_start_t    = None
-        self._current_twist    = Twist()
-        self._log_tick         = 0
-        self._start_t          = self.get_clock().now().nanoseconds * 1e-9
-
-        # LiDAR zone minimums (updated every /scan callback)
-        self._front_min        = 9.9
-        self._left_min         = 9.9
-        self._right_min        = 9.9
-        self._rear_min         = 9.9
-        self._scan_received    = False
-        self._last_scan_t      = None
-
-        # Rear ultrasonic (backup)
-        self._rear_ultra_range = 9.9
-        self._ultra_received   = False
-
-        # 10 Hz control loop
+        # ── 10 Hz control loop ────────────────────────────────────────────────
         self.create_timer(0.1, self._control_loop)
 
         self.get_logger().info(
-            f'Exploration controller (LiDAR + ultrasonic) ready | '
+            f'Exploration controller (smooth reactive) ready | '
             f'speed={self._move_spd} m/s | turn={self._turn_spd} rad/s | '
-            f'obstacle={self._obs_dist} m | clear={self._clear_dist:.2f} m | '
-            f'estop={self._estop_dist} m | rear_safe={self._rear_safe} m | '
-            f'backup_s={self._backup_s} s | min_turn={self._min_turn_s} s | '
-            f'max_turn={self._max_turn_s} s')
+            f'obstacle={self._obs_dist} m | estop={self._estop_dist} m')
 
     # ── LiDAR callback ────────────────────────────────────────────────────────
 
     def _on_scan(self, msg: LaserScan):
-        """Process 360° LaserScan into 4 obstacle zones."""
-        n = len(msg.ranges)
-        if n == 0:
-            return
-
-        front_vals = []
-        left_vals = []
-        right_vals = []
-        rear_vals = []
-
-        for i, r in enumerate(msg.ranges):
-            if not (msg.range_min <= r <= msg.range_max):
-                continue   # skip inf / NaN / out-of-range
-
-            # Angle of this ray (radians, 0 = forward, + = CCW left)
-            angle = msg.angle_min + i * msg.angle_increment
-            # Normalize to [-pi, pi]
-            angle = math.atan2(math.sin(angle), math.cos(angle))
-            deg = math.degrees(angle)
-
-            if -75.0 <= deg <= 75.0:
-                front_vals.append(r)
-            elif 75.0 < deg <= 120.0:
-                left_vals.append(r)
-            elif -120.0 <= deg < -75.0:
-                right_vals.append(r)
-            else:
-                rear_vals.append(r)
-
-        self._front_min = min(front_vals) if front_vals else 9.9
-        self._left_min  = min(left_vals)  if left_vals  else 9.9
-        self._right_min = min(right_vals) if right_vals else 9.9
-        self._rear_min  = min(rear_vals)  if rear_vals  else 9.9
-
+        self._latest_scan = msg
         if not self._scan_received:
             self.get_logger().info(
-                f'First LiDAR scan received: {n} rays | '
-                f'front={self._front_min:.2f} left={self._left_min:.2f} '
-                f'right={self._right_min:.2f} rear={self._rear_min:.2f}')
-        self._scan_received = True
+                f'First LiDAR scan: {len(msg.ranges)} rays')
+            self._scan_received = True
         self._last_scan_t = self.get_clock().now().nanoseconds * 1e-9
 
-    # ── Rear ultrasonic callback ──────────────────────────────────────────────
-
-    def _on_ultrasonic(self, msg: Range):
-        """Store rear ultrasonic reading (backup for reverse safety)."""
-        if msg.min_range <= msg.range <= msg.max_range:
-            self._rear_ultra_range = msg.range
-            self._ultra_received = True
-
-    # ── Effective rear distance (min of LiDAR rear zone + ultrasonic) ─────────
-
-    def _rear_distance(self) -> float:
-        """Return the closest rear obstacle from either sensor."""
-        rear = self._rear_min
-        if self._ultra_received:
-            rear = min(rear, self._rear_ultra_range)
-        return rear
-
-    # ── 10 Hz control loop ────────────────────────────────────────────────────
+    # ── Main control loop ─────────────────────────────────────────────────────
 
     def _control_loop(self):
         now = self.get_clock().now().nanoseconds * 1e-9
 
-        # ── Guard: hold still until first LiDAR scan arrives ──────────────
+        # ── Wait for LiDAR ────────────────────────────────────────────────
         if not self._scan_received:
             self._cmd_pub.publish(Twist())
-            waiting_s = now - self._start_t
+            self._log_tick += 1
             if self._log_tick % 10 == 0:
-                if waiting_s > self._sensor_timeout:
+                elapsed = now - self._start_t
+                if elapsed > self._timeout:
                     self.get_logger().warn(
-                        f'*** NO LIDAR DATA after {waiting_s:.0f} s — ROBOT HALTED ***\n'
-                        f'  Check: (1) STL-27L connected to /dev/ttyUSB1\n'
-                        f'         (2) ldlidar_stl_ros2 node is running\n'
-                        f'             run: ros2 topic echo /scan --once')
+                        f'NO LIDAR after {elapsed:.0f} s — robot halted')
                 else:
                     self.get_logger().info(
-                        f'[SENSOR] waiting for first LiDAR scan '
-                        f'({waiting_s:.1f}/{self._sensor_timeout:.0f} s)')
+                        f'Waiting for LiDAR ({elapsed:.1f}/{self._timeout:.0f} s)')
+            return
+
+        # ── Check for stale scan ──────────────────────────────────────────
+        if self._last_scan_t and (now - self._last_scan_t) > 2.0:
+            self._cmd_pub.publish(Twist())
+            if self._log_tick % 10 == 0:
+                self.get_logger().warn('LiDAR stale — robot halted')
             self._log_tick += 1
             return
 
-        # ── 1 Hz status line ──────────────────────────────────────────────
-        self._log_tick += 1
-        if self._log_tick % 10 == 0:
-            if self._state == FORWARD:
-                action = f'DRIVING FORWARD  @ {self._move_spd} m/s'
-            elif self._state == BACKING:
-                elapsed = now - self._phase_start_t if self._phase_start_t else 0.0
-                action = f'BACKING UP       ({elapsed:.1f}/{self._backup_s:.1f} s)'
-            elif self._state == EMERGENCY_BACK:
-                action = f'EMERGENCY REVERSE (front={self._front_min:.2f} m)'
-            else:  # TURNING
-                elapsed = now - self._phase_start_t if self._phase_start_t else 0.0
-                dirstr  = 'LEFT' if self._turn_dir > 0 else 'RIGHT'
-                action  = f'TURNING {dirstr:<5} ({elapsed:.1f}/{self._max_turn_s:.1f} s max)'
+        scan = self._latest_scan
 
-            ultra_str = f'{self._rear_ultra_range:.2f}m' if self._ultra_received else 'n/a'
-            self.get_logger().info(
-                f'[LIDAR] front={self._front_min:.2f} left={self._left_min:.2f} '
-                f'right={self._right_min:.2f} rear={self._rear_min:.2f}  '
-                f'[ULTRA rear={ultra_str}]  '
-                f'[ACTION] {action}')
+        # ── Build sector clearance map ────────────────────────────────────
+        # Divide 360° into N_SECTORS bins, compute min range per sector
+        sector_min = [float('inf')] * N_SECTORS
+        sector_angle = 2.0 * math.pi / N_SECTORS  # radians per sector
 
-        # ── Guard: halt if LiDAR has gone stale ───────────────────────────
-        if self._last_scan_t is not None:
-            stale_s = now - self._last_scan_t
-            if stale_s > 2.0:  # LiDAR at 10Hz, 2s = 20 missed frames
-                self._cmd_pub.publish(Twist())
-                if self._log_tick % 10 == 0:
-                    self.get_logger().warn(
-                        f'[LIDAR STALE] No scan for {stale_s:.1f} s — robot halted')
-                return
+        closest_any = float('inf')
 
-        # ── Emergency: front obstacle extremely close ─────────────────────
-        if self._front_min < self._estop_dist and self._state != EMERGENCY_BACK:
-            self.get_logger().warn(
-                f'EMERGENCY — front={self._front_min:.2f} m — reversing')
-            self._state = EMERGENCY_BACK
-            self._current_twist = Twist()
-            self._current_twist.linear.x = -self._move_spd
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min <= r <= scan.range_max):
+                continue
+            if math.isnan(r) or math.isinf(r):
+                continue
 
-        if self._state == EMERGENCY_BACK:
-            rear_dist = self._rear_distance()
-            if rear_dist < self._rear_safe:
-                # Can't reverse either — just stop
+            angle = scan.angle_min + i * scan.angle_increment
+            # Normalize to [0, 2π)
+            angle = angle % (2.0 * math.pi)
+
+            sector_idx = int(angle / sector_angle) % N_SECTORS
+            if r < sector_min[sector_idx]:
+                sector_min[sector_idx] = r
+
+            if r < closest_any:
+                closest_any = r
+
+        # ── Emergency stop ────────────────────────────────────────────────
+        if closest_any < self._estop_dist:
+            self._cmd_pub.publish(Twist())
+            self._log_tick += 1
+            if self._log_tick % 10 == 0:
                 self.get_logger().warn(
-                    f'BOXED IN — front={self._front_min:.2f} rear={rear_dist:.2f} — stopped')
-                self._cmd_pub.publish(Twist())
-                return
-            if self._front_min >= self._obs_dist:
-                self.get_logger().info(
-                    f'Emergency clear at {self._front_min:.2f} m — turning')
-                self._start_turn(now)
-            else:
-                self._current_twist = Twist()
-                self._current_twist.linear.x = -self._move_spd
-            self._cmd_pub.publish(self._current_twist)
+                    f'EMERGENCY STOP — obstacle at {closest_any:.2f} m')
             return
 
-        # ── FORWARD state ─────────────────────────────────────────────────
-        if self._state == FORWARD:
-            if self._front_min < self._obs_dist:
-                self.get_logger().info(
-                    f'>>> OBSTACLE at {self._front_min:.2f} m — '
-                    f'starting {self._backup_s} s reverse')
-                self._state = BACKING
-                self._phase_start_t = now
-                self._flipped = False
-                self._current_twist = Twist()
-                self._current_twist.linear.x = -self._move_spd
-            else:
-                self._current_twist = Twist()
-                self._current_twist.linear.x = self._move_spd
+        # ── Find the best direction to go ─────────────────────────────────
+        # For each sector, the "value" is a blend of:
+        #   - clearance in that direction
+        #   - forward bias (prefer going straight when possible)
+        #   - continuity bonus (prefer sectors with open neighbors)
 
-        # ── BACKING state ─────────────────────────────────────────────────
-        elif self._state == BACKING:
-            elapsed = now - self._phase_start_t
+        # Sector 0 = angle 0 (forward), sector N/4 = 90° left, etc.
+        forward_sector = 0
 
-            # Check rear safety while reversing
-            rear_dist = self._rear_distance()
-            if rear_dist < self._rear_safe:
-                self.get_logger().warn(
-                    f'Rear obstacle at {rear_dist:.2f} m — stopping reverse early')
-                self._start_turn(now)
-            elif elapsed >= self._backup_s:
-                self.get_logger().info(
-                    f'>>> BACKUP DONE — picking best turn direction')
-                self._start_turn(now)
-            else:
-                self._current_twist = Twist()
-                self._current_twist.linear.x = -self._move_spd
+        scores = [0.0] * N_SECTORS
+        for s in range(N_SECTORS):
+            # Base = clearance (clamped to avoid inf domination)
+            clearance = min(sector_min[s], 3.0)
 
-        # ── TURNING state ─────────────────────────────────────────────────
-        elif self._state == TURNING:
-            elapsed = now - self._phase_start_t
-            dirstr = 'LEFT' if self._turn_dir > 0 else 'RIGHT'
+            # Neighbor average (smooth over adjacent sectors)
+            prev_c = min(sector_min[(s - 1) % N_SECTORS], 3.0)
+            next_c = min(sector_min[(s + 1) % N_SECTORS], 3.0)
+            smooth_clearance = (clearance + prev_c + next_c) / 3.0
 
-            # Corner escape: still blocked after max_turn_s — switch direction
-            if elapsed >= self._max_turn_s and not self._flipped:
-                self.get_logger().warn(
-                    f'>>> CORNER ESCAPE — still blocked after {self._max_turn_s:.1f} s '
-                    f'(front={self._front_min:.2f} m) — switching to {"RIGHT" if self._turn_dir > 0 else "LEFT"}')
-                self._flipped = True
-                self._turn_dir *= -1.0
-                self._phase_start_t = now
-                self._current_twist = Twist()
-                self._current_twist.angular.z = self._turn_dir * self._turn_spd
-            elif elapsed >= self._max_turn_s and self._flipped:
-                # Double escape timeout — force forward
-                self.get_logger().warn(
-                    f'>>> FORCED FORWARD — still blocked after double escape')
-                self._finish_turn()
-                return
-            elif elapsed >= self._min_turn_s and self._front_min >= self._clear_dist:
-                self._finish_turn()
-                return
+            # Forward preference: boost sectors near forward
+            # Sector angle relative to forward, normalized to [-π, π]
+            sector_center = s * sector_angle
+            # How far from forward (0) this sector is
+            angle_from_fwd = abs(math.atan2(
+                math.sin(sector_center),
+                math.cos(sector_center)))
+            # Bias: 1.0 when forward, 0.0 when backward
+            fwd_bias = 1.0 - (angle_from_fwd / math.pi)
 
-        self._cmd_pub.publish(self._current_twist)
+            # Combined score
+            scores[s] = smooth_clearance + fwd_bias * 0.5
 
-    # ── Turn helpers ──────────────────────────────────────────────────────────
+            # Penalize blocked sectors
+            if clearance < self._obs_dist:
+                scores[s] *= 0.1
 
-    def _start_turn(self, now: float):
-        """Begin turning toward the side with more open space."""
-        self._state = TURNING
-        self._phase_start_t = now
-        self._flipped = False
+        # Best sector
+        best_sector = max(range(N_SECTORS), key=lambda s: scores[s])
+        best_angle = best_sector * sector_angle
+        # Normalize to [-π, π] (0 = forward)
+        best_angle = math.atan2(math.sin(best_angle), math.cos(best_angle))
 
-        # Pick direction: turn toward the more open side
-        if self._left_min >= self._right_min:
-            self._turn_dir = 1.0   # left (CCW)
-            self.get_logger().info(
-                f'Turning LEFT (left={self._left_min:.2f} > right={self._right_min:.2f})')
+        # ── Compute forward speed ─────────────────────────────────────────
+        # front clearance = min of the 3 sectors around forward (±22.5°)
+        front_sectors = [0, 1, N_SECTORS - 1]  # forward ± 1 sector
+        front_clear = min(sector_min[s] for s in front_sectors)
+
+        if front_clear < self._estop_dist:
+            fwd = 0.0
+        elif front_clear < self._obs_dist:
+            # Proportional slowdown: 0 at estop, full speed at obs_dist
+            ratio = (front_clear - self._estop_dist) / (self._obs_dist - self._estop_dist)
+            fwd = self._move_spd * ratio * 0.5   # half-speed in tight spaces
         else:
-            self._turn_dir = -1.0  # right (CW)
+            fwd = self._move_spd
+
+        # If best direction is significantly to the side, slow down more
+        # to let the robot turn before driving into something
+        turn_urgency = abs(best_angle) / math.pi  # 0 = forward, 1 = backward
+        if turn_urgency > 0.4:
+            fwd *= max(0.0, 1.0 - turn_urgency)
+
+        # ── Compute turn rate ─────────────────────────────────────────────
+        # Proportional: turn faster when the goal direction is more lateral
+        turn = self._turn_spd * (best_angle / math.pi)  # smooth, proportional
+
+        # If front is blocked, turn more aggressively toward the open side
+        if front_clear < self._obs_dist:
+            if abs(best_angle) > 0.1:
+                turn = self._turn_spd * (1.0 if best_angle > 0 else -1.0) * 0.8
+            else:
+                # Front is blocked but best is also forward — find ANY open side
+                left_clear  = min(sector_min[s] for s in range(N_SECTORS // 6, N_SECTORS // 3))
+                right_clear = min(sector_min[s] for s in range(2 * N_SECTORS // 3, 5 * N_SECTORS // 6))
+                if left_clear > right_clear:
+                    turn = self._turn_spd * 0.8
+                else:
+                    turn = -self._turn_spd * 0.8
+
+        # ── Publish ───────────────────────────────────────────────────────
+        twist = Twist()
+        twist.linear.x = fwd
+        twist.angular.z = turn
+        self._cmd_pub.publish(twist)
+
+        # ── Status log every 2 s ─────────────────────────────────────────
+        self._log_tick += 1
+        if self._log_tick % 20 == 0:
+            best_deg = math.degrees(best_angle)
             self.get_logger().info(
-                f'Turning RIGHT (right={self._right_min:.2f} > left={self._left_min:.2f})')
-
-        self._current_twist = Twist()
-        self._current_twist.angular.z = self._turn_dir * self._turn_spd
-
-    def _finish_turn(self):
-        """Turn complete — resume forward and optionally trigger AI."""
-        self._current_twist = Twist()
-        self._cmd_pub.publish(self._current_twist)
-
-        self._turn_count += 1
-        self._state = FORWARD
-        self._flipped = False
-
-        self.get_logger().info(
-            f'Path clear at {self._front_min:.2f} m — resuming forward '
-            f'(turn #{self._turn_count})')
-
-        if self._turn_count % self._label_every == 0:
-            self.get_logger().info(f'Turn {self._turn_count} — requesting AI scene label')
-            done = Bool()
-            done.data = True
-            self._done_pub.publish(done)
+                f'front={front_clear:.2f} m | '
+                f'best_dir={best_deg:+.0f}° | '
+                f'cmd=({fwd:.2f} fwd, {turn:+.2f} turn) | '
+                f'closest={closest_any:.2f} m')
 
 
 def main(args=None):

@@ -38,10 +38,10 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
         DeclareLaunchArgument('rviz',               default_value='false'),
         # Motion tuning
-        DeclareLaunchArgument('move_speed',          default_value='0.20'),
-        DeclareLaunchArgument('turn_speed',          default_value='0.55'),
-        DeclareLaunchArgument('obstacle_distance',   default_value='0.40'),
-        DeclareLaunchArgument('emergency_stop_dist', default_value='0.10'),
+        DeclareLaunchArgument('move_speed',          default_value='0.18'),
+        DeclareLaunchArgument('turn_speed',          default_value='0.50'),
+        DeclareLaunchArgument('obstacle_distance',   default_value='0.50'),
+        DeclareLaunchArgument('emergency_stop_dist', default_value='0.20'),
         # Camera / AI (off by default)
         DeclareLaunchArgument('use_camera',          default_value='false'),
         DeclareLaunchArgument('vila_model',

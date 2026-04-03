@@ -27,6 +27,13 @@ clear), causing immediate re-triggering.
 A reactive controller never stops unless something is dangerously close.
 It just steers toward open space while maintaining forward speed.
 
+Robot body safety
+-----------------
+The LiDAR is mounted at the center of the robot. The wheels extend
+~22 cm from center. We add a 5 cm (2 in) buffer beyond the wheel
+edge, giving a "robot radius" of 0.27 m. Any LiDAR reading closer
+than this means the wheel is about to hit (or has hit) the obstacle.
+
 Subscribes
 ----------
   /scan              sensor_msgs/LaserScan   STL-27L 360° LiDAR
@@ -53,17 +60,19 @@ class ExplorationController(Node):
         super().__init__('exploration_controller')
 
         # ── Parameters ────────────────────────────────────────────────────────
-        self.declare_parameter('move_speed',           0.20)
-        self.declare_parameter('turn_speed',           0.55)
-        self.declare_parameter('obstacle_distance',    0.40)
-        self.declare_parameter('emergency_stop_dist',  0.10)
+        self.declare_parameter('move_speed',           0.18)
+        self.declare_parameter('turn_speed',           0.50)
+        self.declare_parameter('obstacle_distance',    0.50)
+        self.declare_parameter('emergency_stop_dist',  0.20)
+        self.declare_parameter('robot_radius',         0.27)  # half-width + 2in buffer
         self.declare_parameter('sensor_timeout',       8.0)
 
-        self._move_spd   = self.get_parameter('move_speed').value
-        self._turn_spd   = self.get_parameter('turn_speed').value
-        self._obs_dist   = self.get_parameter('obstacle_distance').value
-        self._estop_dist = self.get_parameter('emergency_stop_dist').value
-        self._timeout    = self.get_parameter('sensor_timeout').value
+        self._move_spd    = self.get_parameter('move_speed').value
+        self._turn_spd    = self.get_parameter('turn_speed').value
+        self._obs_dist    = self.get_parameter('obstacle_distance').value
+        self._estop_dist  = self.get_parameter('emergency_stop_dist').value
+        self._robot_rad   = self.get_parameter('robot_radius').value
+        self._timeout     = self.get_parameter('sensor_timeout').value
 
         # ── State ─────────────────────────────────────────────────────────────
         self._scan_received = False
@@ -86,7 +95,8 @@ class ExplorationController(Node):
         self.get_logger().info(
             f'Exploration controller (smooth reactive) ready | '
             f'speed={self._move_spd} m/s | turn={self._turn_spd} rad/s | '
-            f'obstacle={self._obs_dist} m | estop={self._estop_dist} m')
+            f'obstacle={self._obs_dist} m | estop={self._estop_dist} m | '
+            f'robot_radius={self._robot_rad} m')
 
     # ── LiDAR callback ────────────────────────────────────────────────────────
 
@@ -127,12 +137,15 @@ class ExplorationController(Node):
 
         scan = self._latest_scan
 
-        # ── Build sector clearance map ────────────────────────────────────
-        # Divide 360° into N_SECTORS bins, compute min range per sector
+        # ── Build sector clearance map + lateral repulsion ─────────────────
+        # Divide 360° into N_SECTORS bins, compute min range per sector.
+        # Also accumulate a strafe repulsion vector: if something is close
+        # to the side, push the robot laterally away from it.
         sector_min = [float('inf')] * N_SECTORS
         sector_angle = 2.0 * math.pi / N_SECTORS  # radians per sector
 
         closest_any = float('inf')
+        strafe_force = 0.0  # positive = push left, negative = push right
 
         for i, r in enumerate(scan.ranges):
             if not (scan.range_min <= r <= scan.range_max):
@@ -142,22 +155,39 @@ class ExplorationController(Node):
 
             angle = scan.angle_min + i * scan.angle_increment
             # Normalize to [0, 2π)
-            angle = angle % (2.0 * math.pi)
+            angle_pos = angle % (2.0 * math.pi)
 
-            sector_idx = int(angle / sector_angle) % N_SECTORS
+            sector_idx = int(angle_pos / sector_angle) % N_SECTORS
             if r < sector_min[sector_idx]:
                 sector_min[sector_idx] = r
 
             if r < closest_any:
                 closest_any = r
 
-        # ── Emergency stop ────────────────────────────────────────────────
+            # Lateral repulsion: if obstacle is within robot body zone,
+            # compute a strafe push AWAY from it.
+            # The robot body extends robot_radius from center.
+            # We activate repulsion when LiDAR range < robot_radius + buffer.
+            repulse_zone = self._robot_rad + 0.10  # 10 cm extra buffer
+            if r < repulse_zone:
+                # Obstacle is at angle `angle` in robot frame.
+                # Its Y-component (lateral) tells us which side it's on.
+                # sin(angle) > 0 = obstacle is to the LEFT  → push RIGHT (negative)
+                # sin(angle) < 0 = obstacle is to the RIGHT → push LEFT  (positive)
+                norm_angle = math.atan2(math.sin(angle), math.cos(angle))
+                lateral = math.sin(norm_angle)  # +left, -right
+                # Repulsion strength: stronger when closer
+                strength = (repulse_zone - r) / repulse_zone
+                strafe_force -= lateral * strength  # push AWAY
+
+        # ── Emergency stop — anything within robot body radius ─────────
         if closest_any < self._estop_dist:
             self._cmd_pub.publish(Twist())
             self._log_tick += 1
             if self._log_tick % 10 == 0:
                 self.get_logger().warn(
-                    f'EMERGENCY STOP — obstacle at {closest_any:.2f} m')
+                    f'EMERGENCY STOP — obstacle at {closest_any:.2f} m '
+                    f'(body radius={self._robot_rad:.2f} m)')
             return
 
         # ── Find the best direction to go ─────────────────────────────────
@@ -207,31 +237,41 @@ class ExplorationController(Node):
         front_sectors = [0, 1, N_SECTORS - 1]  # forward ± 1 sector
         front_clear = min(sector_min[s] for s in front_sectors)
 
-        if front_clear < self._estop_dist:
+        # Speed gating uses BOTH front AND closest-anywhere.
+        # This prevents driving forward while a side obstacle is scraping.
+        effective_clear = min(front_clear, closest_any + self._robot_rad)
+
+        if effective_clear < self._estop_dist:
             fwd = 0.0
-        elif front_clear < self._obs_dist:
-            # Proportional slowdown: 0 at estop, full speed at obs_dist
-            ratio = (front_clear - self._estop_dist) / (self._obs_dist - self._estop_dist)
-            fwd = self._move_spd * ratio * 0.5   # half-speed in tight spaces
+        elif effective_clear < self._obs_dist:
+            ratio = (effective_clear - self._estop_dist) / (self._obs_dist - self._estop_dist)
+            fwd = self._move_spd * ratio * 0.5
         else:
             fwd = self._move_spd
 
+        # If closest_any is within the robot body zone, slow to crawl
+        # and let strafe handle the escape
+        if closest_any < self._robot_rad:
+            fwd = 0.0
+
         # If best direction is significantly to the side, slow down more
-        # to let the robot turn before driving into something
-        turn_urgency = abs(best_angle) / math.pi  # 0 = forward, 1 = backward
+        turn_urgency = abs(best_angle) / math.pi
         if turn_urgency > 0.4:
             fwd *= max(0.0, 1.0 - turn_urgency)
 
+        # ── Compute strafe (linear.y) from lateral repulsion ──────────────
+        # Clamp strafe to a safe speed (60% of move_speed)
+        max_strafe = self._move_spd * 0.6
+        strafe = max(-max_strafe, min(max_strafe, strafe_force * self._move_spd))
+
         # ── Compute turn rate ─────────────────────────────────────────────
-        # Proportional: turn faster when the goal direction is more lateral
-        turn = self._turn_spd * (best_angle / math.pi)  # smooth, proportional
+        turn = self._turn_spd * (best_angle / math.pi)
 
         # If front is blocked, turn more aggressively toward the open side
         if front_clear < self._obs_dist:
             if abs(best_angle) > 0.1:
                 turn = self._turn_spd * (1.0 if best_angle > 0 else -1.0) * 0.8
             else:
-                # Front is blocked but best is also forward — find ANY open side
                 left_clear  = min(sector_min[s] for s in range(N_SECTORS // 6, N_SECTORS // 3))
                 right_clear = min(sector_min[s] for s in range(2 * N_SECTORS // 3, 5 * N_SECTORS // 6))
                 if left_clear > right_clear:
@@ -242,6 +282,7 @@ class ExplorationController(Node):
         # ── Publish ───────────────────────────────────────────────────────
         twist = Twist()
         twist.linear.x = fwd
+        twist.linear.y = strafe
         twist.angular.z = turn
         self._cmd_pub.publish(twist)
 
@@ -252,7 +293,7 @@ class ExplorationController(Node):
             self.get_logger().info(
                 f'front={front_clear:.2f} m | '
                 f'best_dir={best_deg:+.0f}° | '
-                f'cmd=({fwd:.2f} fwd, {turn:+.2f} turn) | '
+                f'cmd=({fwd:.2f} fwd, {strafe:+.2f} str, {turn:+.2f} turn) | '
                 f'closest={closest_any:.2f} m')
 
 

@@ -57,8 +57,13 @@ WALL_ALIGN_GAIN = 1.2          # how aggressively to align parallel to wall
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
 WALL_SECTOR_R   = 3 * N_SECTORS // 4   # ~270° = 90° right
 
-# Goal bias weight — nudges heading without overriding safety
-GOAL_BIAS_W     = 0.35         # radians of extra turn toward goal per unit
+# Goal bias weight — nudge only, wall-follow stays dominant
+GOAL_BIAS_W     = 0.20         # rad, clamped — reduced to avoid fighting alignment
+
+# Hallway boost: when path is wide open and nearly straight, go faster
+HALLWAY_FRONT   = 1.00         # m min front clearance to activate boost
+HALLWAY_SPEED   = 0.28         # m/s boost speed (vs normal 0.18)
+HALLWAY_TURN    = 0.15         # max |turn| to qualify as "straight"
 
 
 class ExplorationController(Node):
@@ -100,11 +105,11 @@ class ExplorationController(Node):
         self._visited       = []      # blacklisted goals
         self._visited_rad   = 0.8     # m — how close = "reached"
 
-        # Stuck detection (translation only — turning is NOT stuck)
+        # Stuck detection — updated every 100ms in control loop (NOT here)
         self._last_pos_x    = 0.0
         self._last_pos_y    = 0.0
         self._last_move_t   = time.monotonic()
-        self._stuck_timeout = 15.0    # s — generous; turning is fine
+        self._stuck_timeout = 20.0    # s — generous; position updates at 10 Hz now
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -180,15 +185,11 @@ class ExplorationController(Node):
                 self._goal_world = None
                 self._goal_heading = None
 
-        # Check stuck (translation only)
-        if self._has_tf:
-            moved = math.hypot(self._robot_x - self._last_pos_x,
-                               self._robot_y - self._last_pos_y)
-            if moved > 0.4:
-                self._last_pos_x = self._robot_x
-                self._last_pos_y = self._robot_y
-                self._last_move_t = now
-            elif self._goal_world and (now - self._last_move_t) > self._stuck_timeout:
+        # Check stuck — position tracking now happens in control_loop (10 Hz)
+        # Just read the result here
+        if self._has_tf and self._goal_world:
+            now = time.monotonic()
+            if (now - self._last_move_t) > self._stuck_timeout:
                 gx, gy = self._goal_world
                 self.get_logger().warn(
                     f'STUCK (no translation for {self._stuck_timeout:.0f}s) — '
@@ -442,6 +443,9 @@ class ExplorationController(Node):
             # d_fl > d_rl → nose angled away from left wall → need to turn left (+)
             align_error -= (d_rl - d_fl) * WALL_ALIGN_GAIN
 
+        # Clamp alignment error — prevent overcorrection in curves
+        align_error = max(-0.25, min(0.25, align_error))
+
         # Distance correction (same as before)
         dist_error = 0.0
         if right_clear < WALL_TARGET:
@@ -515,12 +519,27 @@ class ExplorationController(Node):
         elif effective_clear < self._obs_dist:
             ratio = ((effective_clear - self._estop_dist) /
                      (self._obs_dist - self._estop_dist))
-            fwd = self._move_spd * max(0.2, ratio)  # never below 20% speed
+            fwd = self._move_spd * max(0.2, ratio)
         else:
             fwd = self._move_spd
 
         if closest_any < self._robot_rad:
             fwd = 0.0
+
+        # Hallway boost: wide open ahead + nearly straight → faster
+        if (front_clear > HALLWAY_FRONT
+                and abs(turn) < HALLWAY_TURN
+                and closest_any > self._obs_dist):
+            fwd = HALLWAY_SPEED
+
+        # ── Update stuck detection at 10 Hz ──────────────────────────────
+        if self._has_tf:
+            moved = math.hypot(self._robot_x - self._last_pos_x,
+                               self._robot_y - self._last_pos_y)
+            if moved > 0.25:
+                self._last_pos_x = self._robot_x
+                self._last_pos_y = self._robot_y
+                self._last_move_t = now
 
         # ── Strafe ────────────────────────────────────────────────────────
         max_str = self._move_spd * 0.6

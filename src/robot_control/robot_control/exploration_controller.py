@@ -52,7 +52,8 @@ UNKNOWN        = -1
 
 # Wall-follow: target distance to keep from side walls
 WALL_TARGET     = 0.55         # m — desired side clearance
-WALL_GAIN       = 0.8          # how aggressively to correct wall distance
+WALL_DIST_GAIN  = 0.8          # how aggressively to correct wall distance
+WALL_ALIGN_GAIN = 1.2          # how aggressively to align parallel to wall
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
 WALL_SECTOR_R   = 3 * N_SECTORS // 4   # ~270° = 90° right
 
@@ -398,24 +399,57 @@ class ExplorationController(Node):
                     f'EMERGENCY STOP — {closest_any:.2f} m')
             return
 
-        # ── Wall-follow steering ──────────────────────────────────────────
-        # Sample left and right side clearance
-        # Sector 6 ≈ 90° left, sector 18 ≈ 90° right (for N_SECTORS=24)
-        # Take the min over a ±30° cone around each side
+        # ── Wall-follow: distance + alignment correction ──────────────────
+        # N_SECTORS=24 → sector_ang=15°
+        # Right-side sectors: 18=270°(-90°), 20=300°(-60°), 16=240°(-120°)
+        # Left-side sectors:   6=90°,         4=60°,         8=120°
+
+        # Distance samples (perpendicular to robot — 90° each side)
         left_sectors  = [(WALL_SECTOR_L + d) % N_SECTORS for d in range(-2, 3)]
         right_sectors = [(WALL_SECTOR_R + d) % N_SECTORS for d in range(-2, 3)]
         left_clear    = min(sector_min[s] for s in left_sectors)
         right_clear   = min(sector_min[s] for s in right_sectors)
 
-        # Wall-follow error: positive = need to turn left, negative = turn right
-        # We try to maintain WALL_TARGET gap on BOTH sides
-        # If right wall is too close → turn left (positive)
-        # If left wall is too close  → turn right (negative)
-        wall_error = 0.0
+        # Alignment samples at ±60° and ±120° on each side:
+        # Project to perpendicular distance: r * sin(angle_from_forward)
+        # At ±60°: sin(60°) = 0.866
+        # At ±120°: sin(120°) = 0.866   (same projection magnitude)
+        # Difference between front-diagonal and rear-diagonal reveals yaw offset.
+        SIN60 = 0.866
+        # Right side: sector 20 ≈ -60° (front-right), sector 16 ≈ -120° (rear-right)
+        r_front_right = sector_min[20 % N_SECTORS]   # -60°
+        r_rear_right  = sector_min[16 % N_SECTORS]   # -120°
+        # Left side: sector 4 ≈ +60° (front-left), sector 8 ≈ +120° (rear-left)
+        r_front_left  = sector_min[4 % N_SECTORS]    # +60°
+        r_rear_left   = sector_min[8 % N_SECTORS]    # +120°
+
+        # Valid alignment correction only when wall is seen on that side
+        align_error = 0.0
+        ALIGN_MIN_RANGE = 1.5  # only use alignment when wall is within 1.5m
+
+        if right_clear < ALIGN_MIN_RANGE and r_front_right < ALIGN_MIN_RANGE and r_rear_right < ALIGN_MIN_RANGE:
+            # Perpendicular projection of front-right vs rear-right
+            d_fr = r_front_right * SIN60
+            d_rr = r_rear_right  * SIN60
+            # d_fr < d_rr → nose angled toward right wall → need to turn left (+)
+            # d_fr > d_rr → nose angled away from right wall → need to turn right (-)
+            align_error += (d_rr - d_fr) * WALL_ALIGN_GAIN
+
+        if left_clear < ALIGN_MIN_RANGE and r_front_left < ALIGN_MIN_RANGE and r_rear_left < ALIGN_MIN_RANGE:
+            d_fl = r_front_left * SIN60
+            d_rl = r_rear_left  * SIN60
+            # d_fl < d_rl → nose angled toward left wall → need to turn right (-)
+            # d_fl > d_rl → nose angled away from left wall → need to turn left (+)
+            align_error -= (d_rl - d_fl) * WALL_ALIGN_GAIN
+
+        # Distance correction (same as before)
+        dist_error = 0.0
         if right_clear < WALL_TARGET:
-            wall_error += (WALL_TARGET - right_clear) * WALL_GAIN  # push left
+            dist_error += (WALL_TARGET - right_clear) * WALL_DIST_GAIN
         if left_clear < WALL_TARGET:
-            wall_error -= (WALL_TARGET - left_clear) * WALL_GAIN   # push right
+            dist_error -= (WALL_TARGET - left_clear) * WALL_DIST_GAIN
+
+        wall_error = dist_error + align_error
 
         # ── Obstacle avoidance: pick best open sector ─────────────────────
         # For the forward hemisphere, find the sector with most clearance
@@ -505,6 +539,7 @@ class ExplorationController(Node):
             self.get_logger().info(
                 f'fwd={fwd:.2f} str={strafe:+.2f} trn={turn:+.2f} | '
                 f'front={front_clear:.2f} L={left_clear:.2f} R={right_clear:.2f} | '
+                f'align={align_error:+.2f} dist={dist_error:+.2f} | '
                 f'goal={goal_str} near={closest_any:.2f}')
 
 

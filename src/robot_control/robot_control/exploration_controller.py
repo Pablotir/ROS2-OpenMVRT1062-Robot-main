@@ -459,7 +459,7 @@ class ExplorationController(Node):
         # EMA smooth the alignment signal
         self._smooth_align = (ALIGN_EMA * raw_align
                               + (1 - ALIGN_EMA) * self._smooth_align)
-        align_error = max(-0.25, min(0.25, self._smooth_align))
+        align_error = max(-1.0, min(1.0, self._smooth_align))
 
         # ── Detect hallway mode ────────────────────────────────────────────
         front_sectors = [0, 1, N_SECTORS - 1]
@@ -524,11 +524,11 @@ class ExplorationController(Node):
             goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
 
         # ── Combine steering signals ──────────────────────────────────────
-        # Base turn from best open sector
-        obstacle_turn = self._turn_spd * (best_ang / math.pi)
-        # Wall correction
-        wall_turn     = max(-self._turn_spd * 0.6,
-                            min(self._turn_spd * 0.6, wall_error))
+        # Base turn from best open sector (scaled to hit max turn at 90°)
+        obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
+        # Wall correction (allow up to 100% of turn speed to fix drift quickly)
+        wall_turn     = max(-self._turn_spd,
+                            min(self._turn_spd, wall_error))
         # Blend: obstacle avoidance dominates when something is close
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
@@ -553,6 +553,12 @@ class ExplorationController(Node):
             fwd = target_speed * max(0.2, ratio)
         else:
             fwd = target_speed
+
+        # DYNAMIC SPEED PENALTY: When correcting alignment or dodging, slow down!
+        # If we turn heavy, drop speed to 20% so we pivot instead of drifting.
+        turn_ratio   = abs(turn) / self._turn_spd
+        turn_penalty = max(0.2, 1.0 - (turn_ratio * 1.5))
+        fwd *= turn_penalty
 
         if closest_any < self._robot_rad:
             fwd = 0.0

@@ -52,18 +52,26 @@ UNKNOWN        = -1
 
 # Wall-follow: target distance to keep from side walls
 WALL_TARGET     = 0.55         # m — desired side clearance
-WALL_DIST_GAIN  = 0.8          # how aggressively to correct wall distance
-WALL_ALIGN_GAIN = 1.2          # how aggressively to align parallel to wall
+WALL_DIST_GAIN  = 0.7          # distance correction gain
+WALL_ALIGN_GAIN = 1.0          # alignment gain
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
 WALL_SECTOR_R   = 3 * N_SECTORS // 4   # ~270° = 90° right
 
-# Goal bias weight — nudge only, wall-follow stays dominant
-GOAL_BIAS_W     = 0.20         # rad, clamped — reduced to avoid fighting alignment
+# Noise filtering
+ALIGN_EMA       = 0.20         # exponential moving average weight (lower = smoother)
+ALIGN_DEADBAND  = 0.04         # m — ignore alignment differences smaller than this
 
-# Hallway boost: when path is wide open and nearly straight, go faster
-HALLWAY_FRONT   = 1.00         # m min front clearance to activate boost
-HALLWAY_SPEED   = 0.28         # m/s boost speed (vs normal 0.18)
-HALLWAY_TURN    = 0.15         # max |turn| to qualify as "straight"
+# Goal bias weight — nudge only, wall-follow stays dominant
+GOAL_BIAS_W     = 0.18         # rad, clamped
+
+# Hallway mode: when both walls visible + front clear, center + run fast
+HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
+HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
+HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
+HALLWAY_CENTER_GAIN = 0.6      # centering gain (L-R error → turn correction)
+
+# Normal speed (open room)
+NORMAL_SPEED     = 0.25        # m/s
 
 
 class ExplorationController(Node):
@@ -110,6 +118,11 @@ class ExplorationController(Node):
         self._last_pos_y    = 0.0
         self._last_move_t   = time.monotonic()
         self._stuck_timeout = 20.0    # s — generous; position updates at 10 Hz now
+
+        # Noise filtering: EMA of alignment corrections
+        self._smooth_align  = 0.0     # exponential moving average of align_error
+        self._smooth_l      = None    # EMA of left clearance
+        self._smooth_r      = None    # EMA of right clearance
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -400,60 +413,78 @@ class ExplorationController(Node):
                     f'EMERGENCY STOP — {closest_any:.2f} m')
             return
 
-        # ── Wall-follow: distance + alignment correction ──────────────────
+        # ── Wall-follow: noise-filtered alignment + hallway mode ────────────────
         # N_SECTORS=24 → sector_ang=15°
-        # Right-side sectors: 18=270°(-90°), 20=300°(-60°), 16=240°(-120°)
-        # Left-side sectors:   6=90°,         4=60°,         8=120°
+        # Right sectors: 18=270°(-90°), 20=300°(-60°), 16=240°(-120°)
+        # Left sectors:   6=90°,         4=60°,         8=120°
 
-        # Distance samples (perpendicular to robot — 90° each side)
+        # Distance samples  (raw, perpendicular)
         left_sectors  = [(WALL_SECTOR_L + d) % N_SECTORS for d in range(-2, 3)]
         right_sectors = [(WALL_SECTOR_R + d) % N_SECTORS for d in range(-2, 3)]
-        left_clear    = min(sector_min[s] for s in left_sectors)
-        right_clear   = min(sector_min[s] for s in right_sectors)
+        left_raw      = min(sector_min[s] for s in left_sectors)
+        right_raw     = min(sector_min[s] for s in right_sectors)
 
-        # Alignment samples at ±60° and ±120° on each side:
-        # Project to perpendicular distance: r * sin(angle_from_forward)
-        # At ±60°: sin(60°) = 0.866
-        # At ±120°: sin(120°) = 0.866   (same projection magnitude)
-        # Difference between front-diagonal and rear-diagonal reveals yaw offset.
+        # EMA smooth the side distances to kill noise
+        if self._smooth_l is None:
+            self._smooth_l, self._smooth_r = left_raw, right_raw
+        else:
+            self._smooth_l = ALIGN_EMA * left_raw  + (1 - ALIGN_EMA) * self._smooth_l
+            self._smooth_r = ALIGN_EMA * right_raw + (1 - ALIGN_EMA) * self._smooth_r
+        left_clear  = self._smooth_l
+        right_clear = self._smooth_r
+
+        # Alignment via ±60° vs ±120° two-point projection
         SIN60 = 0.866
-        # Right side: sector 20 ≈ -60° (front-right), sector 16 ≈ -120° (rear-right)
-        r_front_right = sector_min[20 % N_SECTORS]   # -60°
-        r_rear_right  = sector_min[16 % N_SECTORS]   # -120°
-        # Left side: sector 4 ≈ +60° (front-left), sector 8 ≈ +120° (rear-left)
-        r_front_left  = sector_min[4 % N_SECTORS]    # +60°
-        r_rear_left   = sector_min[8 % N_SECTORS]    # +120°
+        r_front_right = sector_min[20 % N_SECTORS]
+        r_rear_right  = sector_min[16 % N_SECTORS]
+        r_front_left  = sector_min[ 4 % N_SECTORS]
+        r_rear_left   = sector_min[ 8 % N_SECTORS]
 
-        # Valid alignment correction only when wall is seen on that side
-        align_error = 0.0
-        ALIGN_MIN_RANGE = 1.5  # only use alignment when wall is within 1.5m
+        raw_align = 0.0
+        ALIGN_MIN_RANGE = 1.4
+        if (right_clear < ALIGN_MIN_RANGE
+                and r_front_right < ALIGN_MIN_RANGE
+                and r_rear_right  < ALIGN_MIN_RANGE):
+            diff_r = r_rear_right - r_front_right
+            if abs(diff_r) > ALIGN_DEADBAND / SIN60:
+                raw_align += diff_r * SIN60 * WALL_ALIGN_GAIN
 
-        if right_clear < ALIGN_MIN_RANGE and r_front_right < ALIGN_MIN_RANGE and r_rear_right < ALIGN_MIN_RANGE:
-            # Perpendicular projection of front-right vs rear-right
-            d_fr = r_front_right * SIN60
-            d_rr = r_rear_right  * SIN60
-            # d_fr < d_rr → nose angled toward right wall → need to turn left (+)
-            # d_fr > d_rr → nose angled away from right wall → need to turn right (-)
-            align_error += (d_rr - d_fr) * WALL_ALIGN_GAIN
+        if (left_clear < ALIGN_MIN_RANGE
+                and r_front_left < ALIGN_MIN_RANGE
+                and r_rear_left  < ALIGN_MIN_RANGE):
+            diff_l = r_front_left - r_rear_left
+            if abs(diff_l) > ALIGN_DEADBAND / SIN60:
+                raw_align -= diff_l * SIN60 * WALL_ALIGN_GAIN
 
-        if left_clear < ALIGN_MIN_RANGE and r_front_left < ALIGN_MIN_RANGE and r_rear_left < ALIGN_MIN_RANGE:
-            d_fl = r_front_left * SIN60
-            d_rl = r_rear_left  * SIN60
-            # d_fl < d_rl → nose angled toward left wall → need to turn right (-)
-            # d_fl > d_rl → nose angled away from left wall → need to turn left (+)
-            align_error -= (d_rl - d_fl) * WALL_ALIGN_GAIN
+        # EMA smooth the alignment signal
+        self._smooth_align = (ALIGN_EMA * raw_align
+                              + (1 - ALIGN_EMA) * self._smooth_align)
+        align_error = max(-0.25, min(0.25, self._smooth_align))
 
-        # Clamp alignment error — prevent overcorrection in curves
-        align_error = max(-0.25, min(0.25, align_error))
+        # ── Detect hallway mode ────────────────────────────────────────────
+        front_sectors = [0, 1, N_SECTORS - 1]
+        front_clear   = min(sector_min[s] for s in front_sectors)
 
-        # Distance correction (same as before)
-        dist_error = 0.0
-        if right_clear < WALL_TARGET:
-            dist_error += (WALL_TARGET - right_clear) * WALL_DIST_GAIN
-        if left_clear < WALL_TARGET:
-            dist_error -= (WALL_TARGET - left_clear) * WALL_DIST_GAIN
+        in_hallway = (left_clear  < HALLWAY_MAX_SIDE
+                      and right_clear < HALLWAY_MAX_SIDE
+                      and front_clear > HALLWAY_MIN_FRONT)
 
-        wall_error = dist_error + align_error
+        if in_hallway:
+            # CENTER between the two walls: target L == R
+            # Positive center_err = robot is right of center = turn left
+            center_err  = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
+            # Combine centering + alignment (both smoothed)
+            wall_error  = center_err + align_error
+            target_speed = HALLWAY_SPEED
+        else:
+            # Normal wall-follow: independent distance correction on each wall
+            dist_error = 0.0
+            if right_clear < WALL_TARGET:
+                dist_error += (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+            if left_clear < WALL_TARGET:
+                dist_error -= (WALL_TARGET - left_clear) * WALL_DIST_GAIN
+            wall_error   = dist_error + align_error
+            target_speed = NORMAL_SPEED
 
         # ── Obstacle avoidance: pick best open sector ─────────────────────
         # For the forward hemisphere, find the sector with most clearance
@@ -519,18 +550,15 @@ class ExplorationController(Node):
         elif effective_clear < self._obs_dist:
             ratio = ((effective_clear - self._estop_dist) /
                      (self._obs_dist - self._estop_dist))
-            fwd = self._move_spd * max(0.2, ratio)
+            fwd = target_speed * max(0.2, ratio)
         else:
-            fwd = self._move_spd
+            fwd = target_speed
 
         if closest_any < self._robot_rad:
             fwd = 0.0
 
-        # Hallway boost: wide open ahead + nearly straight → faster
-        if (front_clear > HALLWAY_FRONT
-                and abs(turn) < HALLWAY_TURN
-                and closest_any > self._obs_dist):
-            fwd = HALLWAY_SPEED
+        # Log hallway mode
+        mode_str = 'HALL' if in_hallway else 'room'
 
         # ── Update stuck detection at 10 Hz ──────────────────────────────
         if self._has_tf:
@@ -556,10 +584,9 @@ class ExplorationController(Node):
         self._log_tick += 1
         if self._log_tick % 20 == 0:
             self.get_logger().info(
-                f'fwd={fwd:.2f} str={strafe:+.2f} trn={turn:+.2f} | '
+                f'[{mode_str}] fwd={fwd:.2f} trn={turn:+.2f} str={strafe:+.2f} | '
                 f'front={front_clear:.2f} L={left_clear:.2f} R={right_clear:.2f} | '
-                f'align={align_error:+.2f} dist={dist_error:+.2f} | '
-                f'goal={goal_str} near={closest_any:.2f}')
+                f'align={align_error:+.2f} | goal={goal_str} near={closest_any:.2f}')
 
 
 def main(args=None):

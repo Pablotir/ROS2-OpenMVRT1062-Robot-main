@@ -125,7 +125,7 @@ controller_server:
       # No PathAlign: same issue — forces facing the path direction
       critics:
         ["Oscillation", "BaseObstacle", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02    # low — let inflation handle avoidance
+      BaseObstacle.scale: 5.0     # VERY IMPORTANT: Actually avoid obstacles in the costmap!
       PathDist.scale: 32.0        # follow the planned path closely
       GoalDist.scale: 24.0        # move toward the goal
 
@@ -209,8 +209,8 @@ local_costmap:
         clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0       # fast falloff keeps corridor centers cheap
-        inflation_radius: 0.35         # 35 cm — tight enough for doorways
+        cost_scaling_factor: 2.5       # moderate falloff so the robot is gently pushed away
+        inflation_radius: 0.85         # 85 cm — allows the robot to "feel" walls long before hitting them
       always_send_full_costmap: true
 
 # ── Global costmap ─────────────────────────────────────────────────────────────
@@ -266,8 +266,8 @@ global_costmap:
         clear_on_max_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.35
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.85
       always_send_full_costmap: true
 
 map_server:

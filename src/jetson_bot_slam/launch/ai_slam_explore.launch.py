@@ -85,8 +85,8 @@ def generate_launch_description():
         DeclareLaunchArgument('use_slam',            default_value='true',
                               description='Start RTAB-Map LiDAR SLAM'),
         # Nav2 + Frontier exploration
-        DeclareLaunchArgument('use_nav2',            default_value='true',
-                              description='Use Nav2 + explore_lite instead of reactive controller'),
+        DeclareLaunchArgument('use_nav2',            default_value='false',
+                              description='Use Nav2 path planning (not needed for exploration)'),
         # Camera + AI (disabled by default until SLAM is validated)
         DeclareLaunchArgument('use_camera',          default_value='false',
                               description='Enable USB camera + VILA AI labeller'),
@@ -252,20 +252,21 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_nav2')),
     )
 
-    # ── Frontier explorer (Python-native, no C++ build needed) ────────────
+    # ── Frontier explorer (direct LiDAR control — NO Nav2 required) ────────
     frontier_explorer = Node(
         package='robot_control',
         executable='frontier_explorer',
         name='frontier_explorer',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_nav2')),
+        condition=IfCondition(LaunchConfiguration('use_slam')),
         parameters=[{
-            'robot_base_frame':    'base_link',
-            'planner_frequency':   0.33,
-            'progress_timeout':    30.0,
-            'potential_scale':     3.0,
-            'gain_scale':          1.0,
+            'move_speed':          LaunchConfiguration('move_speed'),
+            'turn_speed':          LaunchConfiguration('turn_speed'),
+            'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
+            'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
+            'planner_frequency':   2.0,
             'min_frontier_size':   0.30,
+            'startup_delay':       8.0,
         }],
     )
 
@@ -309,8 +310,8 @@ def generate_launch_description():
         image_convert,    # Only when use_camera:=true
         slam_toolbox,     # LiDAR SLAM (on by default)
         vila_labeller,    # Only when use_camera:=true
-        nav2,             # Nav2 path planning (on by default)
-        frontier_explorer,  # Python frontier exploration (on by default)
-        exploration_ctrl,   # Reactive fallback (only when use_nav2:=false)
+        nav2,             # Nav2 path planning (opt-in with use_nav2:=true)
+        frontier_explorer,  # Direct LiDAR frontier exploration (on with SLAM)
+        exploration_ctrl,   # Old reactive fallback (only when use_nav2:=false AND use_slam:=false)
         rviz,
     ])

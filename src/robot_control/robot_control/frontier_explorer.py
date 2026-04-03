@@ -124,6 +124,11 @@ class FrontierExplorer(Node):
         # Stats counter
         self._stats_counter = 0
 
+        # Consecutive failure tracking — bail out after N failures
+        self._consecutive_fails = 0
+        self._max_consecutive_fails = 3
+        self._error_log: list[str] = []
+
         # ── Nav2 action client ────────────────────────────────────────────────
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -254,14 +259,9 @@ class FrontierExplorer(Node):
         if not frontiers:
             self._no_frontier_count += 1
 
-            # Trigger spin-in-place if stuck and haven't spun yet
-            if not self._spin_done and self._no_frontier_count >= _SPIN_TRIGGER:
-                self.get_logger().info(
-                    f'No frontiers for {self._no_frontier_count} checks — '
-                    'starting spin-in-place to grow the map...')
-                self._start_spin()
-                return
-
+            # With a 360° LiDAR, no frontiers means the area is fully
+            # mapped.  Just log and wait for the map to grow (e.g. if
+            # slam_toolbox corrects a loop closure and reveals gaps).
             if self._no_frontier_count % 10 == 1:
                 self.get_logger().info(
                     f'No frontiers found (check #{self._no_frontier_count}) — '
@@ -465,7 +465,11 @@ class FrontierExplorer(Node):
         goal = NavigateToPose.Goal()
         goal.pose = PoseStamped()
         goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        # Use Time(0) = "latest available transform", avoids TF
+        # extrapolation errors when slam_toolbox hasn't published
+        # the map→odom transform at the exact requested timestamp.
+        from builtin_interfaces.msg import Time as TimeMsg
+        goal.pose.header.stamp = TimeMsg()
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
@@ -485,9 +489,11 @@ class FrontierExplorer(Node):
             return  # Stale callback from a preempted goal
         self._goal_handle = future.result()
         if not self._goal_handle.accepted:
-            self.get_logger().warn('Goal rejected by Nav2 — blacklisting')
+            msg = f'Goal REJECTED by Nav2 at {self._current_goal}'
+            self.get_logger().warn(msg)
             self._blacklist.append(self._current_goal)
             self._navigating = False
+            self._record_failure(msg)
             self._last_fail_t = time.monotonic()
             return
         self.get_logger().info('Goal accepted — navigating...')
@@ -501,16 +507,85 @@ class FrontierExplorer(Node):
         status = future.result().status
         if status == 4:
             self.get_logger().info('Navigation succeeded — replanning for next frontier')
+            self._consecutive_fails = 0  # Reset on success
         elif status == 6:
-            self.get_logger().warn('Navigation cancelled (e.g. by recovery behaviour)')
+            msg = 'Navigation cancelled (e.g. by recovery behaviour)'
+            self.get_logger().warn(msg)
+            self._record_failure(msg)
             self._last_fail_t = time.monotonic()
         elif status == 5:
-            self.get_logger().warn('Navigation aborted/failed completely (status=5) — blacklisting goal')
+            msg = f'Navigation ABORTED (status=5) to goal {self._current_goal}'
+            self.get_logger().warn(msg)
             self._blacklist.append(self._current_goal)
+            self._record_failure(msg)
             self._last_fail_t = time.monotonic()
         else:
-            self.get_logger().warn(f'Navigation ended (status={status}) — waiting for cooldown')
+            msg = f'Navigation ended with unexpected status={status}'
+            self.get_logger().warn(msg)
+            self._record_failure(msg)
             self._last_fail_t = time.monotonic()
+
+    def _record_failure(self, msg: str):
+        """Track consecutive failures and shut down if threshold exceeded."""
+        self._consecutive_fails += 1
+        self._error_log.append(
+            f'[FAIL #{self._consecutive_fails}] {msg}')
+
+        if self._consecutive_fails >= self._max_consecutive_fails:
+            self._fatal_shutdown()
+
+    def _fatal_shutdown(self):
+        """Stop the robot, print errors clearly, and exit the node."""
+        # Stop all motors immediately
+        twist = Twist()
+        self._cmd_pub.publish(twist)
+        self._cmd_pub.publish(twist)  # Publish twice for reliability
+
+        # Cancel any active navigation
+        if self._goal_handle is not None:
+            try:
+                self._goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+
+        # Print errors clearly for easy copying
+        border = '=' * 70
+        lines = [
+            '',
+            '',
+            '',
+            border,
+            'FRONTIER EXPLORER — FATAL: Too many consecutive navigation failures',
+            border,
+            '',
+            f'Consecutive failures: {self._consecutive_fails}',
+            f'Robot position: ({self._robot_x:.2f}, {self._robot_y:.2f})',
+            f'Last goal sent: {self._current_goal}',
+            f'Blacklisted goals: {len(self._blacklist)}',
+            '',
+            'Error log:',
+        ]
+        for entry in self._error_log:
+            lines.append(f'  {entry}')
+        lines.append('')
+        lines.append('Possible causes:')
+        lines.append('  1. TF extrapolation error  — slam_toolbox not publishing map→odom fast enough')
+        lines.append('  2. Planner failure         — goal is unreachable (outside costmap or blocked)')
+        lines.append('  3. Controller failure      — no valid trajectories (inflation too aggressive)')
+        lines.append('  4. Hardware issue           — LiDAR or Arduino disconnected')
+        lines.append('')
+        lines.append('To debug, check the full log above for [ERROR] and [WARN] lines.')
+        lines.append(border)
+        lines.append('')
+
+        error_output = '\n'.join(lines)
+        self.get_logger().fatal(error_output)
+
+        # Also print to stdout so it's visible even if logger is noisy
+        print(error_output, flush=True)
+
+        # Shut down
+        raise SystemExit(1)
 
 
 def main(args=None):

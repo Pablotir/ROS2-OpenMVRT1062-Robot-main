@@ -403,7 +403,13 @@ class FrontierExplorer(Node):
     def _select_best_frontier(
             self, clusters: list[list[tuple[float, float]]]
     ) -> tuple[float, float] | None:
-        """Score and return the centroid of the best frontier cluster."""
+        """Score and return the best frontier goal.
+
+        The navigation target is pulled 0.4 m toward the robot from the
+        frontier centroid.  The centroid sits on the free/unknown boundary —
+        the robot only needs to get *close enough* to see the unknown area,
+        not stand on top of the boundary (which may be outside the costmap).
+        """
         best_score = -float('inf')
         best_xy = None
 
@@ -414,8 +420,7 @@ class FrontierExplorer(Node):
             if dist < 0.3:
                 continue
             
-            # Cap maximum frontier distance to 3.0 meters
-            # The robot shouldn't try to navigate through huge swaths of unknown
+            # Cap maximum frontier distance
             if dist > 5.0:
                 continue
                 
@@ -430,7 +435,21 @@ class FrontierExplorer(Node):
                 best_score = score
                 best_xy = (cx, cy)
 
-        return best_xy
+        if best_xy is None:
+            return None
+
+        # Pull the goal 0.4 m toward the robot so it's always inside
+        # the explored (and therefore costmap-covered) region.
+        fx, fy = best_xy
+        dx = fx - self._robot_x
+        dy = fy - self._robot_y
+        d = math.hypot(dx, dy)
+        pull_back = 0.4  # meters
+        if d > pull_back + 0.3:
+            fx -= (dx / d) * pull_back
+            fy -= (dy / d) * pull_back
+
+        return (fx, fy)
 
     # ── Nav2 goal sending ─────────────────────────────────────────────────────
 

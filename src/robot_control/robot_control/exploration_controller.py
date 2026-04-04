@@ -129,6 +129,7 @@ class ExplorationController(Node):
         self.STATE_HALLWAY = 'HALLWAY'
         self.STATE_ROOM_PERIMETER = 'ROOM'
         self._current_state = self.STATE_CROSSING
+        self._hugging_side = 'RIGHT'
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -448,12 +449,18 @@ class ExplorationController(Node):
         if left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH:
             self._current_state = self.STATE_HALLWAY
         elif right_clear < WALL_THRESH or left_clear < WALL_THRESH:
-            # G14: We default to right-wall hugging for rooms as discussed.
             self._current_state = self.STATE_ROOM_PERIMETER
+            # G14: Switch hugging side if our preferred wall disappears but the other is present
+            if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT' and right_clear > 2.0 and left_clear < WALL_THRESH:
+                self._hugging_side = 'LEFT'
+            elif getattr(self, '_hugging_side', 'RIGHT') == 'LEFT' and left_clear > 2.0 and right_clear < WALL_THRESH:
+                self._hugging_side = 'RIGHT'
         else:
             self._current_state = self.STATE_CROSSING
 
         mode_str = self._current_state
+        if self._current_state == self.STATE_ROOM_PERIMETER:
+            mode_str += f"({getattr(self, '_hugging_side', 'R')[0]})"
         fwd = 0.0
         turn = 0.0
         align_error = 0.0
@@ -472,12 +479,20 @@ class ExplorationController(Node):
             r_rear_left   = sector_min[ 8 % N_SECTORS]
             
             align_err = 0.0
+            align_weight = 0.0
             if (right_clear < WALL_THRESH):
                 diff_r = r_rear_right - r_front_right
-                align_err += diff_r * SIN60 * WALL_ALIGN_GAIN
-            elif (left_clear < WALL_THRESH):
-                diff_l = r_front_left - r_rear_left
-                align_err -= diff_l * SIN60 * WALL_ALIGN_GAIN
+                if abs(diff_r) < 0.5:
+                    align_err += diff_r * SIN60 * WALL_ALIGN_GAIN
+                    align_weight += 1.0
+            if (left_clear < WALL_THRESH):
+                diff_l = r_rear_left - r_front_left
+                if abs(diff_l) < 0.5:
+                    align_err -= diff_l * SIN60 * WALL_ALIGN_GAIN
+                    align_weight += 1.0
+                
+            if align_weight > 0:
+                align_err /= align_weight
             
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
@@ -485,22 +500,37 @@ class ExplorationController(Node):
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
-            # G14: Strict Right-Wall Hugging logic
-            if right_clear < 2.0:
-                dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
-                
-                SIN60 = 0.866
-                r_front_right = sector_min[20 % N_SECTORS]
-                r_rear_right  = sector_min[16 % N_SECTORS]
-                diff_r = r_rear_right - r_front_right
-                align_err = diff_r * SIN60 * WALL_ALIGN_GAIN
-                
-                self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                turn = dist_error + self._smooth_align
-                align_error = self._smooth_align
+            # G14: Dynamic Wall Hugging logic (Left or Right)
+            SIN60 = 0.866
+            r_front_right = sector_min[20 % N_SECTORS]
+            r_rear_right  = sector_min[16 % N_SECTORS]
+            r_front_left  = sector_min[ 4 % N_SECTORS]
+            r_rear_left   = sector_min[ 8 % N_SECTORS]
+
+            if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT':
+                if right_clear < 2.0:
+                    dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+                    diff_r = r_rear_right - r_front_right
+                    align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
+                    
+                    self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
+                    turn = dist_error + self._smooth_align
+                    align_error = self._smooth_align
+                else:
+                    # Seek the right wall blindly with steady turn
+                    turn = -self._turn_spd * 0.7 
             else:
-                # Seek the right wall blindly with steady turn
-                turn = -self._turn_spd * 0.7 
+                if left_clear < 2.0:
+                    dist_error = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
+                    diff_l = r_rear_left - r_front_left
+                    align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
+                    
+                    self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
+                    turn = dist_error + self._smooth_align
+                    align_error = self._smooth_align
+                else:
+                    # Seek the left wall blindly with steady turn
+                    turn = self._turn_spd * 0.7 
             
             target_speed = NORMAL_SPEED
 

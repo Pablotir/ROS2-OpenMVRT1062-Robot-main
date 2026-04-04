@@ -124,6 +124,12 @@ class ExplorationController(Node):
         self._smooth_l      = None    # EMA of left clearance
         self._smooth_r      = None    # EMA of right clearance
 
+        # G14: FSM States Definition
+        self.STATE_CROSSING = 'CROSSING'
+        self.STATE_HALLWAY = 'HALLWAY'
+        self.STATE_ROOM_PERIMETER = 'ROOM'
+        self._current_state = self.STATE_CROSSING
+
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
@@ -433,138 +439,123 @@ class ExplorationController(Node):
         left_clear  = self._smooth_l
         right_clear = self._smooth_r
 
-        # Alignment via ±60° vs ±120° two-point projection
-        SIN60 = 0.866
-        r_front_right = sector_min[20 % N_SECTORS]
-        r_rear_right  = sector_min[16 % N_SECTORS]
-        r_front_left  = sector_min[ 4 % N_SECTORS]
-        r_rear_left   = sector_min[ 8 % N_SECTORS]
-
-        raw_align = 0.0
-        ALIGN_MIN_RANGE = 1.4
-        if (right_clear < ALIGN_MIN_RANGE
-                and r_front_right < ALIGN_MIN_RANGE
-                and r_rear_right  < ALIGN_MIN_RANGE):
-            diff_r = r_rear_right - r_front_right
-            if abs(diff_r) > ALIGN_DEADBAND / SIN60:
-                raw_align += diff_r * SIN60 * WALL_ALIGN_GAIN
-
-        if (left_clear < ALIGN_MIN_RANGE
-                and r_front_left < ALIGN_MIN_RANGE
-                and r_rear_left  < ALIGN_MIN_RANGE):
-            diff_l = r_front_left - r_rear_left
-            if abs(diff_l) > ALIGN_DEADBAND / SIN60:
-                raw_align -= diff_l * SIN60 * WALL_ALIGN_GAIN
-
-        # EMA smooth the alignment signal
-        self._smooth_align = (ALIGN_EMA * raw_align
-                              + (1 - ALIGN_EMA) * self._smooth_align)
-        align_error = max(-1.0, min(1.0, self._smooth_align))
-
-        # ── Detect hallway mode ────────────────────────────────────────────
+        # G14: FSM STATE MACHINE TRIGGERS
+        HALLWAY_THRESH = 1.4
+        WALL_THRESH = 1.4
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
 
-        in_hallway = (left_clear  < HALLWAY_MAX_SIDE
-                      and right_clear < HALLWAY_MAX_SIDE
-                      and front_clear > HALLWAY_MIN_FRONT)
-
-        if in_hallway:
-            # CENTER between the two walls: target L == R
-            # Positive center_err = robot is right of center = turn left
-            center_err  = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
-            # Combine centering + alignment (both smoothed)
-            wall_error  = center_err + align_error
-            target_speed = HALLWAY_SPEED
+        if left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH:
+            self._current_state = self.STATE_HALLWAY
+        elif right_clear < WALL_THRESH or left_clear < WALL_THRESH:
+            # G14: We default to right-wall hugging for rooms as discussed.
+            self._current_state = self.STATE_ROOM_PERIMETER
         else:
-            # Normal wall-follow: independent distance correction on each wall
-            dist_error = 0.0
-            if right_clear < WALL_TARGET:
-                dist_error += (WALL_TARGET - right_clear) * WALL_DIST_GAIN
-            if left_clear < WALL_TARGET:
-                dist_error -= (WALL_TARGET - left_clear) * WALL_DIST_GAIN
-            wall_error   = dist_error + align_error
+            self._current_state = self.STATE_CROSSING
+
+        mode_str = self._current_state
+        fwd = 0.0
+        turn = 0.0
+        align_error = 0.0
+        goal_str = 'none'
+
+        # G14: FSM BEHAVIOR EXECUTION (Single-track behaviors stop wheel cancellation)
+        if self._current_state == self.STATE_HALLWAY:
+            # G14: PD Controller for Center in Hallway
+            center_err  = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
+            
+            # G14: PD Controller for Parallel Alignment in Hallway
+            SIN60 = 0.866
+            r_front_right = sector_min[20 % N_SECTORS]
+            r_rear_right  = sector_min[16 % N_SECTORS]
+            r_front_left  = sector_min[ 4 % N_SECTORS]
+            r_rear_left   = sector_min[ 8 % N_SECTORS]
+            
+            align_err = 0.0
+            if (right_clear < WALL_THRESH):
+                diff_r = r_rear_right - r_front_right
+                align_err += diff_r * SIN60 * WALL_ALIGN_GAIN
+            elif (left_clear < WALL_THRESH):
+                diff_l = r_front_left - r_rear_left
+                align_err -= diff_l * SIN60 * WALL_ALIGN_GAIN
+            
+            self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
+            align_error = self._smooth_align
+            turn = center_err + align_error
+            target_speed = HALLWAY_SPEED
+
+        elif self._current_state == self.STATE_ROOM_PERIMETER:
+            # G14: Strict Right-Wall Hugging logic
+            if right_clear < 2.0:
+                dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+                
+                SIN60 = 0.866
+                r_front_right = sector_min[20 % N_SECTORS]
+                r_rear_right  = sector_min[16 % N_SECTORS]
+                diff_r = r_rear_right - r_front_right
+                align_err = diff_r * SIN60 * WALL_ALIGN_GAIN
+                
+                self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
+                turn = dist_error + self._smooth_align
+                align_error = self._smooth_align
+            else:
+                # Seek the right wall blindly with steady turn
+                turn = -self._turn_spd * 0.7 
+            
             target_speed = NORMAL_SPEED
 
-        # ── Obstacle avoidance: pick best open sector ─────────────────────
-        # For the forward hemisphere, find the sector with most clearance
+        elif self._current_state == self.STATE_CROSSING:
+            target_speed = NORMAL_SPEED
+            # G14: Frontier Crossing towards Goal
+            if self._goal_world is not None and self._has_tf:
+                goal_heading = self._heading_to(*self._goal_world)
+                turn = max(-GOAL_BIAS_W * 2.0, min(GOAL_BIAS_W * 2.0, goal_heading * 0.8))
+                goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
+            else:
+                turn = 0.4 # Slowly circle if no goal
+        
+        # ── Global Obstacle Avoidance (Overrides State) ───────────────────
+        # Find best open sector in the forward hemisphere
         fwd_scores = {}
+        sector_ang = 2.0 * math.pi / N_SECTORS
         for s in range(N_SECTORS):
             clearance = min(sector_min[s], 3.0)
-            prev_c    = min(sector_min[(s-1) % N_SECTORS], 3.0)
-            next_c    = min(sector_min[(s+1) % N_SECTORS], 3.0)
-            smooth    = (clearance + prev_c + next_c) / 3.0
             sec_local = math.atan2(math.sin(s * sector_ang),
-                                    math.cos(s * sector_ang))
-            # Only consider roughly forward sectors (within ±120°)
-            if abs(sec_local) > math.radians(120):
-                continue
-            # Forward preference
-            fwd_bias  = 1.0 - (abs(sec_local) / math.radians(120))
-            score     = smooth + fwd_bias * 0.5
-            if clearance < self._obs_dist:
-                score *= 0.05
-            fwd_scores[s] = score
-
+                                   math.cos(s * sector_ang))
+            if abs(sec_local) > math.radians(120): continue
+            fwd_scores[s] = clearance
+        
+        best_ang = 0.0
         if fwd_scores:
             best_s    = max(fwd_scores, key=lambda s: fwd_scores[s])
             best_ang  = math.atan2(math.sin(best_s * sector_ang),
-                                    math.cos(best_s * sector_ang))
-        else:
-            best_ang  = 0.0
+                                   math.cos(best_s * sector_ang))
 
-        # ── Goal bias ────────────────────────────────────────────────────
-        goal_bias = 0.0
-        goal_str  = 'none'
-        if self._goal_world is not None and self._has_tf:
-            goal_heading = self._heading_to(*self._goal_world)
-            # Gentle bias — clamp to ±GOAL_BIAS_W so wall-follow stays dominant
-            goal_bias = max(-GOAL_BIAS_W,
-                            min(GOAL_BIAS_W, goal_heading * 0.3))
-            goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
-
-        # ── Combine steering signals ──────────────────────────────────────
-        # Base turn from best open sector (scaled to hit max turn at 90°)
-        obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
-        # Wall correction (allow up to 100% of turn speed to fix drift quickly)
-        wall_turn     = max(-self._turn_spd,
-                            min(self._turn_spd, wall_error))
-        # Blend: obstacle avoidance dominates when something is close
-        front_sectors = [0, 1, N_SECTORS - 1]
-        front_clear   = min(sector_min[s] for s in front_sectors)
-
+        # Switch to dodge turning if obstacle directly ahead
         if front_clear < self._obs_dist:
-            # Obstacle close → full avoidance steering
+            obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
             turn = obstacle_turn
-        else:
-            # Clear path → blend wall-follow + goal bias
-            turn = wall_turn + goal_bias
+            # G14: Lower speed drastically when dodging to prevent slipping
+            target_speed *= 0.3
 
         turn = max(-self._turn_spd, min(self._turn_spd, turn))
 
-        # ── Forward speed ─────────────────────────────────────────────────
+        # ── Forward Speed Dynamics ────────────────────────────────────────
         effective_clear = min(front_clear, closest_any + self._robot_rad)
-
         if effective_clear < self._estop_dist:
             fwd = 0.0
         elif effective_clear < self._obs_dist:
-            ratio = ((effective_clear - self._estop_dist) /
-                     (self._obs_dist - self._estop_dist))
+            ratio = ((effective_clear - self._estop_dist) / (self._obs_dist - self._estop_dist))
             fwd = target_speed * max(0.2, ratio)
         else:
             fwd = target_speed
 
-        # DYNAMIC SPEED PENALTY: When correcting alignment or dodging, slow down!
-        # If we turn heavy, drop speed to 20% so we pivot instead of drifting.
         turn_ratio   = abs(turn) / self._turn_spd
         turn_penalty = max(0.2, 1.0 - (turn_ratio * 1.5))
         fwd *= turn_penalty
 
         if closest_any < self._robot_rad:
             fwd = 0.0
-
-        # Log hallway mode
-        mode_str = 'HALL' if in_hallway else 'room'
 
         # ── Update stuck detection at 10 Hz ──────────────────────────────
         if self._has_tf:
@@ -574,7 +565,8 @@ class ExplorationController(Node):
                 self._last_pos_x = self._robot_x
                 self._last_pos_y = self._robot_y
                 self._last_move_t = now
-
+                
+        # G14: DO NOT TOUCH - lateral strafing repulsion as requested
         # ── Strafe ────────────────────────────────────────────────────────
         max_str = self._move_spd * 0.6
         strafe  = max(-max_str, min(max_str, strafe_force * self._move_spd))

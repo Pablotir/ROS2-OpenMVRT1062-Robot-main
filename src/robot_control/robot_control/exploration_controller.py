@@ -327,10 +327,16 @@ class ExplorationController(Node):
             clear   = self._lidar_clearance(heading)
 
             # Base score: large and not too far away
-            score = size * 1.5 - dist * 0.3
+            score = size * 1.5 - dist * 1.5 # Increased distance penalty
 
-            # Mild forward preference (doesn't hard-block rear frontiers)
-            if abs(heading) < math.radians(90):
+            # G14: High forward momentum preference (discourage going backwards)
+            if abs(heading) > math.radians(100):
+                score -= 25.0
+            elif abs(heading) < math.radians(60):
+                score += 5.0
+                
+            # G14: Right-hand bias for exploration (negative heading = right)
+            if heading < -0.1:
                 score += 3.0
 
             # Prefer open LiDAR paths
@@ -450,11 +456,11 @@ class ExplorationController(Node):
             self._current_state = self.STATE_HALLWAY
         elif right_clear < WALL_THRESH or left_clear < WALL_THRESH:
             self._current_state = self.STATE_ROOM_PERIMETER
-            # G14: Switch hugging side if our preferred wall disappears but the other is present
-            if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT' and right_clear > 2.0 and left_clear < WALL_THRESH:
-                self._hugging_side = 'LEFT'
-            elif getattr(self, '_hugging_side', 'RIGHT') == 'LEFT' and left_clear > 2.0 and right_clear < WALL_THRESH:
+            # G14: Heavily prefer right-wall hugging. Only default to left if right is completely lost.
+            if right_clear < WALL_THRESH + 0.5:
                 self._hugging_side = 'RIGHT'
+            elif left_clear < WALL_THRESH:
+                self._hugging_side = 'LEFT'
         else:
             self._current_state = self.STATE_CROSSING
 
@@ -463,6 +469,7 @@ class ExplorationController(Node):
             mode_str += f"({getattr(self, '_hugging_side', 'R')[0]})"
         fwd = 0.0
         turn = 0.0
+        strafe_cmd = 0.0
         align_error = 0.0
         goal_str = 'none'
 
@@ -496,7 +503,10 @@ class ExplorationController(Node):
             
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
-            turn = center_err + align_error
+            
+            # G14: Map centering directly to lateral strafing to maintain zero-loss fwd speed!
+            strafe_cmd = center_err
+            turn = align_error
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
@@ -514,7 +524,8 @@ class ExplorationController(Node):
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
                     
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    turn = dist_error + self._smooth_align
+                    strafe_cmd = dist_error
+                    turn = self._smooth_align
                     align_error = self._smooth_align
                 else:
                     # Seek the right wall blindly with steady turn
@@ -526,7 +537,8 @@ class ExplorationController(Node):
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
                     
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    turn = dist_error + self._smooth_align
+                    strafe_cmd = dist_error
+                    turn = self._smooth_align
                     align_error = self._smooth_align
                 else:
                     # Seek the left wall blindly with steady turn
@@ -598,8 +610,9 @@ class ExplorationController(Node):
                 
         # G14: DO NOT TOUCH - lateral strafing repulsion as requested
         # ── Strafe ────────────────────────────────────────────────────────
-        max_str = self._move_spd * 0.6
-        strafe  = max(-max_str, min(max_str, strafe_force * self._move_spd))
+        max_str = self._move_spd * 0.8
+        total_strafe = (strafe_force * self._move_spd) + strafe_cmd
+        strafe  = max(-max_str, min(max_str, total_strafe))
 
         # ── Publish ───────────────────────────────────────────────────────
         twist = Twist()

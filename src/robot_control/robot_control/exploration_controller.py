@@ -455,6 +455,28 @@ class ExplorationController(Node):
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
 
+        # G15: Box Footprint Collision Check
+        # Project front rays to see if they fall inside our physical driving corridor.
+        # If trying to enter a gap narrower than our track width, abort and spin away.
+        footprint_blocked = False
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(ang_norm) < math.pi / 2: # Forward half
+                x = r * math.cos(ang_norm)
+                y = r * math.sin(ang_norm)
+                # Stop if an obstacle is penetrating our driving corridor box
+                # x spans from 0.08m (ignore close casing) to 0.40m ahead
+                # y spans +/- 0.25m (robot track width + safe margin)
+                if 0.08 < x < 0.40 and abs(y) < 0.25:
+                    footprint_blocked = True
+                    break
+        
+        if footprint_blocked:
+            front_clear = 0.05 # Artificially force an obstacle dodge!
+
         if left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH:
             self._current_state = self.STATE_HALLWAY
         elif right_clear < WALL_THRESH or left_clear < WALL_THRESH:

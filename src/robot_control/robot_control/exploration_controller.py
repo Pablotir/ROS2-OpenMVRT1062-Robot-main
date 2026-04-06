@@ -329,15 +329,16 @@ class ExplorationController(Node):
             # Base score: large and not too far away
             score = size * 1.5 - dist * 1.5 # Increased distance penalty
 
-            # G14: High forward momentum preference (discourage going backwards)
-            if abs(heading) > math.radians(100):
-                score -= 25.0
-            elif abs(heading) < math.radians(60):
-                score += 5.0
-                
-            # G14: Right-hand bias for exploration (negative heading = right)
-            if heading < -0.1:
-                score += 3.0
+            # Bonus for moving forward, heavy penalty for going backward
+            local_ang = heading
+            fwd_score = 5.0 * math.cos(local_ang)
+            if abs(local_ang) > math.pi / 2:
+                fwd_score -= 25.0
+
+            # G14: HEAVY Right-hand rule bias for frontiers
+            right_bonus = 15.0 if local_ang < -0.2 else 0.0
+            
+            score = (size * 1.5) - (dist * 1.5) + fwd_score + right_bonus
 
             # Prefer open LiDAR paths
             if clear < self._obs_dist:
@@ -449,7 +450,7 @@ class ExplorationController(Node):
         right_clear = self._smooth_r
 
         # G14: FSM STATE MACHINE TRIGGERS
-        HALLWAY_THRESH = 1.1 # Reduced from 1.4 to prevent living room tables from faking a hallway
+        HALLWAY_THRESH = 0.75 # Heavily reduced so gaps wider than 1.5m are treated as open rooms
         WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls 
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)

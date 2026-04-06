@@ -419,11 +419,13 @@ class ExplorationController(Node):
 
         # ── Emergency stop ────────────────────────────────────────────────
         if closest_any < self._estop_dist:
-            self._cmd_pub.publish(Twist())
+            twist = Twist()
+            twist.linear.x = -0.15 # Slowly reverse instead of paralyzing
+            self._cmd_pub.publish(twist)
             self._log_tick += 1
             if self._log_tick % 5 == 0:
                 self.get_logger().warn(
-                    f'EMERGENCY STOP — {closest_any:.2f} m')
+                    f'EMERGENCY STOP — {closest_any:.2f} m — REVERSING')
             return
 
         # ── Wall-follow: noise-filtered alignment + hallway mode ────────────────
@@ -448,7 +450,7 @@ class ExplorationController(Node):
 
         # G14: FSM STATE MACHINE TRIGGERS
         HALLWAY_THRESH = 1.4
-        WALL_THRESH = 1.4
+        WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls 
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
 
@@ -504,9 +506,9 @@ class ExplorationController(Node):
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
             
-            # G14: Map centering directly to lateral strafing to maintain zero-loss fwd speed!
-            strafe_cmd = center_err
-            turn = align_error
+            # G14: Reverted mapping to turning because mecanum wheels slip extensively during strafing, ruining the SLAM map cache
+            strafe_cmd = 0.0
+            turn = center_err + align_error
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
@@ -518,27 +520,27 @@ class ExplorationController(Node):
             r_rear_left   = sector_min[ 8 % N_SECTORS]
 
             if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT':
-                if right_clear < 2.0:
+                if right_clear < 3.5:
                     dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
                     diff_r = r_rear_right - r_front_right
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
                     
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    strafe_cmd = dist_error
-                    turn = self._smooth_align
+                    strafe_cmd = 0.0
+                    turn = dist_error + self._smooth_align
                     align_error = self._smooth_align
                 else:
                     # Seek the right wall blindly with steady turn
                     turn = -self._turn_spd * 0.7 
             else:
-                if left_clear < 2.0:
+                if left_clear < 3.5:
                     dist_error = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
                     diff_l = r_rear_left - r_front_left
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
                     
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    strafe_cmd = dist_error
-                    turn = self._smooth_align
+                    strafe_cmd = 0.0
+                    turn = dist_error + self._smooth_align
                     align_error = self._smooth_align
                 else:
                     # Seek the left wall blindly with steady turn

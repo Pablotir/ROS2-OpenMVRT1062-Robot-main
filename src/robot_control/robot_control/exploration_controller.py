@@ -449,7 +449,7 @@ class ExplorationController(Node):
         right_clear = self._smooth_r
 
         # G14: FSM STATE MACHINE TRIGGERS
-        HALLWAY_THRESH = 1.4
+        HALLWAY_THRESH = 1.1 # Reduced from 1.4 to prevent living room tables from faking a hallway
         WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls 
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)

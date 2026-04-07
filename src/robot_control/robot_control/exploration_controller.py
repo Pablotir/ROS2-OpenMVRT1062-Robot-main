@@ -418,6 +418,21 @@ class ExplorationController(Node):
                 na = math.atan2(math.sin(angle), math.cos(angle))
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
+        # G15: Box Footprint Collision Check
+        # Check if gap is barely 2 inches wider than physical robot width
+        # Robot track = 0.43m (y=±0.215m). +2 in = 0.265m
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(ang_norm) < math.pi / 2: # Forward half
+                x = r * math.cos(ang_norm)
+                y = r * math.sin(ang_norm)
+                if 0.02 < x < 0.35 and abs(y) < 0.265:
+                    closest_any = 0.05 # Override Estop trigger
+                    break
+
         # ── Emergency stop ────────────────────────────────────────────────
         if closest_any < self._estop_dist:
             twist = Twist()
@@ -454,28 +469,6 @@ class ExplorationController(Node):
         WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls 
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
-
-        # G15: Box Footprint Collision Check
-        # Project front rays to see if they fall inside our physical driving corridor.
-        # If trying to enter a gap narrower than our track width, abort and spin away.
-        footprint_blocked = False
-        for i, r in enumerate(scan.ranges):
-            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
-                continue
-            angle = scan.angle_min + i * scan.angle_increment
-            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
-            if abs(ang_norm) < math.pi / 2: # Forward half
-                x = r * math.cos(ang_norm)
-                y = r * math.sin(ang_norm)
-                # Stop if an obstacle is penetrating our driving corridor box
-                # x spans from 0.08m (ignore close casing) to 0.40m ahead
-                # y spans +/- 0.25m (robot track width + safe margin)
-                if 0.08 < x < 0.40 and abs(y) < 0.25:
-                    footprint_blocked = True
-                    break
-        
-        if footprint_blocked:
-            front_clear = 0.05 # Artificially force an obstacle dodge!
 
         if left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH:
             self._current_state = self.STATE_HALLWAY

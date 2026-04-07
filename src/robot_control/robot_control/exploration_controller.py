@@ -433,16 +433,32 @@ class ExplorationController(Node):
                     closest_any = 0.05 # Override Estop trigger
                     break
 
-        # ── Emergency stop ────────────────────────────────────────────────
+        # ── Emergency stop (Stateful Escape Sequence) ─────────────────────
         if closest_any < self._estop_dist:
+            if not getattr(self, '_escaping', False):
+                self._escape_ticks = 14 # 1.4 seconds total escape
+                self._escaping = True
+                self.get_logger().warn(f'STUCK / GAP DETECTED ({closest_any:.2f}m)! Starting Escape Sequence')
+
+        if getattr(self, '_escape_ticks', 0) > 0:
+            self._escape_ticks -= 1
             twist = Twist()
-            twist.linear.x = -0.15 # Slowly reverse instead of paralyzing
+            
+            # Phase 1: Reverse cleanly out of the gap (0.8 seconds)
+            if self._escape_ticks > 6:
+                twist.linear.x = -0.15
+                twist.angular.z = 0.0
+            # Phase 2: Spin rapidly away from the trapped angle (0.6 seconds)
+            else:
+                twist.linear.x = 0.0
+                left_clear  = min(sector_min[ 6 % N_SECTORS], sector_min[ 4 % N_SECTORS], sector_min[ 8 % N_SECTORS])
+                right_clear = min(sector_min[18 % N_SECTORS], sector_min[20 % N_SECTORS], sector_min[16 % N_SECTORS])
+                twist.angular.z = self._turn_spd if left_clear > right_clear else -self._turn_spd
+                
             self._cmd_pub.publish(twist)
-            self._log_tick += 1
-            if self._log_tick % 5 == 0:
-                self.get_logger().warn(
-                    f'EMERGENCY STOP — {closest_any:.2f} m — REVERSING')
             return
+        else:
+            self._escaping = False
 
         # ── Wall-follow: noise-filtered alignment + hallway mode ────────────────
         # N_SECTORS=24 → sector_ang=15°

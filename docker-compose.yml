@@ -32,7 +32,7 @@ services:
     devices:
       - /dev/roboclaw_left:/dev/roboclaw_left    # RoboClaw Left  (M1=Rear-Left,  M2=Front-Left)
       - /dev/roboclaw_right:/dev/roboclaw_right  # RoboClaw Right (M1=Rear-Right, M2=Front-Right)
-      - /dev/ttyUSB0:/dev/ttyUSB0                # STL-27L LiDAR (CP2102, always ttyUSB0)
+      - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x → /dev/lidar symlink)
       - /dev/video0:/dev/video0                  # USB camera
       - /dev/video1:/dev/video1                  # USB camera (alternate index)
     volumes:

@@ -15,9 +15,11 @@ echo "Setting up udev rules for the Jetson robot hardware..."
 
 cat <<EOF > /etc/udev/rules.d/99-robot.rules
 # ============================================================
-# LDROBOT STL-27L LiDAR (Silicon Labs CP2102)
+# LDROBOT STL-27L LiDAR
+# Silicon Labs CP210x UART Bridge (idVendor=10c4, idProduct=ea60)
+# Always the only CP210x device on this robot.
 # ============================================================
-SUBSYSTEM=="tty", ENV{ID_SERIAL}=="Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001", SYMLINK+="lidar", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="lidar", MODE="0666"
 
 # ============================================================
 # RoboClaw 2x15A — LEFT Side Controller

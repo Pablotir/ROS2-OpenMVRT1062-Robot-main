@@ -30,6 +30,8 @@ apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-navigation2 \
     ros-humble-nav2-bringup \
     ros-humble-nav2-msgs \
+    ros-humble-nav2-costmap-2d \
+    ros-humble-visualization-msgs \
     ros-humble-xacro \
     ros-humble-robot-state-publisher \
     ros-humble-tf2 \
@@ -69,21 +71,31 @@ echo "▸ Installing Python dependencies..."
 pip3 install --no-cache-dir -i https://pypi.org/simple/ \
     pillow "numpy<2,>=1.26" opencv-python-headless
 
-# ── 5. Build the workspace ───────────────────────────────────────────────────
+# ── 5. Install all workspace dependencies via rosdep ─────────────────────────
+echo ""
+echo "▸ Installing all workspace dependencies via rosdep..."
+cd /root/ros2_ws
+# nano_llm container: $ROS_ROOT=/opt/ros/, setup at /opt/ros/install/setup.bash
+source /opt/ros/install/setup.bash
+
+# rosdep resolves ALL package deps in one shot — avoids whack-a-mole apt installs
+rosdep update 2>/dev/null || true
+rosdep install --from-paths src --ignore-src -r -y || true
+
+# ── 6. Build the workspace ────────────────────────────────────────────────────
 echo ""
 echo "▸ Building ROS2 workspace..."
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-
-colcon build --symlink-install
+# multirobot_map_merge is excluded: blocked by Jetson opencv 4.8.1 vs Ubuntu 4.5.4 header conflict
+colcon build --symlink-install --packages-ignore multirobot_map_merge
 
 source install/setup.bash
 
-# ── 6. Write a convenience source script ─────────────────────────────────────
+# ── 7. Write a convenience source script ─────────────────────────────────────
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
 # Source all ROS2 layers in the correct order
-source /opt/ros/humble/setup.bash
+# nano_llm container: $ROS_ROOT=/opt/ros/, setup at /opt/ros/install/setup.bash
+source /opt/ros/install/setup.bash
 source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EOF

@@ -23,15 +23,19 @@ echo "  ✔ GPG key refreshed"
 echo ""
 echo "▸ Installing ROS2 Humble packages..."
 apt-get update && apt-get install -y --no-install-recommends \
+    python3-serial \
     ros-humble-usb-cam \
     ros-humble-rtabmap-ros \
     ros-humble-slam-toolbox \
     ros-humble-navigation2 \
     ros-humble-nav2-bringup \
+    ros-humble-nav2-msgs \
     ros-humble-xacro \
     ros-humble-robot-state-publisher \
+    ros-humble-tf2 \
     ros-humble-tf2-ros \
     ros-humble-tf2-geometry-msgs \
+    ros-humble-tf2-sensor-msgs \
     ros-humble-cv-bridge \
     ros-humble-vision-opencv \
     ros-humble-image-proc \
@@ -60,20 +64,18 @@ chmod 777 /dev/lidar 2>/dev/null || echo "  ⚠ /dev/lidar not found (LiDAR)"
 # ── 4. Python dependencies ───────────────────────────────────────────────────
 echo ""
 echo "▸ Installing Python dependencies..."
+# Note: pyserial installed via apt above to avoid Jetson pip mirror DNS issues.
+# Only install packages not available via apt here.
 pip3 install --no-cache-dir -i https://pypi.org/simple/ \
-    pyserial pillow "numpy<2,>=1.26" opencv-python-headless
+    pillow "numpy<2,>=1.26" opencv-python-headless
 
 # ── 5. Build the workspace ───────────────────────────────────────────────────
 echo ""
 echo "▸ Building ROS2 workspace..."
 cd /root/ros2_ws
-source /opt/ros/install/setup.bash
-source /opt/ros/install/setup.bash
+source /opt/ros/humble/setup.bash
 
-colcon build --symlink-install \
-    --packages-select \
-    ldlidar_stl_ros2 \
-    robot_control jetson_bot_slam
+colcon build --symlink-install
 
 source install/setup.bash
 
@@ -81,8 +83,7 @@ source install/setup.bash
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
 # Source all ROS2 layers in the correct order
-source /opt/ros/install/setup.bash
-source /opt/ros/install/setup.bash
+source /opt/ros/humble/setup.bash
 source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EOF

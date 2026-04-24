@@ -7,7 +7,8 @@ nav_msgs/Odometry + broadcasts the odom → base_link TF.
 
 Subscribes
 ----------
-/wheel_ticks    std_msgs/Int32MultiArray   [BL, BR, FL, FR] raw encoder counts
+/wheel_ticks    std_msgs/Int32MultiArray   [RL, RR, FL, FR] raw encoder counts
+                                           (published by roboclaw_node)
 
 Publishes
 ---------
@@ -24,20 +25,20 @@ These can be overridden via ROS2 parameters.
 
 Sign conventions
 ----------------
-From the Arduino executeMotor() code, motors 1(BL) and 4(FR) have their
-tick direction INVERTED relative to the physical forward direction.
-The forward kinematics below corrects for that.
+Dual RoboClaw 2x15A controllers handle motor direction inversions internally
+(configured during autotune in BasicMicro Motion Studio).
+All encoder counts increase for forward motion — no software inversions needed.
 
     Physical forward displacement per wheel:
-        d_FL =  -Δenc_FL * meters_per_tick   # FL index inverted in HW
+        d_FL =  +Δenc_FL * meters_per_tick
         d_FR =  +Δenc_FR * meters_per_tick
-        d_BL =  -Δenc_BL * meters_per_tick   # BL index inverted in HW
-        d_BR =  +Δenc_BR * meters_per_tick
+        d_RL =  +Δenc_RL * meters_per_tick
+        d_RR =  +Δenc_RR * meters_per_tick
 
     Robot motion (mecanum forward kinematics):
-        Δx     = (d_FL + d_FR + d_BL + d_BR) / 4
-        Δy     = (-d_FL + d_FR + d_BL - d_BR) / 4    (+y = left in ROS2)
-        Δθ     = (-d_FL + d_FR - d_BL + d_BR) / (4 * (Lx + Ly))
+        Δx     = (d_FL + d_FR + d_RL + d_RR) / 4
+        Δy     = (-d_FL + d_FR + d_RL - d_RR) / 4    (+y = left in ROS2)
+        Δθ     = (-d_FL + d_FR - d_RL + d_RR) / (4 * (Lx + Ly))
 """
 
 import math
@@ -103,7 +104,7 @@ class MecanumOdometryNode(Node):
         self._omega = 0.0
 
         # Previous encoder counts (initialised on first message)
-        self._prev_enc: list[int] | None = None   # [BL, BR, FL, FR]
+        self._prev_enc: list[int] | None = None   # [RL, RR, FL, FR]
         self._prev_time = None
         self._got_first_data = False
 
@@ -141,7 +142,7 @@ class MecanumOdometryNode(Node):
             self.get_logger().warn('Expected 4 encoder values, got fewer')
             return
 
-        enc = list(msg.data)   # [BL, BR, FL, FR]
+        enc = list(msg.data)   # [RL, RR, FL, FR]
         now = self.get_clock().now()
 
         # ── First message: initialise and return ──────────────────────────────
@@ -156,8 +157,8 @@ class MecanumOdometryNode(Node):
             return
 
         # ── Encoder deltas ────────────────────────────────────────────────────
-        d_enc_BL = enc[0] - self._prev_enc[0]
-        d_enc_BR = enc[1] - self._prev_enc[1]
+        d_enc_RL = enc[0] - self._prev_enc[0]
+        d_enc_RR = enc[1] - self._prev_enc[1]
         d_enc_FL = enc[2] - self._prev_enc[2]
         d_enc_FR = enc[3] - self._prev_enc[3]
 
@@ -165,17 +166,17 @@ class MecanumOdometryNode(Node):
         self._prev_time = now
 
         # ── Physical displacements (metres) ───────────────────────────────────
-        # BL and FL encoders are inverted relative to physical forward direction
-        # (Arduino negates the tick command internally for motors 1 and 4).
-        d_BL = -d_enc_BL * self._m_per_tick
-        d_BR = +d_enc_BR * self._m_per_tick
-        d_FL = -d_enc_FL * self._m_per_tick
+        # RoboClaw handles motor direction inversions internally.
+        # All encoders count up for forward motion — no software inversion.
+        d_RL = +d_enc_RL * self._m_per_tick
+        d_RR = +d_enc_RR * self._m_per_tick
+        d_FL = +d_enc_FL * self._m_per_tick
         d_FR = +d_enc_FR * self._m_per_tick
 
         # ── Mecanum forward kinematics ────────────────────────────────────────
-        dx_body = (d_FL + d_FR + d_BL + d_BR) / 4.0          # forward
-        dy_body = (-d_FL + d_FR + d_BL - d_BR) / 4.0         # lateral (+left)
-        dtheta  = (-d_FL + d_FR - d_BL + d_BR) / (4.0 * (self._Lx + self._Ly))
+        dx_body = (d_FL + d_FR + d_RL + d_RR) / 4.0          # forward
+        dy_body = (-d_FL + d_FR + d_RL - d_RR) / 4.0         # lateral (+left)
+        dtheta  = (-d_FL + d_FR - d_RL + d_RR) / (4.0 * (self._Lx + self._Ly))
 
         # ── Integrate into odom frame (mid-point integration) ─────────────────
         mid_theta = self._theta + dtheta / 2.0
@@ -249,9 +250,9 @@ class MecanumOdometryNode(Node):
     def _tf_keepalive(self):
         """Re-broadcast odom→base_link TF at 20 Hz with fresh timestamps.
 
-        The Arduino sends encoder data at ~1-3 Hz. Without this timer,
-        Nav2 and RTAB-Map can't resolve TF lookups for LiDAR scans that
-        arrive between encoder updates → cascade of extrapolation errors.
+        The RoboClaw encoder reads happen at ~20 Hz, but this timer acts
+        as a safety net to keep TF fresh if an encoder read is delayed.
+        Nav2 and SLAM Toolbox need continuous TF availability.
         """
         if not self._got_first_data:
             return   # Don't publish until we have at least one encoder reading

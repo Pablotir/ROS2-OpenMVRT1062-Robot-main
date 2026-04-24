@@ -4,9 +4,9 @@ ai_slam_explore.launch.py
 Minimal autonomous mapping stack:
 
   STL-27L LiDAR  ──► /scan ──► slam_toolbox (builds /map)
-  Arduino Mega   ──► arduino_bridge ──► /wheel_ticks ──► mecanum_odometry ──► /odom
+  RoboClaw L+R   ──► roboclaw_node ──► /wheel_ticks ──► mecanum_odometry ──► /odom
   exploration_controller reads /scan and writes /cmd_vel (linear.x + angular.z only)
-  motor_driver reads /cmd_vel and drives the wheels
+  roboclaw_node reads /cmd_vel and drives the wheels (HW PID velocity control)
 
 No Nav2. No costmaps. No path planner. No frontier logic.
 The robot drives forward, avoids obstacles via LiDAR, turns toward
@@ -33,7 +33,8 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────
     args = [
-        DeclareLaunchArgument('serial_port',        default_value='/dev/arduino'),
+        DeclareLaunchArgument('left_port',          default_value='/dev/roboclaw_left'),
+        DeclareLaunchArgument('right_port',         default_value='/dev/roboclaw_right'),
         DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar'),
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
         DeclareLaunchArgument('rviz',               default_value='false'),
@@ -64,14 +65,23 @@ def generate_launch_description():
         }],
     )
 
-    # ── Arduino bridge ────────────────────────────────────────────────────
-    arduino_bridge = Node(
+    # ── RoboClaw motor controller ─────────────────────────────────────────
+    roboclaw = Node(
         package='jetson_bot_slam',
-        executable='arduino_bridge',
-        name='arduino_bridge',
+        executable='roboclaw_node',
+        name='roboclaw_node',
         parameters=[{
-            'serial_port': LaunchConfiguration('serial_port'),
-            'baud_rate':   115200,
+            'left_port':         LaunchConfiguration('left_port'),
+            'right_port':        LaunchConfiguration('right_port'),
+            'address':           0x80,
+            'baudrate':          115200,
+            'wheel_radius':      0.0508,
+            'half_wheelbase':    0.1270,
+            'half_track_width':  0.2172,
+            'ticks_per_rev':     1440,
+            'max_qpps':          2300,
+            'control_hz':        20.0,
+            'cmd_vel_timeout':   0.6,
         }],
         output='screen',
     )
@@ -87,21 +97,6 @@ def generate_launch_description():
             'half_wheelbase':   0.1270,
             'half_track_width': 0.2172,
             'publish_tf':       True,
-        }],
-        output='screen',
-    )
-
-    # ── Motor driver ──────────────────────────────────────────────────────
-    motor_driver = Node(
-        package='jetson_bot_slam',
-        executable='motor_driver',
-        name='motor_driver',
-        parameters=[{
-            'wheel_radius':     0.0508,
-            'half_wheelbase':   0.1270,
-            'half_track_width': 0.2172,
-            'control_hz':       10.0,
-            'cmd_vel_timeout':  0.6,
         }],
         output='screen',
     )
@@ -218,9 +213,8 @@ def generate_launch_description():
 
     return LaunchDescription(args + [
         robot_state_pub,    # TF / URDF
-        arduino_bridge,     # Wheel encoders + ultrasonic
+        roboclaw,           # Dual RoboClaw motor control + encoder reads
         mecanum_odom,       # /odom from encoders
-        motor_driver,       # /cmd_vel → wheel speeds
         lidar,              # /scan from STL-27L
         slam_toolbox,       # /scan + /odom → /map
         exploration_ctrl,   # /scan → /cmd_vel (only motion publisher)

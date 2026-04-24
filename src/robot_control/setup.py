@@ -21,7 +21,6 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'robot_control_node      = robot_control.robot_control_node:main',
             'camera_receiver         = robot_control.camera_receiver:main',
             'slam_receiver           = robot_control.slam_receiver:main',
             'usb_camera_node         = robot_control.usb_camera_node:main',

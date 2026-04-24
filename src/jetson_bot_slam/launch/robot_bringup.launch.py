@@ -1,134 +1,133 @@
-"""
-robot_bringup.launch.py
-========================
-Starts the core robot stack:
-  - robot_state_publisher  (URDF / TF)
-  - arduino_bridge         (serial ↔ ROS2)
-  - mecanum_odometry       (wheel odometry → /odom + TF)
-  - motor_driver           (cmd_vel → Arduino B-commands)
-  - usb_cam                (USB camera → /image_raw + /camera_info)
-
-Usage:
-    ros2 launch jetson_bot_slam robot_bringup.launch.py
-    ros2 launch jetson_bot_slam robot_bringup.launch.py serial_port:=/dev/ttyUSB0 camera_index:=1
-"""
-
-import os
-from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, Command
-from launch_ros.actions import Node
-
-
-def generate_launch_description():
-    pkg = get_package_share_directory('jetson_bot_slam')
-
-    # ── Launch arguments ──────────────────────────────────────────────────────
-    serial_port_arg = DeclareLaunchArgument(
-        'serial_port', default_value='/dev/ttyUSB0',
-        description='Arduino serial port')
-
-    camera_index_arg = DeclareLaunchArgument(
-        'camera_index', default_value='1',
-        description='OpenCV camera device index (1 = /dev/video1 on Jetson USB port 1)')
-
-    camera_width_arg = DeclareLaunchArgument(
-        'camera_width',  default_value='640')
-    camera_height_arg = DeclareLaunchArgument(
-        'camera_height', default_value='480')
-    camera_fps_arg = DeclareLaunchArgument(
-        'camera_fps',    default_value='30')
-
-    # ── URDF via xacro ───────────────────────────────────────────────────────
-    urdf_file = os.path.join(pkg, 'urdf', 'jetson_bot.urdf.xacro')
-    robot_description = Command(['xacro ', urdf_file])
-
-    robot_state_pub = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        parameters=[{'robot_description': robot_description,
-                     'use_sim_time': False}],
-    )
-
-    # ── Arduino bridge ───────────────────────────────────────────────────────
-    arduino_bridge = Node(
-        package='jetson_bot_slam',
-        executable='arduino_bridge',
-        name='arduino_bridge',
-        parameters=[{'serial_port': LaunchConfiguration('serial_port'),
-                     'baud_rate': 115200}],
-        output='screen',
-    )
-
-    # ── Mecanum odometry ─────────────────────────────────────────────────────
-    mecanum_odom = Node(
-        package='jetson_bot_slam',
-        executable='mecanum_odometry',
-        name='mecanum_odometry',
-        parameters=[{
-            'wheel_radius':      0.0508,
-            'ticks_per_rev':     1440,
-            'half_wheelbase':    0.1270,   # Lx – tune if odometry drifts
-            'half_track_width':  0.2172,   # Ly – tune if odometry drifts
-            'publish_tf':        True,
-        }],
-        output='screen',
-    )
-
-    # ── Motor driver ─────────────────────────────────────────────────────────
-    motor_driver = Node(
-        package='jetson_bot_slam',
-        executable='motor_driver',
-        name='motor_driver',
-        parameters=[{
-            'wheel_radius':      0.0508,
-            'half_wheelbase':    0.1270,
-            'half_track_width':  0.2172,
-            'control_hz':        10.0,
-            'cmd_vel_timeout':   0.5,
-        }],
-        output='screen',
-    )
-
-    # ── USB Camera (usb_cam node, ROS2 Humble+) ───────────────────────────────
-    #
-    # Install:  sudo apt install ros-humble-usb-cam
-    #
-    # The camera_info_url should point to a calibration file.
-    # Run  ros2 run camera_calibration cameracalibrator  to generate one.
-    # Until calibration is done, RTAB-Map will use the raw image but loop
-    # closure quality will be reduced.
-    usb_camera = Node(
-        package='usb_cam',
-        executable='usb_cam_node_exe',
-        name='usb_cam',
-        parameters=[{
-            'video_device':   '/dev/video' + LaunchConfiguration('camera_index'),
-            'image_width':    LaunchConfiguration('camera_width'),
-            'image_height':   LaunchConfiguration('camera_height'),
-            'framerate':      LaunchConfiguration('camera_fps'),
-            'pixel_format':   'yuyv',
-            'camera_frame_id':'camera_optical_link',
-            'io_method':      'mmap',
-        }],
-        remappings=[
-            ('/usb_cam/image_raw',   '/image_raw'),
-            ('/usb_cam/camera_info', '/camera_info'),
-        ],
-        output='screen',
-    )
-
-    return LaunchDescription([
-        serial_port_arg,
-        camera_index_arg,
-        camera_width_arg,
-        camera_height_arg,
-        camera_fps_arg,
-        robot_state_pub,
-        arduino_bridge,
-        mecanum_odom,
-        motor_driver,
-        usb_camera,
-    ])
+"""\r
+robot_bringup.launch.py\r
+========================\r
+Starts the core robot stack:\r
+  - robot_state_publisher  (URDF / TF)\r
+  - roboclaw_node          (dual RoboClaw motor control + encoder reads)\r
+  - mecanum_odometry       (wheel odometry → /odom + TF)\r
+  - usb_cam                (USB camera → /image_raw + /camera_info)\r
+\r
+Usage:\r
+    ros2 launch jetson_bot_slam robot_bringup.launch.py\r
+    ros2 launch jetson_bot_slam robot_bringup.launch.py left_port:=/dev/ttyACM0 right_port:=/dev/ttyACM1\r
+"""\r
+\r
+import os\r
+from ament_index_python.packages import get_package_share_directory\r
+from launch import LaunchDescription\r
+from launch.actions import DeclareLaunchArgument\r
+from launch.substitutions import LaunchConfiguration, Command\r
+from launch_ros.actions import Node\r
+\r
+\r
+def generate_launch_description():\r
+    pkg = get_package_share_directory('jetson_bot_slam')\r
+\r
+    # ── Launch arguments ──────────────────────────────────────────────────────\r
+    left_port_arg = DeclareLaunchArgument(\r
+        'left_port', default_value='/dev/roboclaw_left',\r
+        description='Left RoboClaw serial port (M1=RL, M2=FL)')\r
+\r
+    right_port_arg = DeclareLaunchArgument(\r
+        'right_port', default_value='/dev/roboclaw_right',\r
+        description='Right RoboClaw serial port (M1=RR, M2=FR)')\r
+\r
+    camera_index_arg = DeclareLaunchArgument(\r
+        'camera_index', default_value='1',\r
+        description='OpenCV camera device index (1 = /dev/video1 on Jetson USB port 1)')\r
+\r
+    camera_width_arg = DeclareLaunchArgument(\r
+        'camera_width',  default_value='640')\r
+    camera_height_arg = DeclareLaunchArgument(\r
+        'camera_height', default_value='480')\r
+    camera_fps_arg = DeclareLaunchArgument(\r
+        'camera_fps',    default_value='30')\r
+\r
+    # ── URDF via xacro ───────────────────────────────────────────────────────\r
+    urdf_file = os.path.join(pkg, 'urdf', 'jetson_bot.urdf.xacro')\r
+    robot_description = Command(['xacro ', urdf_file])\r
+\r
+    robot_state_pub = Node(\r
+        package='robot_state_publisher',\r
+        executable='robot_state_publisher',\r
+        name='robot_state_publisher',\r
+        parameters=[{'robot_description': robot_description,\r
+                     'use_sim_time': False}],\r
+    )\r
+\r
+    # ── RoboClaw motor controller ────────────────────────────────────────────\r
+    roboclaw = Node(\r
+        package='jetson_bot_slam',\r
+        executable='roboclaw_node',\r
+        name='roboclaw_node',\r
+        parameters=[{\r
+            'left_port':         LaunchConfiguration('left_port'),\r
+            'right_port':        LaunchConfiguration('right_port'),\r
+            'address':           0x80,\r
+            'baudrate':          115200,\r
+            'wheel_radius':      0.0508,\r
+            'half_wheelbase':    0.1270,\r
+            'half_track_width':  0.2172,\r
+            'ticks_per_rev':     1440,\r
+            'max_qpps':          2300,\r
+            'control_hz':        20.0,\r
+            'cmd_vel_timeout':   0.5,\r
+        }],\r
+        output='screen',\r
+    )\r
+\r
+    # ── Mecanum odometry ─────────────────────────────────────────────────────\r
+    mecanum_odom = Node(\r
+        package='jetson_bot_slam',\r
+        executable='mecanum_odometry',\r
+        name='mecanum_odometry',\r
+        parameters=[{\r
+            'wheel_radius':      0.0508,\r
+            'ticks_per_rev':     1440,\r
+            'half_wheelbase':    0.1270,\r
+            'half_track_width':  0.2172,\r
+            'publish_tf':        True,\r
+        }],\r
+        output='screen',\r
+    )\r
+\r
+    # ── USB Camera (usb_cam node, ROS2 Humble+) ───────────────────────────────\r
+    #\r
+    # Install:  sudo apt install ros-humble-usb-cam\r
+    #\r
+    # The camera_info_url should point to a calibration file.\r
+    # Run  ros2 run camera_calibration cameracalibrator  to generate one.\r
+    # Until calibration is done, RTAB-Map will use the raw image but loop\r
+    # closure quality will be reduced.\r
+    usb_camera = Node(\r
+        package='usb_cam',\r
+        executable='usb_cam_node_exe',\r
+        name='usb_cam',\r
+        parameters=[{\r
+            'video_device':   '/dev/video' + LaunchConfiguration('camera_index'),\r
+            'image_width':    LaunchConfiguration('camera_width'),\r
+            'image_height':   LaunchConfiguration('camera_height'),\r
+            'framerate':      LaunchConfiguration('camera_fps'),\r
+            'pixel_format':   'yuyv',\r
+            'camera_frame_id':'camera_optical_link',\r
+            'io_method':      'mmap',\r
+        }],\r
+        remappings=[\r
+            ('/usb_cam/image_raw',   '/image_raw'),\r
+            ('/usb_cam/camera_info', '/camera_info'),\r
+        ],\r
+        output='screen',\r
+    )\r
+\r
+    return LaunchDescription([\r
+        left_port_arg,\r
+        right_port_arg,\r
+        camera_index_arg,\r
+        camera_width_arg,\r
+        camera_height_arg,\r
+        camera_fps_arg,\r
+        robot_state_pub,\r
+        roboclaw,\r
+        mecanum_odom,\r
+        usb_camera,\r
+    ])\r

@@ -1,74 +1,92 @@
-# ROS 2 Humble for Ubuntu 22.04 (JetPack 6 / nano_llm base)
-ARG ROS_DISTRO=humble
-FROM ros:${ROS_DISTRO}-ros-base
+# ──────────────────────────────────────────────────────────────────────────────
+# ros2.Dockerfile — Custom robot image built on top of dustynv/nano_llm
+# ──────────────────────────────────────────────────────────────────────────────
+# Bakes in all apt packages and the built workspace so the container is
+# ready to launch immediately on every `docker compose up` — no setup needed.
+#
+# Build (on Jetson, run once or after dependency changes):
+#   docker compose build
+#
+# Run:
+#   docker compose up -d
+#   docker exec -it jetson_bot_vila bash
+#   ros2 launch jetson_bot_slam ai_slam_explore.launch.py
+
+FROM dustynv/nano_llm:humble-r36.3.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# ── Refresh ROS2 GPG key (avoids EXPKEYSIG failures in long-lived images) ─────
-RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-      -o /usr/share/keyrings/ros-archive-keyring.gpg
+# ── Fix ROS2 GPG key ──────────────────────────────────────────────────────────
+RUN rm -f /usr/share/keyrings/ros-archive-keyring.gpg && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
 
-# ── Core system deps ──────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y \
-    python3-pip python3-serial python3-opencv \
-    ffmpeg libsm6 libxext6 \
-    libatlas-base-dev libopenblas-dev libhdf5-dev \
-    build-essential cmake git curl nano tmux \
-    libusb-1.0-0-dev libjpeg-dev \
+# ── Fix broken packages from nano_llm base ────────────────────────────────────
+RUN dpkg --configure -a 2>/dev/null || true && \
+    apt-get install -f -y 2>/dev/null || true
+
+# ── Install ROS2 Humble packages ──────────────────────────────────────────────
+# Note: nano_llm ships OpenCV 4.8.1 (custom). Ubuntu apt has 4.5.4.
+# We use --force-overwrite for header conflicts.
+# cv-bridge / image-proc / vision-opencv are excluded — they need libopencv-dev
+# (4.5.4) which conflicts. Not needed without camera; add back later if needed.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-overwrite" \
+        python3-serial \
+        python3-colcon-common-extensions \
+        ros-humble-slam-toolbox \
+        ros-humble-xacro \
+        ros-humble-robot-state-publisher \
+        ros-humble-joint-state-publisher \
+        ros-humble-tf2 \
+        ros-humble-tf2-ros \
+        ros-humble-tf2-geometry-msgs \
+        ros-humble-navigation2 \
+        ros-humble-nav2-bringup \
+        ros-humble-nav2-msgs \
+        ros-humble-nav2-costmap-2d \
+        ros-humble-visualization-msgs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Core ROS2 Humble packages (required — hard failure if missing) ────────────
-RUN apt-get update && apt-get install -y \
-    ros-humble-xacro \
-    ros-humble-robot-state-publisher \
-    ros-humble-tf2 \
-    ros-humble-tf2-ros \
-    ros-humble-tf2-geometry-msgs \
-    ros-humble-tf2-sensor-msgs \
-    ros-humble-cv-bridge \
-    ros-humble-vision-opencv \
-    ros-humble-image-proc \
-    ros-humble-nav2-msgs \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# ── Python dependencies ────────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow
 
-# ── Optional SLAM / Nav packages (soft failure — build continues if unavailable)
-RUN apt-get update; \
-    apt-get install -y ros-humble-slam-toolbox          2>/dev/null; \
-    apt-get install -y ros-humble-navigation2           2>/dev/null; \
-    apt-get install -y ros-humble-nav2-bringup          2>/dev/null; \
-    apt-get install -y ros-humble-usb-cam               2>/dev/null; \
-    apt-get install -y ros-humble-teleop-twist-keyboard 2>/dev/null; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+# ── Clone external ROS2 packages ──────────────────────────────────────────────
+RUN mkdir -p /root/ros2_ws/src && \
+    cd /root/ros2_ws/src && \
+    git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git
 
-# ── Python libraries (pip) — only packages not available via apt ──────────────
-# pyserial is installed via apt (python3-serial) to avoid the Jetson pip mirror.
-RUN python3 -m pip install --no-cache-dir -i https://pypi.org/simple/ \
-    "numpy<2,>=1.26" \
-    pillow apriltag requests \
-    "opencv-python-headless"
+# ── Copy robot workspace source ────────────────────────────────────────────────
+COPY ./src /root/ros2_ws/src
 
-# ── Workspace setup ───────────────────────────────────────────────────────────
-ENV ROS_WS=/root/ros2_ws
-WORKDIR $ROS_WS
-RUN mkdir -p src
-
-# Copy workspace and entrypoint
-COPY ./src ./src
-COPY ./entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-# Use bash login shell to allow sourcing
+# ── Build the workspace ────────────────────────────────────────────────────────
+# Excluded:
+#   multirobot_map_merge — blocked by OpenCV 4.8.1 vs 4.5.4 header conflict
+#   explore_lite_msgs    — requires rosidl_generator_rs (Rust), not in this container
+#   explore_lite         — depends on explore_lite_msgs
 SHELL ["/bin/bash", "-lc"]
-
-# Build the full workspace
-RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
-    cd $ROS_WS && \
+RUN source /opt/ros/install/setup.bash && \
+    source /opt/ros/humble/setup.bash && \
+    cd /root/ros2_ws && \
     colcon build --symlink-install \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release
+        --packages-ignore multirobot_map_merge explore_lite_msgs explore_lite
 
-# Add both ROS2 and workspace to bashrc
-RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc && \
-    echo "source ${ROS_WS}/install/setup.bash" >> /root/.bashrc
+# ── Write source_all.bash and add to .bashrc ──────────────────────────────────
+RUN cat > /root/ros2_ws/source_all.bash << 'EOF'
+#!/bin/bash
+# Source all ROS2 layers in the correct order.
+# nano_llm: ROS2 CLI at /opt/ros/install, Humble packages at /opt/ros/humble
+source /opt/ros/install/setup.bash
+source /opt/ros/humble/setup.bash
+source /root/ros2_ws/install/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+EOF
+RUN chmod +x /root/ros2_ws/source_all.bash && \
+    echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc
 
-ENTRYPOINT ["/entrypoint.sh"]
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
+COPY ./entrypoint.sh /root/ros2_ws/entrypoint.sh
+RUN chmod +x /root/ros2_ws/entrypoint.sh
+ENTRYPOINT ["/root/ros2_ws/entrypoint.sh"]
+CMD ["bash"]

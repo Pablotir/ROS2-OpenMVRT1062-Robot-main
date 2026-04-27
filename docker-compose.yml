@@ -15,10 +15,14 @@
 
 services:
   robot:
-    # dustynv/nano_llm:humble includes ROS2 Humble + nano_llm + CUDA
-    # For JetPack 6 (L4T R36.x), use the r36 tag.
-    # Check available tags: https://hub.docker.com/r/dustynv/nano_llm/tags
-    image: dustynv/nano_llm:humble-r36.3.0
+    # Build our custom image on top of dustynv/nano_llm.
+    # All ROS2 packages and the workspace are baked in — no setup needed.
+    # Run `docker compose build` once (or after changing dependencies).
+    # Then `docker compose up -d` starts instantly every time.
+    build:
+      context: .
+      dockerfile: ros2.Dockerfile
+    image: jetson_bot_custom:latest
     container_name: jetson_bot_vila
     network_mode: "host"
     runtime: nvidia

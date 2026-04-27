@@ -52,8 +52,8 @@ UNKNOWN        = -1
 
 # Wall-follow: target distance to keep from side walls
 WALL_TARGET     = 0.55         # m — desired side clearance
-WALL_DIST_GAIN  = 0.7          # distance correction gain
-WALL_ALIGN_GAIN = 1.0          # alignment gain
+WALL_DIST_GAIN  = 0.35         # distance correction gain (was 0.7 — reduced to keep strafe gentle)
+WALL_ALIGN_GAIN = 0.50         # alignment gain (was 1.0 — reduced)
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
 WALL_SECTOR_R   = 3 * N_SECTORS // 4   # ~270° = 90° right
 
@@ -68,10 +68,15 @@ GOAL_BIAS_W     = 0.18         # rad, clamped
 HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
 HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
 HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
-HALLWAY_CENTER_GAIN = 0.6      # centering gain (L-R error → turn correction)
+HALLWAY_CENTER_GAIN = 0.30     # strafe centering gain (was 0.6 — now drives strafe not turn)
+HALLWAY_ALIGN_GAIN  = 0.10     # yaw-only alignment gain in hallway (tiny)
 
 # Normal speed (open room)
 NORMAL_SPEED     = 0.25        # m/s
+
+# Max strafe speed as fraction of move_speed
+MAX_STRAFE_FRAC  = 0.50        # 50% of move_speed max
+MAX_ALIGN_TURN   = 0.10        # rad/s — absolute cap on alignment yaw corrections
 
 
 class ExplorationController(Node):
@@ -488,12 +493,16 @@ class ExplorationController(Node):
         align_error = 0.0
         goal_str = 'none'
 
-        # G14: FSM BEHAVIOR EXECUTION (Single-track behaviors stop wheel cancellation)
+        # HALLWAY: strafe to center, tiny turn for parallel alignment only.
+        # Lateral centering via strafe keeps all 4 wheels near equal speed.
+        # Angular correction is reserved only for heading alignment (≤ MAX_ALIGN_TURN).
         if self._current_state == self.STATE_HALLWAY:
-            # G14: PD Controller for Center in Hallway
-            center_err  = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
+            # Lateral centering → strafe (not turn)
+            center_err = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
+            strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                             min(self._move_spd * MAX_STRAFE_FRAC, center_err))
 
-            # G14: PD Controller for Parallel Alignment in Hallway
+            # Parallel alignment → tiny yaw only
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]
             r_rear_right  = sector_min[16 % N_SECTORS]
@@ -502,12 +511,12 @@ class ExplorationController(Node):
 
             align_err = 0.0
             align_weight = 0.0
-            if (right_clear < WALL_THRESH):
+            if right_clear < WALL_THRESH:
                 diff_r = r_rear_right - r_front_right
                 if abs(diff_r) < 0.5:
                     align_err += diff_r * SIN60 * WALL_ALIGN_GAIN
                     align_weight += 1.0
-            if (left_clear < WALL_THRESH):
+            if left_clear < WALL_THRESH:
                 diff_l = r_rear_left - r_front_left
                 if abs(diff_l) < 0.5:
                     align_err -= diff_l * SIN60 * WALL_ALIGN_GAIN
@@ -519,14 +528,13 @@ class ExplorationController(Node):
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
 
-            # G14: Reverted mapping to turning because mecanum wheels slip extensively during strafing, ruining the SLAM map cache
-            strafe_cmd = 0.0
-            turn = center_err + align_error
-            turn = max(-0.18, min(0.18, turn))  # clamp: hallway corrections stay gentle
+            # Yaw = alignment only, hard-capped to MAX_ALIGN_TURN
+            turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, align_error * HALLWAY_ALIGN_GAIN))
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
-            # G14: Dynamic Wall Hugging logic (Left or Right)
+            # ROOM: strafe for distance correction, tiny yaw for alignment only.
+            # Strafe moves the body laterally without yawing → no wheel speed asymmetry.
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]
             r_rear_right  = sector_min[16 % N_SECTORS]
@@ -535,32 +543,36 @@ class ExplorationController(Node):
 
             if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT':
                 if right_clear < 3.5:
-                    dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+                    # Distance correction → strafe (negative = move right, away from left wall)
+                    dist_err   = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+                    strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                                    min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
+                    # Alignment → tiny yaw
                     diff_r = r_rear_right - r_front_right
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
-
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    strafe_cmd = 0.0
-                    turn = dist_error + self._smooth_align
-                    turn = max(-0.20, min(0.20, turn))  # clamp: wall-follow stay small
+                    turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Seek the right wall blindly with steady turn
-                    turn = -self._turn_spd * 0.7
+                    # Seek the right wall: gentle strafe right
+                    strafe_cmd = -self._move_spd * 0.30
+                    turn = 0.0
             else:
                 if left_clear < 3.5:
-                    dist_error = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
+                    # Distance correction → strafe (positive = move left)
+                    dist_err   = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
+                    strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                                    min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
+                    # Alignment → tiny yaw
                     diff_l = r_rear_left - r_front_left
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
-
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
-                    strafe_cmd = 0.0
-                    turn = dist_error + self._smooth_align
-                    turn = max(-0.20, min(0.20, turn))  # clamp: wall-follow stay small
+                    turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Seek the left wall blindly with steady turn
-                    turn = self._turn_spd * 0.7 
+                    # Seek the left wall: gentle strafe left
+                    strafe_cmd = self._move_spd * 0.30
+                    turn = 0.0 
 
             target_speed = NORMAL_SPEED
 

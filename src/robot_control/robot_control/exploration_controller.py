@@ -136,6 +136,7 @@ class ExplorationController(Node):
         self._corner_turning = False      # in forced hard-turn phase
         self._corner_ticks   = 0          # ticks remaining in hard-turn
         self._corner_dir     = 1.0        # +1 = left, -1 = right
+        self._CORNER_COMMIT_TICKS = 8     # 0.8s turn — enough to clear a doorframe without overshooting
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -424,40 +425,39 @@ class ExplorationController(Node):
                 na = math.atan2(math.sin(angle), math.cos(angle))
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
-        # G15: Box Footprint Collision Check
-        # Detect solid obstacles (walls, furniture) in the robot's projected footprint.
-        # Robot track = 0.43m (y=±0.215m). We check ±0.235m (1cm margin).
+        # G15: Bilateral Gap Width Check
+        # Measures the lateral clearance on BOTH sides of the robot's forward path
+        # within a ±45° cone. Only triggers if BOTH sides are simultaneously close
+        # enough that the total gap ≤ robot_width + 2 inches (0.051m).
         #
-        # KEY FIX: single-hit mode caused false positives from table legs, chair legs,
-        # and wall edges. Now we measure the CONTINUOUS ANGULAR SPAN of hits inside
-        # the footprint box. A solid wall spans many degrees; a thin leg spans <8°.
-        # Only trigger if any continuous span > 10° (about a 5cm object at 30cm).
-        _box_angles = []
-        for i, r in enumerate(scan.ranges):
-            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
+        # Examples:
+        #   Door edge on right, open space left → right=0.20m, left=2.0m → total 2.2m → OK
+        #   Narrow corridor wall both sides     → right=0.22m, left=0.22m → total 0.44m → ESCAPE
+        _ROBOT_WIDTH  = 0.43          # physical track width (m)
+        _GAP_MARGIN   = 0.051         # 2 inches total margin
+        _MIN_GAP      = _ROBOT_WIDTH + _GAP_MARGIN   # 0.481m min passable gap
+        _CONE         = math.pi / 4   # ±45° forward cone
+        _left_y  = float('inf')
+        _right_y = float('inf')
+        for _i, _r in enumerate(scan.ranges):
+            if not (scan.range_min <= _r <= scan.range_max) or math.isnan(_r) or math.isinf(_r):
                 continue
-            angle = scan.angle_min + i * scan.angle_increment
-            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
-            if abs(ang_norm) < math.pi / 2:  # Forward half only
-                x = r * math.cos(ang_norm)
-                y = r * math.sin(ang_norm)
-                if 0.02 < x < 0.40 and abs(y) < 0.235:
-                    _box_angles.append(ang_norm)
-        if _box_angles:
-            _box_angles.sort()
-            _gap = scan.angle_increment * 5   # 5-ray gap breaks continuity
-            _span_start = _box_angles[0]
-            _prev      = _box_angles[0]
-            _max_span  = 0.0
-            for _a in _box_angles[1:]:
-                if _a - _prev > _gap:
-                    _max_span  = max(_max_span, _prev - _span_start)
-                    _span_start = _a
-                _prev = _a
-            _max_span = max(_max_span, _prev - _span_start)
-            # >10° continuous span = solid obstacle (not a thin leg)
-            if _max_span > math.radians(10):
-                closest_any = 0.05  # Override: solid obstacle in footprint
+            _ang = scan.angle_min + _i * scan.angle_increment
+            _an  = math.atan2(math.sin(_ang), math.cos(_ang))
+            if abs(_an) <= _CONE:
+                _x = _r * math.cos(_an)
+                _y = _r * math.sin(_an)
+                if _x > 0.15:           # must be ahead of robot nose
+                    if _y > 0:
+                        _left_y  = min(_left_y,  _y)
+                    elif _y < 0:
+                        _right_y = min(_right_y, abs(_y))
+        # Cap open-space side to a sane max so inf doesn't mask gaps
+        _left_y  = min(_left_y,  4.0)
+        _right_y = min(_right_y, 4.0)
+        if (_left_y + _right_y) <= _MIN_GAP:
+            closest_any = 0.05  # Genuine narrow gap — robot can't fit
+
 
         # ── Emergency stop (Stateful Escape Sequence) ─────────────────────
         if closest_any < self._estop_dist:
@@ -621,7 +621,7 @@ class ExplorationController(Node):
         # Previous code used proportional best_ang which produced tiny
         # oscillating turns in corners. Now we:
         #   1. Count consecutive blocked cycles
-        #   2. After 3 cycles (~0.3s), commit to a hard turn for 15 ticks (1.5s)
+        #   2. After 3 cycles (~0.3s), commit to a hard turn for 0.8s
         if front_clear < self._obs_dist:
             self._corner_count += 1
             # Choose direction: whichever side has more space
@@ -630,7 +630,7 @@ class ExplorationController(Node):
                     # Commit: turn toward the open side
                     self._corner_dir     = 1.0 if left_clear > right_clear else -1.0
                     self._corner_turning = True
-                    self._corner_ticks   = 15   # 1.5 s of hard turning
+                    self._corner_ticks   = self._CORNER_COMMIT_TICKS   # 0.8s — avoids overshooting doors
                 else:
                     # Short-term: use best_ang proportionally (existing behavior)
                     fwd_scores = {}

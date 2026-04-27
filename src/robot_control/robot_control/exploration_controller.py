@@ -425,19 +425,42 @@ class ExplorationController(Node):
                 na = math.atan2(math.sin(angle), math.cos(angle))
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
-        # G15: Bilateral Gap Width Check
-        # left_clear and right_clear are already EMA-smoothed perpendicular wall
-        # distances (measured at ±90° from forward). Their sum = corridor width.
+        # G15: Forward Gap Width Check (look-ahead cone, 15°–45° band)
+        # Checks if an UPCOMING gap (within 1m ahead) is wide enough for the robot.
+        # Only considers rays at 15°–45° off-forward:
+        #   < 15°: nearly-parallel rays have near-zero y — always falsely close
+        #   > 45°: sees current side walls, not the gap ahead
         #
-        # Trigger only if BOTH sides are close simultaneously:
-        #   Open room:          L=1.5m + R=0.7m = 2.2m  → no trigger ✓
-        #   Normal hallway:     L=0.5m + R=0.5m = 1.0m  → no trigger ✓
-        #   Doorframe one side: L=2.0m + R=0.3m = 2.3m  → no trigger ✓
-        #   Too-narrow gap:     L=0.22m+ R=0.22m= 0.44m → ESCAPE    ✓
-        _ROBOT_WIDTH = 0.43    # m
-        _GAP_MARGIN  = 0.051   # 2 inches total (1 inch each side)
-        if (left_clear + right_clear) <= (_ROBOT_WIDTH + _GAP_MARGIN):
-            closest_any = 0.05  # Corridor too narrow — trigger escape
+        # Scenarios:
+        #   Open room / far walls:           left=right=3.0m cap  → no trigger  ✓
+        #   Door edge on one side:           R=0.25m, L=3.0m      → no trigger  ✓
+        #   Wide doorway (0.8m, 0.5m ahead): L=R=0.4m → 0.8m     → no trigger  ✓
+        #   Narrow gap  (0.43m, 0.5m ahead): L=R=0.215m → 0.43m  → ESCAPE      ✓
+        _ROBOT_WIDTH = 0.43
+        _GAP_MARGIN  = 0.051        # 2 inches total
+        _CONE_MIN    = math.radians(15)
+        _CONE_MAX    = math.radians(45)
+        _LOOKAHEAD   = 1.0          # m — only check 1 m ahead
+        _left_y  = float('inf')
+        _right_y = float('inf')
+        for _i, _r in enumerate(scan.ranges):
+            if not (scan.range_min <= _r <= scan.range_max) or math.isnan(_r) or math.isinf(_r):
+                continue
+            _ang = scan.angle_min + _i * scan.angle_increment
+            _an  = math.atan2(math.sin(_ang), math.cos(_ang))
+            if _CONE_MIN <= abs(_an) <= _CONE_MAX:   # 15°–45° band only
+                _x = _r * math.cos(_an)
+                _y = _r * math.sin(_an)
+                if 0.10 < _x <= _LOOKAHEAD:          # must be 10cm–1m ahead
+                    if _y > 0:
+                        _left_y  = min(_left_y,  _y)
+                    elif _y < 0:
+                        _right_y = min(_right_y, abs(_y))
+        _left_y  = min(_left_y,  3.0)   # cap: no detection = wide open
+        _right_y = min(_right_y, 3.0)
+        if (_left_y + _right_y) <= (_ROBOT_WIDTH + _GAP_MARGIN):
+            closest_any = 0.05          # upcoming gap too narrow — escape
+
 
 
         # ── Emergency stop (Stateful Escape Sequence) ─────────────────────

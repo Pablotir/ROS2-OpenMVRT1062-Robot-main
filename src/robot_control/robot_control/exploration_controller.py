@@ -129,6 +129,7 @@ class ExplorationController(Node):
         self.STATE_HALLWAY = 'HALLWAY'
         self.STATE_ROOM_PERIMETER = 'ROOM'
         self._current_state = self.STATE_CROSSING
+        self._prev_state   = self.STATE_CROSSING   # track transitions to reset EMA
         self._hugging_side = 'RIGHT'
 
         # Corner escape: count consecutive front-blocked cycles
@@ -456,7 +457,7 @@ class ExplorationController(Node):
 
         # G14: FSM STATE MACHINE TRIGGERS
         HALLWAY_THRESH = 0.75 # Heavily reduced so gaps wider than 1.5m are treated as open rooms
-        WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls 
+        WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls
         front_sectors = [0, 1, N_SECTORS - 1]
         front_clear   = min(sector_min[s] for s in front_sectors)
 
@@ -471,6 +472,12 @@ class ExplorationController(Node):
                 self._hugging_side = 'LEFT'
         else:
             self._current_state = self.STATE_CROSSING
+
+        # Reset alignment EMA on any FSM state transition to avoid stale
+        # corrections bleeding into the new state's controller
+        if self._current_state != self._prev_state:
+            self._smooth_align = 0.0
+            self._prev_state   = self._current_state
 
         mode_str = self._current_state
         if self._current_state == self.STATE_ROOM_PERIMETER:
@@ -515,6 +522,7 @@ class ExplorationController(Node):
             # G14: Reverted mapping to turning because mecanum wheels slip extensively during strafing, ruining the SLAM map cache
             strafe_cmd = 0.0
             turn = center_err + align_error
+            turn = max(-0.18, min(0.18, turn))  # clamp: hallway corrections stay gentle
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
@@ -534,10 +542,11 @@ class ExplorationController(Node):
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     strafe_cmd = 0.0
                     turn = dist_error + self._smooth_align
+                    turn = max(-0.20, min(0.20, turn))  # clamp: wall-follow stay small
                     align_error = self._smooth_align
                 else:
                     # Seek the right wall blindly with steady turn
-                    turn = -self._turn_spd * 0.7 
+                    turn = -self._turn_spd * 0.7
             else:
                 if left_clear < 3.5:
                     dist_error = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
@@ -547,6 +556,7 @@ class ExplorationController(Node):
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     strafe_cmd = 0.0
                     turn = dist_error + self._smooth_align
+                    turn = max(-0.20, min(0.20, turn))  # clamp: wall-follow stay small
                     align_error = self._smooth_align
                 else:
                     # Seek the left wall blindly with steady turn

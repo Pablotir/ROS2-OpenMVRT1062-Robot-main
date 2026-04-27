@@ -118,16 +118,16 @@ if ! grep -q "source_all.bash" /root/.bashrc 2>/dev/null; then
     echo "  ✔ Added source_all.bash to ~/.bashrc"
 fi
 
-# ── 8. Pre-download VILA model (optional, skip if offline) ───────────────────
-echo ""
-echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
-python3 -c "
-from nano_llm import NanoLLM
-print('Downloading VILA 2.7B...')
-model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='mlc', quantization='q4f16_ft')
-print('Model downloaded and ready!')
-del model
-" 2>&1 || echo "⚠  Model download skipped (will download on first inference)"
+# ── 8. Pre-download VILA model (disabled — uncomment when ready for AI labelling)
+# echo ""
+# echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
+# python3 -c "
+# from nano_llm import NanoLLM
+# print('Downloading VILA 2.7B...')
+# model = NanoLLM.from_pretrained('Efficient-Large-Model/VILA-2.7b', api='mlc', quantization='q4f16_ft')
+# print('Model downloaded and ready!')
+# del model
+# " 2>&1 || echo "⚠  Model download skipped (will download on first inference)"
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"

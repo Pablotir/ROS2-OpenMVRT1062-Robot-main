@@ -426,37 +426,18 @@ class ExplorationController(Node):
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
         # G15: Bilateral Gap Width Check
-        # Measures the lateral clearance on BOTH sides of the robot's forward path
-        # within a ±45° cone. Only triggers if BOTH sides are simultaneously close
-        # enough that the total gap ≤ robot_width + 2 inches (0.051m).
+        # left_clear and right_clear are already EMA-smoothed perpendicular wall
+        # distances (measured at ±90° from forward). Their sum = corridor width.
         #
-        # Examples:
-        #   Door edge on right, open space left → right=0.20m, left=2.0m → total 2.2m → OK
-        #   Narrow corridor wall both sides     → right=0.22m, left=0.22m → total 0.44m → ESCAPE
-        _ROBOT_WIDTH  = 0.43          # physical track width (m)
-        _GAP_MARGIN   = 0.051         # 2 inches total margin
-        _MIN_GAP      = _ROBOT_WIDTH + _GAP_MARGIN   # 0.481m min passable gap
-        _CONE         = math.pi / 4   # ±45° forward cone
-        _left_y  = float('inf')
-        _right_y = float('inf')
-        for _i, _r in enumerate(scan.ranges):
-            if not (scan.range_min <= _r <= scan.range_max) or math.isnan(_r) or math.isinf(_r):
-                continue
-            _ang = scan.angle_min + _i * scan.angle_increment
-            _an  = math.atan2(math.sin(_ang), math.cos(_ang))
-            if abs(_an) <= _CONE:
-                _x = _r * math.cos(_an)
-                _y = _r * math.sin(_an)
-                if _x > 0.15:           # must be ahead of robot nose
-                    if _y > 0:
-                        _left_y  = min(_left_y,  _y)
-                    elif _y < 0:
-                        _right_y = min(_right_y, abs(_y))
-        # Cap open-space side to a sane max so inf doesn't mask gaps
-        _left_y  = min(_left_y,  4.0)
-        _right_y = min(_right_y, 4.0)
-        if (_left_y + _right_y) <= _MIN_GAP:
-            closest_any = 0.05  # Genuine narrow gap — robot can't fit
+        # Trigger only if BOTH sides are close simultaneously:
+        #   Open room:          L=1.5m + R=0.7m = 2.2m  → no trigger ✓
+        #   Normal hallway:     L=0.5m + R=0.5m = 1.0m  → no trigger ✓
+        #   Doorframe one side: L=2.0m + R=0.3m = 2.3m  → no trigger ✓
+        #   Too-narrow gap:     L=0.22m+ R=0.22m= 0.44m → ESCAPE    ✓
+        _ROBOT_WIDTH = 0.43    # m
+        _GAP_MARGIN  = 0.051   # 2 inches total (1 inch each side)
+        if (left_clear + right_clear) <= (_ROBOT_WIDTH + _GAP_MARGIN):
+            closest_any = 0.05  # Corridor too narrow — trigger escape
 
 
         # ── Emergency stop (Stateful Escape Sequence) ─────────────────────

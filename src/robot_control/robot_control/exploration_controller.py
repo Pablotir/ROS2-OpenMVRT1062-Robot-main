@@ -131,6 +131,12 @@ class ExplorationController(Node):
         self._current_state = self.STATE_CROSSING
         self._hugging_side = 'RIGHT'
 
+        # Corner escape: count consecutive front-blocked cycles
+        self._corner_count   = 0          # cycles with front < obs_dist
+        self._corner_turning = False      # in forced hard-turn phase
+        self._corner_ticks   = 0          # ticks remaining in hard-turn
+        self._corner_dir     = 1.0        # +1 = left, -1 = right
+
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
@@ -591,28 +597,48 @@ class ExplorationController(Node):
                 turn = 0.4 # Slowly circle if no goal
         
         # ── Global Obstacle Avoidance (Overrides State) ───────────────────
-        # Find best open sector in the forward hemisphere
-        fwd_scores = {}
-        sector_ang = 2.0 * math.pi / N_SECTORS
-        for s in range(N_SECTORS):
-            clearance = min(sector_min[s], 3.0)
-            sec_local = math.atan2(math.sin(s * sector_ang),
-                                   math.cos(s * sector_ang))
-            if abs(sec_local) > math.radians(120): continue
-            fwd_scores[s] = clearance
-        
-        best_ang = 0.0
-        if fwd_scores:
-            best_s    = max(fwd_scores, key=lambda s: fwd_scores[s])
-            best_ang  = math.atan2(math.sin(best_s * sector_ang),
-                                   math.cos(best_s * sector_ang))
-
-        # Switch to dodge turning if obstacle directly ahead
+        # When front is blocked: turn decisively toward the more open side.
+        # Previous code used proportional best_ang which produced tiny
+        # oscillating turns in corners. Now we:
+        #   1. Count consecutive blocked cycles
+        #   2. After 3 cycles (~0.3s), commit to a hard turn for 15 ticks (1.5s)
         if front_clear < self._obs_dist:
-            obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
-            turn = obstacle_turn
-            # G14: Lower speed drastically when dodging to prevent slipping
+            self._corner_count += 1
+            # Choose direction: whichever side has more space
+            if not self._corner_turning:
+                if self._corner_count >= 3:
+                    # Commit: turn toward the open side
+                    self._corner_dir     = 1.0 if left_clear > right_clear else -1.0
+                    self._corner_turning = True
+                    self._corner_ticks   = 15   # 1.5 s of hard turning
+                else:
+                    # Short-term: use best_ang proportionally (existing behavior)
+                    fwd_scores = {}
+                    sector_ang_local = 2.0 * math.pi / N_SECTORS
+                    for s in range(N_SECTORS):
+                        clearance = min(sector_min[s], 3.0)
+                        sec_local = math.atan2(math.sin(s * sector_ang_local),
+                                               math.cos(s * sector_ang_local))
+                        if abs(sec_local) > math.radians(120): continue
+                        fwd_scores[s] = clearance
+                    best_ang = 0.0
+                    if fwd_scores:
+                        best_s   = max(fwd_scores, key=lambda s: fwd_scores[s])
+                        best_ang = math.atan2(math.sin(best_s * sector_ang_local),
+                                              math.cos(best_s * sector_ang_local))
+                    turn = self._turn_spd * (best_ang / (math.pi / 2.0))
             target_speed *= 0.3
+        else:
+            self._corner_count = 0
+
+        # Committed hard-turn phase (overrides everything)
+        if self._corner_turning:
+            if self._corner_ticks > 0:
+                self._corner_ticks -= 1
+                turn = self._corner_dir * self._turn_spd   # full speed turn
+                target_speed *= 0.2                        # creep forward
+            else:
+                self._corner_turning = False
 
         turn = max(-self._turn_spd, min(self._turn_spd, turn))
 

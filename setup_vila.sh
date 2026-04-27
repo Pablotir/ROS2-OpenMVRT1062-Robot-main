@@ -8,7 +8,7 @@
 set -e
 
 echo "══════════════════════════════════════════════════════════════"
-echo "  Jetson Bot SLAM + VILA 2.7B + STL-27L LiDAR — First-Time Setup"
+echo "  Jetson Bot SLAM + VILA 2.7B — First-Time Container Setup"
 echo "══════════════════════════════════════════════════════════════"
 
 # ── 0. Fix expired ROS2 GPG key ──────────────────────────────────────────────
@@ -19,34 +19,42 @@ curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
     | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
 echo "  ✔ GPG key refreshed"
 
-# ── 1. Install ROS2 Humble packages from apt ─────────────────────────────────
+# ── 1. Fix any broken packages from previous runs ────────────────────────────
+echo ""
+echo "▸ Fixing any broken packages..."
+dpkg --configure -a 2>/dev/null || true
+apt-get install -f -y 2>/dev/null || true
+
+# ── 2. Install ROS2 Humble packages ──────────────────────────────────────────
+# IMPORTANT: This container has OpenCV 4.8.1 (custom nano_llm build).
+# Packages that pull in libopencv-dev (4.5.4 from apt) will conflict.
+# We use --force-overwrite to handle header file collisions.
+# cv-bridge / image-proc / vision-opencv are intentionally excluded here —
+# they're not needed without a camera, and nano_llm already has Python OpenCV.
 echo ""
 echo "▸ Installing ROS2 Humble packages..."
-apt-get update && apt-get install -y --no-install-recommends \
+DEBIAN_FRONTEND=noninteractive apt-get update && \
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    -o Dpkg::Options::="--force-overwrite" \
     python3-serial \
-    ros-humble-usb-cam \
-    ros-humble-rtabmap-ros \
+    python3-colcon-common-extensions \
     ros-humble-slam-toolbox \
+    ros-humble-xacro \
+    ros-humble-robot-state-publisher \
+    ros-humble-joint-state-publisher \
+    ros-humble-tf2 \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-geometry-msgs \
     ros-humble-navigation2 \
     ros-humble-nav2-bringup \
     ros-humble-nav2-msgs \
     ros-humble-nav2-costmap-2d \
     ros-humble-visualization-msgs \
-    ros-humble-xacro \
-    ros-humble-robot-state-publisher \
-    ros-humble-tf2 \
-    ros-humble-tf2-ros \
-    ros-humble-tf2-geometry-msgs \
-    ros-humble-tf2-sensor-msgs \
-    ros-humble-cv-bridge \
-    ros-humble-vision-opencv \
-    ros-humble-image-proc \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Fix any dpkg conflicts (container's opencv-dev 4.8.1 vs apt's 4.5.4 headers)
-dpkg --configure -a --force-overwrite 2>/dev/null || true
+echo "  ✔ Core packages installed"
 
-# ── 2. Clone external packages ───────────────────────────────────────────────
+# ── 3. Clone external packages ───────────────────────────────────────────────
 echo ""
 echo "▸ Setting up external packages..."
 cd /root/ros2_ws/src
@@ -57,55 +65,60 @@ if [ ! -d "ldlidar_stl_ros2" ]; then
     git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git
 fi
 
-# ── 3. Device permissions ────────────────────────────────────────────────────
+# ── 4. Device permissions ─────────────────────────────────────────────────────
 echo ""
 echo "▸ Setting device permissions..."
-chmod 777 /dev/roboclaw_left  2>/dev/null || echo "  ⚠ /dev/roboclaw_left not found"
-chmod 777 /dev/roboclaw_right 2>/dev/null || echo "  ⚠ /dev/roboclaw_right not found"
-chmod 777 /dev/lidar          2>/dev/null || echo "  ⚠ /dev/lidar not found (LiDAR)"
+chmod 777 /dev/roboclaw_left  2>/dev/null || echo "  ⚠ /dev/roboclaw_left not found (plug in RoboClaw)"
+chmod 777 /dev/roboclaw_right 2>/dev/null || echo "  ⚠ /dev/roboclaw_right not found (plug in RoboClaw)"
+chmod 777 /dev/lidar          2>/dev/null || echo "  ⚠ /dev/lidar not found (plug in LiDAR)"
 
-# ── 4. Python dependencies ───────────────────────────────────────────────────
+# ── 5. Python dependencies ────────────────────────────────────────────────────
 echo ""
 echo "▸ Installing Python dependencies..."
-# Note: pyserial installed via apt above to avoid Jetson pip mirror DNS issues.
-# Only install packages not available via apt here.
-pip3 install --no-cache-dir -i https://pypi.org/simple/ \
-    pillow "numpy<2,>=1.26" opencv-python-headless
-
-# ── 5. Install all workspace dependencies via rosdep ─────────────────────────
-echo ""
-echo "▸ Installing all workspace dependencies via rosdep..."
-cd /root/ros2_ws
-# nano_llm container: $ROS_ROOT=/opt/ros/, setup at /opt/ros/install/setup.bash
-source /opt/ros/install/setup.bash
-
-# rosdep resolves ALL package deps in one shot — avoids whack-a-mole apt installs
-rosdep update 2>/dev/null || true
-rosdep install --from-paths src --ignore-src -r -y || true
+pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow
 
 # ── 6. Build the workspace ────────────────────────────────────────────────────
 echo ""
 echo "▸ Building ROS2 workspace..."
-# multirobot_map_merge is excluded: blocked by Jetson opencv 4.8.1 vs Ubuntu 4.5.4 header conflict
-colcon build --symlink-install --packages-ignore multirobot_map_merge
+cd /root/ros2_ws
+source /opt/ros/install/setup.bash
+source /opt/ros/humble/setup.bash
+
+# Excluded packages:
+#   multirobot_map_merge — blocked by OpenCV 4.8.1 vs 4.5.4 header conflict
+#   explore_lite_msgs    — requires rosidl_generator_rs (Rust), not in this container
+#   explore_lite         — depends on explore_lite_msgs
+colcon build --symlink-install \
+    --packages-ignore multirobot_map_merge explore_lite_msgs explore_lite
 
 source install/setup.bash
 
-# ── 7. Write a convenience source script ─────────────────────────────────────
+# ── 7. Write convenience source script ────────────────────────────────────────
+echo ""
+echo "▸ Writing source_all.bash..."
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
 # Source all ROS2 layers in the correct order.
-# nano_llm container: ROS2 CLI lives at /opt/ros/install
-# Humble packages (slam_toolbox, xacro, etc) live at /opt/ros/humble
+# Usage: source /root/ros2_ws/source_all.bash
+#
+# nano_llm container layout:
+#   /opt/ros/install  — nano_llm custom ROS2 (has ros2 CLI binary)
+#   /opt/ros/humble   — standard Humble apt packages (slam_toolbox, xacro, etc)
+#   ~/ros2_ws/install — our robot workspace overlay
 source /opt/ros/install/setup.bash
 source /opt/ros/humble/setup.bash
 source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EOF
 chmod +x /root/ros2_ws/source_all.bash
-echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc
 
-# ── 7. Pre-download VILA model (optional) ────────────────────────────────────
+# Add to .bashrc if not already there
+if ! grep -q "source_all.bash" /root/.bashrc 2>/dev/null; then
+    echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc
+    echo "  ✔ Added source_all.bash to ~/.bashrc"
+fi
+
+# ── 8. Pre-download VILA model (optional, skip if offline) ───────────────────
 echo ""
 echo "▸ Pre-downloading VILA 2.7B model (this may take a few minutes)..."
 python3 -c "
@@ -118,8 +131,11 @@ del model
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"
-echo "  Setup complete! Run the full stack with:"
+echo "  Setup complete!"
 echo ""
-echo "    source /root/ros2_ws/source_all.bash"
+echo "  Every new shell: source /root/ros2_ws/source_all.bash"
+echo "  (already added to ~/.bashrc — new shells get it automatically)"
+echo ""
+echo "  Run the robot stack:"
 echo "    ros2 launch jetson_bot_slam ai_slam_explore.launch.py"
 echo "══════════════════════════════════════════════════════════════"

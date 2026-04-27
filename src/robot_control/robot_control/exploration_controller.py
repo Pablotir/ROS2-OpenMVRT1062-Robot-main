@@ -58,31 +58,25 @@ WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
 WALL_SECTOR_R   = 3 * N_SECTORS // 4   # ~270° = 90° right
 
 # Noise filtering
-ALIGN_EMA       = 0.20         # EMA weight for yaw alignment
+ALIGN_EMA       = 0.20         # exponential moving average weight (lower = smoother)
 ALIGN_DEADBAND  = 0.04         # m — ignore alignment differences smaller than this
-STRAFE_EMA      = 0.25         # EMA weight for strafe centering (higher = more responsive)
 
 # Goal bias weight — nudge only, wall-follow stays dominant
 GOAL_BIAS_W     = 0.18         # rad, clamped
 
 # Hallway mode: when both walls visible + front clear, center + run fast
-HALLWAY_MAX_SIDE  = 1.4        # m — both L+R within this = hallway
+HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
 HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
-HALLWAY_SPEED     = 0.52       # m/s top speed in hallway
-HALLWAY_CENTER_GAIN    = 0.22  # strafe centering gain
-HALLWAY_CENTER_DEADBAND = 0.08 # m — don't strafe if within ±8 cm of center
-HALLWAY_ALIGN_GAIN      = 0.10 # yaw-only alignment gain in hallway
+HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
+HALLWAY_CENTER_GAIN = 0.30     # strafe centering gain (was 0.6 — now drives strafe not turn)
+HALLWAY_ALIGN_GAIN  = 0.10     # yaw-only alignment gain in hallway (tiny)
 
 # Normal speed (open room)
 NORMAL_SPEED     = 0.25        # m/s
 
 # Max strafe speed as fraction of move_speed
-MAX_STRAFE_FRAC  = 0.40        # 40% of move_speed max for centering (≈0.072 m/s)
+MAX_STRAFE_FRAC  = 0.50        # 50% of move_speed max
 MAX_ALIGN_TURN   = 0.10        # rad/s — absolute cap on alignment yaw corrections
-
-# Frontier scoring — right-hand rule
-FRONTIER_RIGHT_BONUS = 45.0    # pts for frontier to the right of robot
-FRONTIER_LEFT_PENALTY = 10.0   # pts subtracted for frontier to the left of robot
 
 
 class ExplorationController(Node):
@@ -131,8 +125,7 @@ class ExplorationController(Node):
         self._stuck_timeout = 20.0    # s — generous; position updates at 10 Hz now
 
         # Noise filtering: EMA of alignment corrections
-        self._smooth_align  = 0.0     # EMA of yaw alignment
-        self._smooth_strafe = 0.0     # EMA of lateral centering strafe
+        self._smooth_align  = 0.0     # exponential moving average of align_error
         self._smooth_l      = None    # EMA of left clearance
         self._smooth_r      = None    # EMA of right clearance
 
@@ -348,23 +341,22 @@ class ExplorationController(Node):
             heading = self._heading_to(cx, cy) if self._has_tf else 0.0
             clear   = self._lidar_clearance(heading)
 
-            # Base score: large cluster, not too far away
-            local_ang = heading
+            # Base score: large and not too far away
+            score = size * 1.5 - dist * 1.5
 
-            # Forward preference, heavy rear penalty
+            # Bonus for moving forward, heavy penalty for going backward
+            local_ang = heading
             fwd_score = 5.0 * math.cos(local_ang)
             if abs(local_ang) > math.pi / 2:
                 fwd_score -= 25.0
 
-            # Right-hand rule: strong bonus for rightward frontiers, penalty for left
-            if local_ang < -0.2:          # frontier is to the robot's right
-                dir_bonus = FRONTIER_RIGHT_BONUS
-            elif local_ang > 0.2:         # frontier is to the robot's left
-                dir_bonus = -FRONTIER_LEFT_PENALTY
-            else:
-                dir_bonus = 0.0
+            # Right-hand rule: proportional bonus for rightward frontiers,
+            # proportional penalty for leftward frontiers.
+            # local_ang: negative = right, positive = left (ROS convention)
+            right_bonus = 20.0 * max(0.0, -local_ang / math.pi)  # 0..+20 for right
+            left_penalty = 10.0 * max(0.0,  local_ang / math.pi)  # 0..+10 for left
 
-            score = (size * 1.5) - (dist * 1.5) + fwd_score + dir_bonus
+            score = (size * 1.5) - (dist * 1.5) + fwd_score + right_bonus - left_penalty
 
             # Prefer open LiDAR paths
             if clear < self._obs_dist:
@@ -489,11 +481,11 @@ class ExplorationController(Node):
         else:
             self._current_state = self.STATE_CROSSING
 
-        # Reset both EMA accumulators on any FSM state transition
+        # Reset alignment EMA on any FSM state transition to avoid stale
+        # corrections bleeding into the new state's controller
         if self._current_state != self._prev_state:
-            self._smooth_align  = 0.0
-            self._smooth_strafe = 0.0
-            self._prev_state    = self._current_state
+            self._smooth_align = 0.0
+            self._prev_state   = self._current_state
 
         mode_str = self._current_state
         if self._current_state == self.STATE_ROOM_PERIMETER:
@@ -508,15 +500,10 @@ class ExplorationController(Node):
         # Lateral centering via strafe keeps all 4 wheels near equal speed.
         # Angular correction is reserved only for heading alignment (≤ MAX_ALIGN_TURN).
         if self._current_state == self.STATE_HALLWAY:
-            # Lateral centering → strafe with deadband + EMA to kill oscillation
-            raw_center = left_clear - right_clear
-            if abs(raw_center) < HALLWAY_CENTER_DEADBAND:
-                raw_center = 0.0  # within ±8 cm of center: no correction
-            center_cmd = raw_center * HALLWAY_CENTER_GAIN
-            center_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
-                             min(self._move_spd * MAX_STRAFE_FRAC, center_cmd))
-            self._smooth_strafe = STRAFE_EMA * center_cmd + (1 - STRAFE_EMA) * self._smooth_strafe
-            strafe_cmd = self._smooth_strafe
+            # Lateral centering → strafe (not turn)
+            center_err = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
+            strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                             min(self._move_spd * MAX_STRAFE_FRAC, center_err))
 
             # Parallel alignment → tiny yaw only
             SIN60 = 0.866
@@ -559,41 +546,35 @@ class ExplorationController(Node):
 
             if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT':
                 if right_clear < 3.5:
-                    # Distance correction → EMA-smoothed strafe
-                    dist_err = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
-                    dist_err = max(-self._move_spd * MAX_STRAFE_FRAC,
-                                   min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
-                    self._smooth_strafe = STRAFE_EMA * dist_err + (1 - STRAFE_EMA) * self._smooth_strafe
-                    strafe_cmd = self._smooth_strafe
+                    # Distance correction → strafe (negative = move right, away from left wall)
+                    dist_err   = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
+                    strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                                    min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
                     # Alignment → tiny yaw
                     diff_r = r_rear_right - r_front_right
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
-                    self._smooth_align = ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align
+                    self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Lost right wall: gentle strafe right, bleed smooth_strafe toward it
-                    self._smooth_strafe = STRAFE_EMA * (-self._move_spd * 0.25) + (1 - STRAFE_EMA) * self._smooth_strafe
-                    strafe_cmd = self._smooth_strafe
+                    # Seek the right wall: gentle strafe right
+                    strafe_cmd = -self._move_spd * 0.30
                     turn = 0.0
             else:
                 if left_clear < 3.5:
-                    # Distance correction → EMA-smoothed strafe
-                    dist_err = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
-                    dist_err = max(-self._move_spd * MAX_STRAFE_FRAC,
-                                   min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
-                    self._smooth_strafe = STRAFE_EMA * dist_err + (1 - STRAFE_EMA) * self._smooth_strafe
-                    strafe_cmd = self._smooth_strafe
+                    # Distance correction → strafe (positive = move left)
+                    dist_err   = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
+                    strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                                    min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
                     # Alignment → tiny yaw
                     diff_l = r_rear_left - r_front_left
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
-                    self._smooth_align = ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align
+                    self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Lost left wall: gentle strafe left
-                    self._smooth_strafe = STRAFE_EMA * (self._move_spd * 0.25) + (1 - STRAFE_EMA) * self._smooth_strafe
-                    strafe_cmd = self._smooth_strafe
+                    # Seek the left wall: gentle strafe left
+                    strafe_cmd = self._move_spd * 0.30
                     turn = 0.0 
 
             target_speed = NORMAL_SPEED
@@ -606,7 +587,7 @@ class ExplorationController(Node):
                 turn = max(-GOAL_BIAS_W * 2.0, min(GOAL_BIAS_W * 2.0, goal_heading * 0.8))
                 goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
             else:
-                turn = 0.4 # Slowly circle if no goal
+                turn = -0.35  # Circle RIGHT (right-hand rule) when no goal yet
 
         # ── Global Obstacle Avoidance (Overrides State) ───────────────────
         # Find best open sector in the forward hemisphere
@@ -626,36 +607,39 @@ class ExplorationController(Node):
                                    math.cos(best_s * sector_ang))
 
         # ── Obstacle avoidance: gentle correction, strafe-first for minor offsets
-        # When front is blocked: prefer a lateral strafe if the obstacle is
-        # off-centre (best_ang < 20°). Only commit to a hard yaw-based turn
-        # when the path is truly blocked and a full turn is needed.
+        # HALLWAY mode: suppress committed hard-turns entirely — the centering
+        # strafe already handles the robot's position; hard yaw-turns in a
+        # narrow corridor cause the observed zig-zag (full ±0.50 turn firing).
+        in_hallway = (self._current_state == self.STATE_HALLWAY)
+
         if front_clear < self._obs_dist:
-            self._corner_count += 1
+            if not in_hallway:
+                self._corner_count += 1
 
             # Small lateral offset → prefer strafe (mecanum advantage)
-            STRAFE_THRESHOLD = math.radians(20.0)  # ±20° → strafe instead of turn
+            STRAFE_THRESHOLD = math.radians(20.0)
             if abs(best_ang) <= STRAFE_THRESHOLD and not self._corner_turning:
-                # Push the robot sideways toward the open side
                 strafe_cmd += math.sin(best_ang) * self._move_spd * 0.6
-                # Gentle yaw correction only (≤5°-equivalent)
                 turn = max(-math.radians(5) * (self._turn_spd / math.radians(45)),
                            min(math.radians(5) * (self._turn_spd / math.radians(45)),
                                best_ang * 0.15))
-            elif not self._corner_turning:
+            elif not self._corner_turning and not in_hallway:
                 if self._corner_count >= 3:
-                    # Commit to hard yaw turn toward the more open side
-                    self._corner_dir      = 1.0 if left_clear > right_clear else -1.0
-                    self._corner_turning  = True
+                    self._corner_dir       = 1.0 if left_clear > right_clear else -1.0
+                    self._corner_turning   = True
                     self._corner_start_yaw = self._robot_yaw
                 else:
-                    # Proportional but damped — max ~8° of angular rate
-                    gentle_gain = 0.15  # well below 1.0; keeps corrections small
+                    gentle_gain = 0.15
                     turn = max(-self._turn_spd * 0.3,
                                min(self._turn_spd * 0.3,
                                    self._turn_spd * gentle_gain * (best_ang / (math.pi / 2.0))))
+            elif in_hallway:
+                # In hallway just nudge the heading slightly and slow down
+                turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, best_ang * 0.2))
             target_speed *= 0.35
         else:
-            self._corner_count = 0
+            if not in_hallway:
+                self._corner_count = 0
 
         # ── Committed hard-turn phase — exit when odometry shows ≥40° rotation
         if self._corner_turning:
@@ -704,9 +688,13 @@ class ExplorationController(Node):
                 self._last_move_t = now
 
         # ── Strafe ────────────────────────────────────────────────────────
-        # Obstacle repulsion (strafe_force) stacks on top of centering (strafe_cmd).
-        # Cap the total to MAX_STRAFE_FRAC so centering can't oscillate at full speed.
-        max_str = self._move_spd * MAX_STRAFE_FRAC
+        # In HALLWAY at high speed (0.52 m/s), large strafe causes severe
+        # FR/RL wheel asymmetry. Cap hallway strafe tightly.
+        # For ROOM/CROSSING, allow up to move_spd * 0.8 as before.
+        if self._current_state == self.STATE_HALLWAY:
+            max_str = 0.06   # ~6 cm/s max lateral push in hallway
+        else:
+            max_str = self._move_spd * 0.8
         total_strafe = (strafe_force * self._move_spd) + strafe_cmd
         strafe  = max(-max_str, min(max_str, total_strafe))
 

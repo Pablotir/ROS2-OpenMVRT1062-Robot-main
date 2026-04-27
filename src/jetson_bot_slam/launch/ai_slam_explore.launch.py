@@ -127,8 +127,8 @@ def generate_launch_description():
         launch_arguments={
             'use_sim_time':    'false',
             'slam_params_file': slam_params_file,
-            # Silence per-scan "LaserRangeScan contains X readings" INFO spam
-            'log_level':        'warn',
+            # Suppress noisy 'LaserRangeScan contains X readings, expected Y' lines
+            'log_level':       'warn',
         }.items(),
     )
 

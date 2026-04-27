@@ -57,11 +57,12 @@ if [ ! -d "ldlidar_stl_ros2" ]; then
     git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git
 fi
 
-# ── 3. Serial port permissions for LiDAR ─────────────────────────────────────
+# ── 3. Device permissions ────────────────────────────────────────────────────
 echo ""
-echo "▸ Setting serial port permissions..."
-chmod 777 /dev/arduino 2>/dev/null || echo "  ⚠ /dev/arduino not found (Arduino)"
-chmod 777 /dev/lidar 2>/dev/null || echo "  ⚠ /dev/lidar not found (LiDAR)"
+echo "▸ Setting device permissions..."
+chmod 777 /dev/roboclaw_left  2>/dev/null || echo "  ⚠ /dev/roboclaw_left not found"
+chmod 777 /dev/roboclaw_right 2>/dev/null || echo "  ⚠ /dev/roboclaw_right not found"
+chmod 777 /dev/lidar          2>/dev/null || echo "  ⚠ /dev/lidar not found (LiDAR)"
 
 # ── 4. Python dependencies ───────────────────────────────────────────────────
 echo ""
@@ -93,9 +94,11 @@ source install/setup.bash
 # ── 7. Write a convenience source script ─────────────────────────────────────
 cat > /root/ros2_ws/source_all.bash << 'EOF'
 #!/bin/bash
-# Source all ROS2 layers in the correct order
-# nano_llm container: $ROS_ROOT=/opt/ros/, setup at /opt/ros/install/setup.bash
+# Source all ROS2 layers in the correct order.
+# nano_llm container: ROS2 CLI lives at /opt/ros/install
+# Humble packages (slam_toolbox, xacro, etc) live at /opt/ros/humble
 source /opt/ros/install/setup.bash
+source /opt/ros/humble/setup.bash
 source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EOF

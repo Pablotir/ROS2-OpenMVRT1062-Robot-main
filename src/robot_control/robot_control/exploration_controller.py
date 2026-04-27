@@ -136,7 +136,6 @@ class ExplorationController(Node):
         self._corner_turning = False      # in forced hard-turn phase
         self._corner_ticks   = 0          # ticks remaining in hard-turn
         self._corner_dir     = 1.0        # +1 = left, -1 = right
-        self._CORNER_COMMIT_TICKS = 8     # 0.8s turn — enough to clear a doorframe without overshooting
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -344,7 +343,7 @@ class ExplorationController(Node):
 
             # G14: HEAVY Right-hand rule bias for frontiers
             right_bonus = 15.0 if local_ang < -0.2 else 0.0
-            
+
             score = (size * 1.5) - (dist * 1.5) + fwd_score + right_bonus
 
             # Prefer open LiDAR paths
@@ -425,16 +424,20 @@ class ExplorationController(Node):
                 na = math.atan2(math.sin(angle), math.cos(angle))
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
-        # G15 REMOVED: All gap/narrow-passage detection via LiDAR cone geometry
-        # produced persistent false positives (minimum-y over a cone is too sensitive
-        # to a single door edge, furniture corner, or table leg on one side).
-        # Obstacle avoidance is handled by the three layers below:
-        #   1. front_clear < obs_dist  → slow + turn toward open space
-        #   2. closest_any < estop_dist → full stop + escape sequence
-        #   3. Strafe repulsion         → lateral push away from nearby walls
-
-
-
+        # G15: Box Footprint Collision Check
+        # Check if gap is barely 2 inches wider than physical robot width
+        # Robot track = 0.43m (y=±0.215m). +2 in = 0.265m
+        for i, r in enumerate(scan.ranges):
+            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(ang_norm) < math.pi / 2: # Forward half
+                x = r * math.cos(ang_norm)
+                y = r * math.sin(ang_norm)
+                if 0.02 < x < 0.35 and abs(y) < 0.265:
+                    closest_any = 0.05 # Override Estop trigger
+                    break
 
         # ── Emergency stop (Stateful Escape Sequence) ─────────────────────
         if closest_any < self._estop_dist:
@@ -446,7 +449,7 @@ class ExplorationController(Node):
         if getattr(self, '_escape_ticks', 0) > 0:
             self._escape_ticks -= 1
             twist = Twist()
-            
+
             # Phase 1: Reverse cleanly out of the gap (0.8 seconds)
             if self._escape_ticks > 6:
                 twist.linear.x = -0.15
@@ -457,7 +460,7 @@ class ExplorationController(Node):
                 left_clear  = min(sector_min[ 6 % N_SECTORS], sector_min[ 4 % N_SECTORS], sector_min[ 8 % N_SECTORS])
                 right_clear = min(sector_min[18 % N_SECTORS], sector_min[20 % N_SECTORS], sector_min[16 % N_SECTORS])
                 twist.angular.z = self._turn_spd if left_clear > right_clear else -self._turn_spd
-                
+
             self._cmd_pub.publish(twist)
             return
         else:
@@ -514,14 +517,14 @@ class ExplorationController(Node):
         if self._current_state == self.STATE_HALLWAY:
             # G14: PD Controller for Center in Hallway
             center_err  = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
-            
+
             # G14: PD Controller for Parallel Alignment in Hallway
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]
             r_rear_right  = sector_min[16 % N_SECTORS]
             r_front_left  = sector_min[ 4 % N_SECTORS]
             r_rear_left   = sector_min[ 8 % N_SECTORS]
-            
+
             align_err = 0.0
             align_weight = 0.0
             if (right_clear < WALL_THRESH):
@@ -534,13 +537,13 @@ class ExplorationController(Node):
                 if abs(diff_l) < 0.5:
                     align_err -= diff_l * SIN60 * WALL_ALIGN_GAIN
                     align_weight += 1.0
-                
+
             if align_weight > 0:
                 align_err /= align_weight
-            
+
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
-            
+
             # G14: Reverted mapping to turning because mecanum wheels slip extensively during strafing, ruining the SLAM map cache
             strafe_cmd = 0.0
             turn = center_err + align_error
@@ -559,7 +562,7 @@ class ExplorationController(Node):
                     dist_error = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
                     diff_r = r_rear_right - r_front_right
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
-                    
+
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     strafe_cmd = 0.0
                     turn = dist_error + self._smooth_align
@@ -572,7 +575,7 @@ class ExplorationController(Node):
                     dist_error = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
                     diff_l = r_rear_left - r_front_left
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
-                    
+
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     strafe_cmd = 0.0
                     turn = dist_error + self._smooth_align
@@ -580,7 +583,7 @@ class ExplorationController(Node):
                 else:
                     # Seek the left wall blindly with steady turn
                     turn = self._turn_spd * 0.7 
-            
+
             target_speed = NORMAL_SPEED
 
         elif self._current_state == self.STATE_CROSSING:
@@ -592,14 +595,34 @@ class ExplorationController(Node):
                 goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
             else:
                 turn = 0.4 # Slowly circle if no goal
-        
+
         # ── Global Obstacle Avoidance (Overrides State) ───────────────────
+        # Find best open sector in the forward hemisphere
+        fwd_scores = {}
+        sector_ang = 2.0 * math.pi / N_SECTORS
+        for s in range(N_SECTORS):
+            clearance = min(sector_min[s], 3.0)
+            sec_local = math.atan2(math.sin(s * sector_ang),
+                                   math.cos(s * sector_ang))
+            if abs(sec_local) > math.radians(120): continue
+            fwd_scores[s] = clearance
+        
+        best_ang = 0.0
+        if fwd_scores:
+            best_s    = max(fwd_scores, key=lambda s: fwd_scores[s])
+            best_ang  = math.atan2(math.sin(best_s * sector_ang),
+                                   math.cos(best_s * sector_ang))
+
+        # Switch to dodge turning if obstacle directly ahead
         # When front is blocked: turn decisively toward the more open side.
         # Previous code used proportional best_ang which produced tiny
         # oscillating turns in corners. Now we:
         #   1. Count consecutive blocked cycles
-        #   2. After 3 cycles (~0.3s), commit to a hard turn for 0.8s
+        #   2. After 3 cycles (~0.3s), commit to a hard turn for 15 ticks (1.5s)
         if front_clear < self._obs_dist:
+            obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
+            turn = obstacle_turn
+            # G14: Lower speed drastically when dodging to prevent slipping
             self._corner_count += 1
             # Choose direction: whichever side has more space
             if not self._corner_turning:
@@ -607,7 +630,7 @@ class ExplorationController(Node):
                     # Commit: turn toward the open side
                     self._corner_dir     = 1.0 if left_clear > right_clear else -1.0
                     self._corner_turning = True
-                    self._corner_ticks   = self._CORNER_COMMIT_TICKS   # 0.8s — avoids overshooting doors
+                    self._corner_ticks   = 15   # 1.5 s of hard turning
                 else:
                     # Short-term: use best_ang proportionally (existing behavior)
                     fwd_scores = {}
@@ -664,7 +687,7 @@ class ExplorationController(Node):
                 self._last_pos_x = self._robot_x
                 self._last_pos_y = self._robot_y
                 self._last_move_t = now
-                
+
         # G14: DO NOT TOUCH - lateral strafing repulsion as requested
         # ── Strafe ────────────────────────────────────────────────────────
         max_str = self._move_spd * 0.8

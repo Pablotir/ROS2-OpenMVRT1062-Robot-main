@@ -425,19 +425,39 @@ class ExplorationController(Node):
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
         # G15: Box Footprint Collision Check
-        # Check if gap is barely 2 inches wider than physical robot width
-        # Robot track = 0.43m (y=±0.215m). +2 in = 0.265m
+        # Detect solid obstacles (walls, furniture) in the robot's projected footprint.
+        # Robot track = 0.43m (y=±0.215m). We check ±0.235m (1cm margin).
+        #
+        # KEY FIX: single-hit mode caused false positives from table legs, chair legs,
+        # and wall edges. Now we measure the CONTINUOUS ANGULAR SPAN of hits inside
+        # the footprint box. A solid wall spans many degrees; a thin leg spans <8°.
+        # Only trigger if any continuous span > 10° (about a 5cm object at 30cm).
+        _box_angles = []
         for i, r in enumerate(scan.ranges):
             if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
                 continue
             angle = scan.angle_min + i * scan.angle_increment
             ang_norm = math.atan2(math.sin(angle), math.cos(angle))
-            if abs(ang_norm) < math.pi / 2: # Forward half
+            if abs(ang_norm) < math.pi / 2:  # Forward half only
                 x = r * math.cos(ang_norm)
                 y = r * math.sin(ang_norm)
-                if 0.02 < x < 0.35 and abs(y) < 0.265:
-                    closest_any = 0.05 # Override Estop trigger
-                    break
+                if 0.02 < x < 0.40 and abs(y) < 0.235:
+                    _box_angles.append(ang_norm)
+        if _box_angles:
+            _box_angles.sort()
+            _gap = scan.angle_increment * 5   # 5-ray gap breaks continuity
+            _span_start = _box_angles[0]
+            _prev      = _box_angles[0]
+            _max_span  = 0.0
+            for _a in _box_angles[1:]:
+                if _a - _prev > _gap:
+                    _max_span  = max(_max_span, _prev - _span_start)
+                    _span_start = _a
+                _prev = _a
+            _max_span = max(_max_span, _prev - _span_start)
+            # >10° continuous span = solid obstacle (not a thin leg)
+            if _max_span > math.radians(10):
+                closest_any = 0.05  # Override: solid obstacle in footprint
 
         # ── Emergency stop (Stateful Escape Sequence) ─────────────────────
         if closest_any < self._estop_dist:

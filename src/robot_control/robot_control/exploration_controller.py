@@ -134,8 +134,11 @@ class ExplorationController(Node):
         # Corner escape: count consecutive front-blocked cycles
         self._corner_count   = 0          # cycles with front < obs_dist
         self._corner_turning = False      # in forced hard-turn phase
-        self._corner_ticks   = 0          # ticks remaining in hard-turn
         self._corner_dir     = 1.0        # +1 = left, -1 = right
+        # Odometry-based corner turn exit: record yaw at start, exit when
+        # robot has rotated >= corner_target_rad (instead of ticking time)
+        self._corner_start_yaw   = None   # robot yaw when hard-turn began
+        self._corner_target_rad  = math.radians(40.0)  # rotate 40° then stop
 
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
@@ -424,47 +427,12 @@ class ExplorationController(Node):
                 na = math.atan2(math.sin(angle), math.cos(angle))
                 strafe_force -= math.sin(na) * ((repulse_zone - r) / repulse_zone)
 
-        # G15: Box Footprint Collision Check
-        # Check if gap is barely 2 inches wider than physical robot width
-        # Robot track = 0.43m (y=±0.215m). +2 in = 0.265m
-        for i, r in enumerate(scan.ranges):
-            if not (scan.range_min <= r <= scan.range_max) or math.isnan(r) or math.isinf(r):
-                continue
-            angle = scan.angle_min + i * scan.angle_increment
-            ang_norm = math.atan2(math.sin(angle), math.cos(angle))
-            if abs(ang_norm) < math.pi / 2: # Forward half
-                x = r * math.cos(ang_norm)
-                y = r * math.sin(ang_norm)
-                if 0.02 < x < 0.35 and abs(y) < 0.265:
-                    closest_any = 0.05 # Override Estop trigger
-                    break
-
-        # ── Emergency stop (Stateful Escape Sequence) ─────────────────────
+        # ── Hard e-stop: only publish zero and warn — NO escape sequence ──
         if closest_any < self._estop_dist:
-            if not getattr(self, '_escaping', False):
-                self._escape_ticks = 14 # 1.4 seconds total escape
-                self._escaping = True
-                self.get_logger().warn(f'STUCK / GAP DETECTED ({closest_any:.2f}m)! Starting Escape Sequence')
-
-        if getattr(self, '_escape_ticks', 0) > 0:
-            self._escape_ticks -= 1
-            twist = Twist()
-
-            # Phase 1: Reverse cleanly out of the gap (0.8 seconds)
-            if self._escape_ticks > 6:
-                twist.linear.x = -0.15
-                twist.angular.z = 0.0
-            # Phase 2: Spin rapidly away from the trapped angle (0.6 seconds)
-            else:
-                twist.linear.x = 0.0
-                left_clear  = min(sector_min[ 6 % N_SECTORS], sector_min[ 4 % N_SECTORS], sector_min[ 8 % N_SECTORS])
-                right_clear = min(sector_min[18 % N_SECTORS], sector_min[20 % N_SECTORS], sector_min[16 % N_SECTORS])
-                twist.angular.z = self._turn_spd if left_clear > right_clear else -self._turn_spd
-
-            self._cmd_pub.publish(twist)
+            self.get_logger().warn(
+                f'E-STOP: obstacle at {closest_any:.2f} m — holding')
+            self._cmd_pub.publish(Twist())
             return
-        else:
-            self._escaping = False
 
         # ── Wall-follow: noise-filtered alignment + hallway mode ────────────────
         # N_SECTORS=24 → sector_ang=15°
@@ -613,52 +581,55 @@ class ExplorationController(Node):
             best_ang  = math.atan2(math.sin(best_s * sector_ang),
                                    math.cos(best_s * sector_ang))
 
-        # Switch to dodge turning if obstacle directly ahead
-        # When front is blocked: turn decisively toward the more open side.
-        # Previous code used proportional best_ang which produced tiny
-        # oscillating turns in corners. Now we:
-        #   1. Count consecutive blocked cycles
-        #   2. After 3 cycles (~0.3s), commit to a hard turn for 15 ticks (1.5s)
+        # ── Obstacle avoidance: gentle correction, strafe-first for minor offsets
+        # When front is blocked: prefer a lateral strafe if the obstacle is
+        # off-centre (best_ang < 20°). Only commit to a hard yaw-based turn
+        # when the path is truly blocked and a full turn is needed.
         if front_clear < self._obs_dist:
-            obstacle_turn = self._turn_spd * (best_ang / (math.pi / 2.0))
-            turn = obstacle_turn
-            # G14: Lower speed drastically when dodging to prevent slipping
             self._corner_count += 1
-            # Choose direction: whichever side has more space
-            if not self._corner_turning:
+
+            # Small lateral offset → prefer strafe (mecanum advantage)
+            STRAFE_THRESHOLD = math.radians(20.0)  # ±20° → strafe instead of turn
+            if abs(best_ang) <= STRAFE_THRESHOLD and not self._corner_turning:
+                # Push the robot sideways toward the open side
+                strafe_cmd += math.sin(best_ang) * self._move_spd * 0.6
+                # Gentle yaw correction only (≤5°-equivalent)
+                turn = max(-math.radians(5) * (self._turn_spd / math.radians(45)),
+                           min(math.radians(5) * (self._turn_spd / math.radians(45)),
+                               best_ang * 0.15))
+            elif not self._corner_turning:
                 if self._corner_count >= 3:
-                    # Commit: turn toward the open side
-                    self._corner_dir     = 1.0 if left_clear > right_clear else -1.0
-                    self._corner_turning = True
-                    self._corner_ticks   = 15   # 1.5 s of hard turning
+                    # Commit to hard yaw turn toward the more open side
+                    self._corner_dir      = 1.0 if left_clear > right_clear else -1.0
+                    self._corner_turning  = True
+                    self._corner_start_yaw = self._robot_yaw
                 else:
-                    # Short-term: use best_ang proportionally (existing behavior)
-                    fwd_scores = {}
-                    sector_ang_local = 2.0 * math.pi / N_SECTORS
-                    for s in range(N_SECTORS):
-                        clearance = min(sector_min[s], 3.0)
-                        sec_local = math.atan2(math.sin(s * sector_ang_local),
-                                               math.cos(s * sector_ang_local))
-                        if abs(sec_local) > math.radians(120): continue
-                        fwd_scores[s] = clearance
-                    best_ang = 0.0
-                    if fwd_scores:
-                        best_s   = max(fwd_scores, key=lambda s: fwd_scores[s])
-                        best_ang = math.atan2(math.sin(best_s * sector_ang_local),
-                                              math.cos(best_s * sector_ang_local))
-                    turn = self._turn_spd * (best_ang / (math.pi / 2.0))
-            target_speed *= 0.3
+                    # Proportional but damped — max ~8° of angular rate
+                    gentle_gain = 0.15  # well below 1.0; keeps corrections small
+                    turn = max(-self._turn_spd * 0.3,
+                               min(self._turn_spd * 0.3,
+                                   self._turn_spd * gentle_gain * (best_ang / (math.pi / 2.0))))
+            target_speed *= 0.35
         else:
             self._corner_count = 0
 
-        # Committed hard-turn phase (overrides everything)
+        # ── Committed hard-turn phase — exit when odometry shows ≥40° rotation
         if self._corner_turning:
-            if self._corner_ticks > 0:
-                self._corner_ticks -= 1
-                turn = self._corner_dir * self._turn_spd   # full speed turn
-                target_speed *= 0.2                        # creep forward
+            yaw_now = self._robot_yaw
+            if self._corner_start_yaw is not None:
+                # Angular distance travelled since hard-turn start
+                rotated = abs(math.atan2(
+                    math.sin(yaw_now - self._corner_start_yaw),
+                    math.cos(yaw_now - self._corner_start_yaw)))
+                if rotated >= self._corner_target_rad:
+                    self._corner_turning = False
+                    self._corner_start_yaw = None
+                else:
+                    turn = self._corner_dir * self._turn_spd
+                    target_speed *= 0.2
             else:
-                self._corner_turning = False
+                # Safety: no yaw reference yet — use current as start
+                self._corner_start_yaw = self._robot_yaw
 
         turn = max(-self._turn_spd, min(self._turn_spd, turn))
 

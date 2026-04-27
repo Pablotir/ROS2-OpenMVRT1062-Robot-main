@@ -83,7 +83,11 @@ source /root/ros2_ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EOF
 RUN chmod +x /root/ros2_ws/source_all.bash && \
-    echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc
+    echo 'source /root/ros2_ws/source_all.bash' >> /root/.bashrc && \
+    echo 'cd /root/ros2_ws' >> /root/.bashrc
+
+# ── Default working directory (shown in prompt and docker exec) ────────────────
+WORKDIR /root/ros2_ws
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 COPY ./entrypoint.sh /root/ros2_ws/entrypoint.sh

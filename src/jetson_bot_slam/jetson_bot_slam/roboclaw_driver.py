@@ -241,21 +241,32 @@ class RoboclawDriver:
                     pass
             return (False, 0.0)
 
+    def _read_s16(self) -> int | None:
+        """Read signed 16-bit big-endian, updating CRC."""
+        data = self._ser.read(2)
+        if len(data) != 2:
+            return None
+        for b in data:
+            self._crc_update(b)
+        return struct.unpack('>h', data)[0]   # lowercase h = signed
+
     def read_currents(self, address: int) -> tuple[bool, float, float]:
         """
         Read M1 and M2 motor currents.
 
-        Returns (success, m1_amps, m2_amps). Raw values are in 10mA units.
+        Returns (success, m1_amps, m2_amps).
+        Raw values are signed 16-bit in 10mA units (divide by 100 → amps).
+        Example: raw 284 → 2.84 A
         """
         with self._lock:
             for _ in range(self._retries):
                 try:
                     self._ser.reset_input_buffer()
                     self._send_command(address, self.CMD_GETCURRENTS)
-                    m1_raw = self._read_u16()
-                    m2_raw = self._read_u16()
+                    m1_raw = self._read_s16()   # signed — was _read_u16 (bug)
+                    m2_raw = self._read_s16()
                     if m1_raw is not None and m2_raw is not None and self._read_crc():
-                        return (True, m1_raw / 100.0, m2_raw / 100.0)
+                        return (True, abs(m1_raw) / 100.0, abs(m2_raw) / 100.0)
                 except (serial.SerialException, OSError):
                     pass
             return (False, 0.0, 0.0)

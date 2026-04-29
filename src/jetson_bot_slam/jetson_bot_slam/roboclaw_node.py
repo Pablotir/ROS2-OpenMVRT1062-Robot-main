@@ -202,12 +202,18 @@ class RoboclawNode(Node):
         qpps_rl = int(v_rl * self._rad_to_qpps)
         qpps_rr = int(v_rr * self._rad_to_qpps)
 
-        # Clamp to max QPPS
+        # Proportional scaling: if ANY wheel exceeds max_qpps, scale all
+        # four down by the same factor.  This preserves the kinematic ratio
+        # so the robot moves in the commanded direction, just slower.
+        # (Per-wheel clamping destroys the ratio → unintended yaw/drift.)
         mx = self._max_qpps
-        qpps_fl = max(-mx, min(mx, qpps_fl))
-        qpps_fr = max(-mx, min(mx, qpps_fr))
-        qpps_rl = max(-mx, min(mx, qpps_rl))
-        qpps_rr = max(-mx, min(mx, qpps_rr))
+        max_abs = max(abs(qpps_fl), abs(qpps_fr), abs(qpps_rl), abs(qpps_rr))
+        if max_abs > mx:
+            scale = mx / max_abs
+            qpps_fl = int(qpps_fl * scale)
+            qpps_fr = int(qpps_fr * scale)
+            qpps_rl = int(qpps_rl * scale)
+            qpps_rr = int(qpps_rr * scale)
 
         # Send to controllers
         # Left:  M1=RL, M2=FL

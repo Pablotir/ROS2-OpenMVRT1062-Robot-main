@@ -531,16 +531,19 @@ class ExplorationController(Node):
         right_clear = self._smooth_r
 
         # G14: FSM STATE MACHINE TRIGGERS
-        HALLWAY_THRESH = 0.75 # Heavily reduced so gaps wider than 1.5m are treated as open rooms
-        WALL_THRESH = 2.5 # Increased heavily so it can track distant right-side walls
-        front_sectors = [0, 1, N_SECTORS - 1]
-        front_clear   = min(sector_min[s] for s in front_sectors)
+        HALLWAY_THRESH = 0.75  # both walls within this → hallway
+        WALL_THRESH    = 2.5   # one wall within this → room perimeter
+        front_sectors  = [0, 1, N_SECTORS - 1]
+        front_clear    = min(sector_min[s] for s in front_sectors)
 
-        if left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH:
+        # HALLWAY only if both walls close AND front is clear.
+        # HALLWAY_MIN_FRONT guard prevents entering high-speed hallway mode
+        # when a dead-end or turn is ahead — robot drops to ROOM instead.
+        if (left_clear < HALLWAY_THRESH and right_clear < HALLWAY_THRESH
+                and front_clear >= HALLWAY_MIN_FRONT):
             self._current_state = self.STATE_HALLWAY
         elif right_clear < WALL_THRESH or left_clear < WALL_THRESH:
             self._current_state = self.STATE_ROOM_PERIMETER
-            # G14: Heavily prefer right-wall hugging. Only default to left if right is completely lost.
             if right_clear < WALL_THRESH + 0.5:
                 self._hugging_side = 'RIGHT'
             elif left_clear < WALL_THRESH:
@@ -621,6 +624,15 @@ class ExplorationController(Node):
             align_error = self._smooth_align
 
             turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, align_error * HALLWAY_ALIGN_GAIN))
+
+            # Mild goal nudge in hallway: steer toward frontier goal so the
+            # robot naturally drifts toward doorways rather than charging into
+            # dead ends.  Capped at 0.08 rad/s — won't override wall centering.
+            if self._goal_world is not None and self._has_tf:
+                gh = self._heading_to(*self._goal_world)
+                turn += max(-0.08, min(0.08, gh * 0.12))
+                goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
+
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
@@ -686,14 +698,17 @@ class ExplorationController(Node):
                                    math.cos(best_s * sector_ang))
 
         # ── Obstacle avoidance: gentle correction, strafe-first for minor offsets
-        # HALLWAY mode: suppress committed hard-turns entirely — the centering
-        # strafe already handles the robot's position; hard yaw-turns in a
-        # narrow corridor cause the observed zig-zag (full ±0.50 turn firing).
+        # HALLWAY dead-end: the HALLWAY_MIN_FRONT guard means if we arrive here
+        # with front_clear < obs_dist in HALLWAY mode, the robot genuinely hit
+        # something unexpected (e.g. a person / obstacle mid-corridor).  Treat
+        # it like ROOM — allow full corner escape so the robot isn't stranded.
         in_hallway = (self._current_state == self.STATE_HALLWAY)
 
         if front_clear < self._obs_dist:
-            if not in_hallway:
-                self._corner_count += 1
+            # Always increment corner count — including in hallway.
+            # HALLWAY_MIN_FRONT prevents reaching this during normal wall-follow;
+            # if we're here anyway something is genuinely blocking the path.
+            self._corner_count += 1
 
             # Small lateral offset → prefer strafe (mecanum advantage)
             STRAFE_THRESHOLD = math.radians(20.0)
@@ -702,7 +717,7 @@ class ExplorationController(Node):
                 turn = max(-math.radians(5) * (self._turn_spd / math.radians(45)),
                            min(math.radians(5) * (self._turn_spd / math.radians(45)),
                                best_ang * 0.15))
-            elif not self._corner_turning and not in_hallway:
+            elif not self._corner_turning:
                 if self._corner_count >= 3:
                     self._corner_dir       = 1.0 if left_clear > right_clear else -1.0
                     self._corner_turning   = True
@@ -712,13 +727,9 @@ class ExplorationController(Node):
                     turn = max(-self._turn_spd * 0.3,
                                min(self._turn_spd * 0.3,
                                    self._turn_spd * gentle_gain * (best_ang / (math.pi / 2.0))))
-            elif in_hallway:
-                # In hallway just nudge the heading slightly and slow down
-                turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, best_ang * 0.2))
             target_speed *= 0.35
         else:
-            if not in_hallway:
-                self._corner_count = 0
+            self._corner_count = 0
 
         # ── Committed hard-turn phase — exit when odometry shows ≥40° rotation
         if self._corner_turning:

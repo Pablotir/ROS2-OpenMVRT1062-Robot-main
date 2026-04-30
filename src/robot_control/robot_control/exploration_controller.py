@@ -124,7 +124,7 @@ class ExplorationController(Node):
         self._goal_world    = None    # (x, y) map frame
         self._goal_heading  = None    # robot-local radians, updated every control tick
         self._visited       = []      # blacklisted goals
-        self._visited_rad   = 0.8     # m — how close = "reached"
+        self._visited_rad   = 1.5     # m — suppress clusters this close to any visited goal
 
         # Stuck detection — updated every 100ms in control loop (NOT here)
         self._last_pos_x    = 0.0
@@ -347,7 +347,7 @@ class ExplorationController(Node):
 
         visited_cells = set()
         clusters = []
-        min_cells = max(1, int(0.20 / res))
+        min_cells = max(1, int(1.0 / res))   # ~1.0m patch minimum — filters map-update artifacts
 
         for start in frontier:
             if start in visited_cells:
@@ -386,6 +386,10 @@ class ExplorationController(Node):
             dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
 
             if dist < 0.4 or dist > 15.0:
+                continue
+            # Skip clusters the 360° LiDAR already covered from the current
+            # position — anything within ~2.0m was fully scanned this sweep.
+            if dist < 2.0:
                 continue
             if self._is_visited(cx, cy):
                 continue

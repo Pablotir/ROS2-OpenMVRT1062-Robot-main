@@ -19,10 +19,10 @@ slam_toolbox:
     debug_logging: false
     throttle_scans: 1
     transform_publish_period: 0.05
-    map_update_interval: 1.0 # 1Hz is suitable for continuous exploration
+    map_update_interval: 0.1  # Publish /map at 10 Hz — matches LiDAR scan rate, eliminates stale-map artifacts
     resolution: 0.05
     max_laser_range: 12.0
-    minimum_time_interval: 0.2
+    minimum_time_interval: 0.1  # Process up to 10 scans/sec (was 0.2 = 5Hz)
     transform_timeout: 0.2
     tf_buffer_duration: 10.0
     stack_size_to_use: 40000000

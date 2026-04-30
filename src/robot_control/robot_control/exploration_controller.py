@@ -72,7 +72,7 @@ HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
 HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
 HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
 HALLWAY_CENTER_GAIN = 0.30     # strafe centering gain (was 0.6 — now drives strafe not turn)
-HALLWAY_ALIGN_GAIN  = 0.10     # yaw-only alignment gain in hallway (tiny)
+HALLWAY_ALIGN_GAIN  = 1.0      # yaw alignment gain in hallway — same strength as ROOM mode
 
 # Normal speed (open room)
 NORMAL_SPEED     = 0.25        # m/s
@@ -595,8 +595,12 @@ class ExplorationController(Node):
         # HALLWAY: strafe to center, tiny turn for parallel alignment only.
         elif self._current_state == self.STATE_HALLWAY:
             center_err = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
-            strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
-                             min(self._move_spd * MAX_STRAFE_FRAC, center_err))
+            # Deadband: skip micro-strafe when walls are within 5 cm of equal
+            if abs(left_clear - right_clear) < 0.05:
+                strafe_cmd = 0.0
+            else:
+                strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
+                                 min(self._move_spd * MAX_STRAFE_FRAC, center_err))
 
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]

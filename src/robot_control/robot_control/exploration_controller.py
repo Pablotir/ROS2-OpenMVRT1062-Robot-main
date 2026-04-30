@@ -44,6 +44,9 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 import tf2_ros
+import heapq
+import os
+import subprocess
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 N_SECTORS      = 24            # 360 / 24 = 15° per sector
@@ -77,6 +80,11 @@ NORMAL_SPEED     = 0.25        # m/s
 # Max strafe speed as fraction of move_speed
 MAX_STRAFE_FRAC  = 0.50        # 50% of move_speed max
 MAX_ALIGN_TURN   = 0.10        # rad/s — absolute cap on alignment yaw corrections
+
+# Return-to-home
+NO_FRONTIER_CONFIRM = 3        # consecutive empty frontier cycles before declaring done
+HOME_ARRIVAL_DIST   = 0.6      # m — how close to home = "arrived"
+MAP_SAVE_DIR        = '/root/ros2_ws/maps'
 
 
 class ExplorationController(Node):
@@ -146,6 +154,16 @@ class ExplorationController(Node):
         self._corner_start_yaw   = None   # robot yaw when hard-turn began
         self._corner_target_rad  = math.radians(40.0)  # rotate 40° then stop
 
+        # Return-to-home
+        self._home_x = 0.0
+        self._home_y = 0.0
+        self._home_recorded = False
+        self._no_frontier_count = 0
+        self._returning_home = False
+        self._exploration_complete = False
+        self._home_path   = []        # A* waypoints [(x,y), ...]
+        self._home_wp_idx = 0         # current waypoint index
+
         # ── TF ────────────────────────────────────────────────────────────────
         self._tf_buf = tf2_ros.Buffer()
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
@@ -206,9 +224,30 @@ class ExplorationController(Node):
     def _plan_frontier(self):
         if self._map is None:
             return
+        if self._exploration_complete:
+            return
 
         self._update_tf()
         now = time.monotonic()
+
+        # ── Returning home: check arrival, skip frontier replanning ───────
+        if self._returning_home:
+            if self._has_tf:
+                dist_home = math.hypot(
+                    self._home_x - self._robot_x,
+                    self._home_y - self._robot_y)
+                if dist_home < HOME_ARRIVAL_DIST:
+                    self.get_logger().info(
+                        f'HOME REACHED ({self._robot_x:.1f},{self._robot_y:.1f})'
+                        f' — saving map and stopping')
+                    self._save_map()
+                    self._exploration_complete = True
+                else:
+                    self.get_logger().info(
+                        f'RETURNING HOME | dist={dist_home:.1f} m | '
+                        f'pos=({self._robot_x:.1f},{self._robot_y:.1f}) | '
+                        f'home=({self._home_x:.1f},{self._home_y:.1f})')
+            return
 
         # Check goal reached
         if self._goal_world is not None and self._has_tf:
@@ -238,6 +277,7 @@ class ExplorationController(Node):
         if self._goal_world is None:
             clusters = self._find_frontiers()
             if clusters:
+                self._no_frontier_count = 0   # reset — frontiers still exist
                 best = self._pick_frontier(clusters)
                 if best is not None:
                     gx, gy = best
@@ -253,8 +293,21 @@ class ExplorationController(Node):
                             f'heading={math.degrees(h):+.0f}° | '
                             f'{len(clusters)} clusters | {len(self._visited)} visited')
             else:
-                if self._log_tick % 5 == 0:
-                    self.get_logger().info('No frontiers — area fully mapped?')
+                # No frontiers — confirm over multiple cycles before declaring done
+                self._no_frontier_count += 1
+                if (self._no_frontier_count >= NO_FRONTIER_CONFIRM
+                        and self._home_recorded):
+                    self._returning_home = True
+                    self._goal_world = (self._home_x, self._home_y)
+                    self._plan_path_home()
+                    self.get_logger().info(
+                        f'EXPLORATION COMPLETE — returning home '
+                        f'({self._home_x:.1f},{self._home_y:.1f}) | '
+                        f'{len(self._home_path)} waypoints')
+                else:
+                    self.get_logger().info(
+                        f'No frontiers ({self._no_frontier_count}/'
+                        f'{NO_FRONTIER_CONFIRM}) — confirming...')
 
     def _heading_to(self, gx, gy) -> float:
         dx = gx - self._robot_x
@@ -407,7 +460,21 @@ class ExplorationController(Node):
             self._cmd_pub.publish(Twist())
             return
 
+        # ── Exploration complete: full stop ────────────────────────────────
+        if self._exploration_complete:
+            self._cmd_pub.publish(Twist())
+            return
+
         self._update_tf()
+
+        # Record home position from first valid TF
+        if self._has_tf and not self._home_recorded:
+            self._home_x = self._robot_x
+            self._home_y = self._robot_y
+            self._home_recorded = True
+            self.get_logger().info(
+                f'Home position recorded: ({self._home_x:.2f}, {self._home_y:.2f})')
+
         scan = self._latest_scan
 
         # ── Build sector map ──────────────────────────────────────────────
@@ -496,16 +563,38 @@ class ExplorationController(Node):
         align_error = 0.0
         goal_str = 'none'
 
+        # ══ RETURN-TO-HOME: A* path-following bypasses the FSM ════════════
+        if self._returning_home and self._home_path and self._has_tf:
+            wp = self._home_path[self._home_wp_idx]
+            dx = wp[0] - self._robot_x
+            dy = wp[1] - self._robot_y
+            dist_wp = math.hypot(dx, dy)
+
+            # Advance to next waypoint when close
+            if dist_wp < 0.35 and self._home_wp_idx < len(self._home_path) - 1:
+                self._home_wp_idx += 1
+                wp = self._home_path[self._home_wp_idx]
+                dx = wp[0] - self._robot_x
+                dy = wp[1] - self._robot_y
+                dist_wp = math.hypot(dx, dy)
+
+            # Heading to waypoint
+            wp_heading = math.atan2(math.sin(math.atan2(dy, dx) - self._robot_yaw),
+                                   math.cos(math.atan2(dy, dx) - self._robot_yaw))
+
+            # Proportional steering — stronger than exploration nudges
+            turn = max(-self._turn_spd * 0.7, min(self._turn_spd * 0.7, wp_heading * 1.2))
+            target_speed = NORMAL_SPEED
+            mode_str = 'HOME'
+            goal_str = f'wp {self._home_wp_idx+1}/{len(self._home_path)}'
+
+        # ══ NORMAL EXPLORATION FSM ════════════════════════════════════════
         # HALLWAY: strafe to center, tiny turn for parallel alignment only.
-        # Lateral centering via strafe keeps all 4 wheels near equal speed.
-        # Angular correction is reserved only for heading alignment (≤ MAX_ALIGN_TURN).
-        if self._current_state == self.STATE_HALLWAY:
-            # Lateral centering → strafe (not turn)
+        elif self._current_state == self.STATE_HALLWAY:
             center_err = (left_clear - right_clear) * HALLWAY_CENTER_GAIN
             strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
                              min(self._move_spd * MAX_STRAFE_FRAC, center_err))
 
-            # Parallel alignment → tiny yaw only
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]
             r_rear_right  = sector_min[16 % N_SECTORS]
@@ -531,13 +620,10 @@ class ExplorationController(Node):
             self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
             align_error = self._smooth_align
 
-            # Yaw = alignment only, hard-capped to MAX_ALIGN_TURN
             turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, align_error * HALLWAY_ALIGN_GAIN))
             target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
-            # ROOM: strafe for distance correction, tiny yaw for alignment only.
-            # Strafe moves the body laterally without yawing → no wheel speed asymmetry.
             SIN60 = 0.866
             r_front_right = sector_min[20 % N_SECTORS]
             r_rear_right  = sector_min[16 % N_SECTORS]
@@ -546,48 +632,41 @@ class ExplorationController(Node):
 
             if getattr(self, '_hugging_side', 'RIGHT') == 'RIGHT':
                 if right_clear < 3.5:
-                    # Distance correction → strafe (negative = move right, away from left wall)
                     dist_err   = (WALL_TARGET - right_clear) * WALL_DIST_GAIN
                     strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
                                     min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
-                    # Alignment → tiny yaw
                     diff_r = r_rear_right - r_front_right
                     align_err = diff_r * SIN60 * WALL_ALIGN_GAIN if abs(diff_r) < 0.5 else 0.0
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Seek the right wall: gentle strafe right
                     strafe_cmd = -self._move_spd * 0.30
                     turn = 0.0
             else:
                 if left_clear < 3.5:
-                    # Distance correction → strafe (positive = move left)
                     dist_err   = -(WALL_TARGET - left_clear) * WALL_DIST_GAIN
                     strafe_cmd = max(-self._move_spd * MAX_STRAFE_FRAC,
                                     min(self._move_spd * MAX_STRAFE_FRAC, dist_err))
-                    # Alignment → tiny yaw
                     diff_l = r_rear_left - r_front_left
                     align_err = -diff_l * SIN60 * WALL_ALIGN_GAIN if abs(diff_l) < 0.5 else 0.0
                     self._smooth_align = (ALIGN_EMA * align_err + (1 - ALIGN_EMA) * self._smooth_align)
                     turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, self._smooth_align))
                     align_error = self._smooth_align
                 else:
-                    # Seek the left wall: gentle strafe left
                     strafe_cmd = self._move_spd * 0.30
-                    turn = 0.0 
+                    turn = 0.0
 
             target_speed = NORMAL_SPEED
 
         elif self._current_state == self.STATE_CROSSING:
             target_speed = NORMAL_SPEED
-            # G14: Frontier Crossing towards Goal
             if self._goal_world is not None and self._has_tf:
                 goal_heading = self._heading_to(*self._goal_world)
                 turn = max(-GOAL_BIAS_W * 2.0, min(GOAL_BIAS_W * 2.0, goal_heading * 0.8))
                 goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
             else:
-                turn = -0.35  # Circle RIGHT (right-hand rule) when no goal yet
+                turn = -0.35
 
         # ── Global Obstacle Avoidance (Overrides State) ───────────────────
         # Find best open sector in the forward hemisphere
@@ -712,6 +791,179 @@ class ExplorationController(Node):
                 f'[{mode_str}] fwd={fwd:.2f} trn={turn:+.2f} str={strafe:+.2f} | '
                 f'front={front_clear:.2f} L={left_clear:.2f} R={right_clear:.2f} | '
                 f'align={align_error:+.2f} | goal={goal_str} near={closest_any:.2f}')
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # A* PATH PLANNER — shortest obstacle-free path from current pos to home
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _plan_path_home(self):
+        """Compute A* path on the OccupancyGrid from robot position to home."""
+        m = self._map
+        if m is None:
+            self.get_logger().warn('No map for path planning — falling back to direct')
+            self._home_path = [(self._home_x, self._home_y)]
+            return
+
+        w, h  = m.info.width, m.info.height
+        res   = m.info.resolution
+        ox    = m.info.origin.position.x
+        oy    = m.info.origin.position.y
+        data  = m.data
+
+        # ── World ↔ grid conversions ──────────────────────────────────────
+        def to_grid(wx, wy):
+            c = int((wx - ox) / res)
+            r = int((wy - oy) / res)
+            return (max(0, min(r, h - 1)), max(0, min(c, w - 1)))
+
+        def to_world(r, c):
+            return ox + (c + 0.5) * res, oy + (r + 0.5) * res
+
+        # ── Inflate obstacles by robot radius ─────────────────────────────
+        inflate = int(math.ceil(self._robot_rad / res)) + 1
+        passable = bytearray(w * h)
+        for i in range(w * h):
+            passable[i] = 1 if data[i] == 0 else 0  # only FREE cells
+
+        inflated = bytearray(passable)
+        for r in range(h):
+            for c in range(w):
+                if data[r * w + c] > 0:  # occupied
+                    for dr in range(-inflate, inflate + 1):
+                        for dc in range(-inflate, inflate + 1):
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < h and 0 <= nc < w:
+                                inflated[nr * w + nc] = 0
+
+        # ── A* search ─────────────────────────────────────────────────────
+        start = to_grid(self._robot_x, self._robot_y)
+        goal  = to_grid(self._home_x, self._home_y)
+
+        # Ensure start and goal are passable (robot is there, so it must be)
+        inflated[start[0] * w + start[1]] = 1
+        inflated[goal[0] * w + goal[1]]   = 1
+
+        SQRT2 = 1.414
+        open_set = [(0.0, start)]
+        g_score  = {start: 0.0}
+        came_from = {}
+
+        while open_set:
+            _, cur = heapq.heappop(open_set)
+            if cur == goal:
+                break
+
+            cr, cc = cur
+            for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+                nr, nc = cr + dr, cc + dc
+                if not (0 <= nr < h and 0 <= nc < w):
+                    continue
+                if not inflated[nr * w + nc]:
+                    continue
+                step = SQRT2 if (dr != 0 and dc != 0) else 1.0
+                ng = g_score[cur] + step
+                nkey = (nr, nc)
+                if ng < g_score.get(nkey, float('inf')):
+                    g_score[nkey] = ng
+                    f = ng + math.hypot(nr - goal[0], nc - goal[1])
+                    heapq.heappush(open_set, (f, nkey))
+                    came_from[nkey] = cur
+
+        # ── Reconstruct path ──────────────────────────────────────────────
+        if goal not in came_from and start != goal:
+            self.get_logger().warn('A* found no path — falling back to direct')
+            self._home_path = [(self._home_x, self._home_y)]
+            return
+
+        path_cells = []
+        cur = goal
+        while cur in came_from:
+            path_cells.append(cur)
+            cur = came_from[cur]
+        path_cells.append(start)
+        path_cells.reverse()
+
+        # Simplify: keep every 10th cell (~0.5m spacing at 0.05m res)
+        simplified = [path_cells[i] for i in range(0, len(path_cells), 10)]
+        if simplified[-1] != path_cells[-1]:
+            simplified.append(path_cells[-1])
+
+        self._home_path = [to_world(r, c) for r, c in simplified]
+        self._home_wp_idx = 0
+        self.get_logger().info(
+            f'A* path: {len(path_cells)} cells → {len(self._home_path)} waypoints')
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MAP SAVING — called once when exploration is complete and robot is home
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _save_map(self):
+        """Save the current map as PGM + YAML and request pose graph serialization."""
+        os.makedirs(MAP_SAVE_DIR, exist_ok=True)
+
+        m = self._map
+        if m is None:
+            self.get_logger().warn('No map data available to save')
+            return
+
+        w, h = m.info.width, m.info.height
+        res   = m.info.resolution
+        ox    = m.info.origin.position.x
+        oy    = m.info.origin.position.y
+
+        # ── Write PGM (P5 binary grayscale) ───────────────────────────────
+        pgm_path = os.path.join(MAP_SAVE_DIR, 'exploration_map.pgm')
+        try:
+            with open(pgm_path, 'wb') as f:
+                f.write(f'P5\n{w} {h}\n255\n'.encode())
+                # OccupancyGrid row 0 = bottom of map; PGM row 0 = top → flip
+                for row in range(h - 1, -1, -1):
+                    row_data = bytearray(w)
+                    for col in range(w):
+                        val = m.data[row * w + col]
+                        if val == -1:       # unknown
+                            row_data[col] = 205
+                        elif val == 0:      # free
+                            row_data[col] = 254
+                        else:               # occupied (typically 100)
+                            row_data[col] = 0
+                    f.write(row_data)
+            self.get_logger().info(f'Map image saved: {pgm_path}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to save PGM: {e}')
+
+        # ── Write YAML metadata ───────────────────────────────────────────
+        yaml_path = os.path.join(MAP_SAVE_DIR, 'exploration_map.yaml')
+        try:
+            with open(yaml_path, 'w') as f:
+                f.write(f'image: exploration_map.pgm\n')
+                f.write(f'resolution: {res}\n')
+                f.write(f'origin: [{ox}, {oy}, 0.0]\n')
+                f.write(f'negate: 0\n')
+                f.write(f'occupied_thresh: 0.65\n')
+                f.write(f'free_thresh: 0.196\n')
+            self.get_logger().info(f'Map metadata saved: {yaml_path}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to save YAML: {e}')
+
+        # ── Request slam_toolbox pose graph serialization ─────────────────
+        posegraph_path = os.path.join(MAP_SAVE_DIR, 'exploration_posegraph')
+        try:
+            subprocess.Popen([
+                'ros2', 'service', 'call',
+                '/slam_toolbox/serialize_map',
+                'slam_toolbox/srv/SerializePoseGraph',
+                f"{{filename: '{posegraph_path}'}}"
+            ])
+            self.get_logger().info(
+                f'Pose graph serialization requested: {posegraph_path}')
+        except Exception as e:
+            self.get_logger().warn(f'Pose graph serialization failed: {e}')
+
+        self.get_logger().info(
+            '══════════════════════════════════════════════════\n'
+            '  EXPLORATION COMPLETE — MAP SAVED — MOTORS STOPPED\n'
+            '══════════════════════════════════════════════════')
 
 
 def main(args=None):

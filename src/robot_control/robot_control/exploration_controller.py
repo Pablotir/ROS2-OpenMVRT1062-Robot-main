@@ -182,7 +182,7 @@ class ExplorationController(Node):
 
         # ── Timers ────────────────────────────────────────────────────────────
         self.create_timer(0.1,  self._control_loop)    # 10 Hz driving
-        self.create_timer(5.0,  self._plan_frontier)   # 0.2 Hz goal update
+        self.create_timer(2.0,  self._plan_frontier)   # 0.5 Hz goal update (was 5s — now reacts faster)
 
         self.get_logger().info(
             f'Exploration controller (wall-follow+frontier) ready | '
@@ -200,7 +200,13 @@ class ExplorationController(Node):
         self._last_scan_t = time.monotonic()
 
     def _on_map(self, msg):
+        first_map = (self._map is None)
         self._map = msg
+        # Trigger frontier planning immediately on the first map so the robot
+        # has a goal before it can reach any T-junction and corner-turn into
+        # already-scanned areas like cubby alcoves.
+        if first_map and self._has_tf:
+            self._plan_frontier()
 
     def _update_tf(self) -> bool:
         try:
@@ -347,7 +353,11 @@ class ExplorationController(Node):
 
         visited_cells = set()
         clusters = []
-        min_cells = max(1, int(1.0 / res))   # ~1.0m patch minimum — filters map-update artifacts
+        # 0.35m (7 cells at 5cm res): filters single-cell noise while still
+        # qualifying doorways (~0.8m wide = 16 cells) and the main hallway.
+        # The cubby won't generate a large cluster because its walls are fully
+        # visible from the junction — all cells become FREE, not frontier.
+        min_cells = max(1, int(0.35 / res))
 
         for start in frontier:
             if start in visited_cells:
@@ -386,10 +396,6 @@ class ExplorationController(Node):
             dist = math.hypot(cx - self._robot_x, cy - self._robot_y)
 
             if dist < 0.4 or dist > 15.0:
-                continue
-            # Skip clusters the 360° LiDAR already covered from the current
-            # position — anything within ~2.0m was fully scanned this sweep.
-            if dist < 2.0:
                 continue
             if self._is_visited(cx, cy):
                 continue

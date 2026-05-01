@@ -86,6 +86,12 @@ NO_FRONTIER_CONFIRM = 3        # consecutive empty frontier cycles before declar
 HOME_ARRIVAL_DIST   = 0.6      # m — how close to home = "arrived"
 MAP_SAVE_DIR        = '/root/ros2_ws/maps'
 
+# Trajectory-based LiDAR coverage blacklisting
+TRAJ_RECORD_DIST = 0.8    # m — record a waypoint every 0.8 m of travel
+TRAJ_COVERED_RAD = 3.0    # m — suppress frontier clusters this close to any
+                           #     recorded position (360° LiDAR covers 10m, 3.0m
+                           #     is the conservative occlusion-safe radius)
+
 
 class ExplorationController(Node):
     def __init__(self):
@@ -125,6 +131,9 @@ class ExplorationController(Node):
         self._goal_heading  = None    # robot-local radians, updated every control tick
         self._visited       = []      # blacklisted goals
         self._visited_rad   = 1.5     # m — suppress clusters this close to any visited goal
+        self._trajectory    = []      # robot positions recorded every TRAJ_RECORD_DIST
+        self._last_traj_x   = 0.0
+        self._last_traj_y   = 0.0
 
         # Stuck detection — updated every 100ms in control loop (NOT here)
         self._last_pos_x    = 0.0
@@ -323,8 +332,17 @@ class ExplorationController(Node):
                           math.cos(world_a - self._robot_yaw))
 
     def _is_visited(self, x, y) -> bool:
-        return any(math.hypot(x - vx, y - vy) < self._visited_rad
-                   for vx, vy in self._visited)
+        # Goal blacklist: explicit reached-goal suppression
+        if any(math.hypot(x - vx, y - vy) < self._visited_rad
+               for vx, vy in self._visited):
+            return True
+        # Trajectory coverage: every recorded robot position represents a full
+        # 360° LiDAR scan at 10m range.  Frontier clusters within 2.5m of any
+        # trajectory point were definitively scanned and need not be revisited.
+        if any(math.hypot(x - tx, y - ty) < TRAJ_COVERED_RAD
+               for tx, ty in self._trajectory):
+            return True
+        return False
 
     def _find_frontiers(self):
         m = self._map
@@ -484,8 +502,21 @@ class ExplorationController(Node):
             self._home_x = self._robot_x
             self._home_y = self._robot_y
             self._home_recorded = True
+            # Seed trajectory with home so starting-room clusters are immediately
+            # within the LiDAR coverage blacklist radius.
+            self._trajectory.append((self._home_x, self._home_y))
+            self._last_traj_x = self._home_x
+            self._last_traj_y = self._home_y
             self.get_logger().info(
                 f'Home position recorded: ({self._home_x:.2f}, {self._home_y:.2f})')
+
+        # Record trajectory waypoint every TRAJ_RECORD_DIST metres
+        if self._has_tf:
+            if math.hypot(self._robot_x - self._last_traj_x,
+                          self._robot_y - self._last_traj_y) >= TRAJ_RECORD_DIST:
+                self._trajectory.append((self._robot_x, self._robot_y))
+                self._last_traj_x = self._robot_x
+                self._last_traj_y = self._robot_y
 
         scan = self._latest_scan
 

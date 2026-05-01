@@ -641,6 +641,12 @@ class ExplorationController(Node):
 
             turn = max(-MAX_ALIGN_TURN, min(MAX_ALIGN_TURN, align_error * HALLWAY_ALIGN_GAIN))
 
+            # ±2° deadband: when alignment turn is within 2°/s the robot is
+            # parallel to the walls — zero the correction so it drives
+            # perfectly straight.  The goal nudge below still applies.
+            if abs(turn) < math.radians(2.0):
+                turn = 0.0
+
             # Mild goal nudge in hallway: steer toward frontier goal so the
             # robot naturally drifts toward doorways rather than charging into
             # dead ends.  Capped at 0.08 rad/s — won't override wall centering.
@@ -684,6 +690,15 @@ class ExplorationController(Node):
                 else:
                     strafe_cmd = self._move_spd * 0.30
                     turn = 0.0
+
+            # Goal bias in ROOM — prevents blind wall-follow loops around
+            # enclosed areas (cubbies, alcoves).  When a frontier exists the
+            # robot curves toward it while wall-follow keeps it safe.
+            if self._goal_world is not None and self._has_tf:
+                gh = self._heading_to(*self._goal_world)
+                goal_bias = max(-GOAL_BIAS_W, min(GOAL_BIAS_W, gh * 0.5))
+                turn += goal_bias
+                goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
 
             target_speed = NORMAL_SPEED
 

@@ -421,9 +421,11 @@ class ExplorationController(Node):
 
             score = (size * 1.5) - (dist * 1.5) + fwd_score + right_bonus - left_penalty
 
-            # Prefer open LiDAR paths
+            # Prefer open LiDAR paths — penalty kept modest so perpendicular
+            # hallways (LiDAR sees corner wall, not the hallway beyond) don't
+            # score worse than backward targets with open corridors behind them.
             if clear < self._obs_dist:
-                score -= 50.0   # blocked → very low priority
+                score -= 20.0   # blocked: lower priority but not disqualifying
             else:
                 score += min(clear, 4.0) * 1.5
 

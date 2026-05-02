@@ -722,15 +722,6 @@ class ExplorationController(Node):
                     strafe_cmd = self._move_spd * 0.30
                     turn = 0.0
 
-            # Goal bias in ROOM — prevents blind wall-follow loops around
-            # enclosed areas (cubbies, alcoves).  When a frontier exists the
-            # robot curves toward it while wall-follow keeps it safe.
-            if self._goal_world is not None and self._has_tf:
-                gh = self._heading_to(*self._goal_world)
-                goal_bias = max(-GOAL_BIAS_W, min(GOAL_BIAS_W, gh * 0.5))
-                turn += goal_bias
-                goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
-
             target_speed = NORMAL_SPEED
 
         elif self._current_state == self.STATE_CROSSING:
@@ -764,9 +755,13 @@ class ExplorationController(Node):
         # with front_clear < obs_dist in HALLWAY mode, the robot genuinely hit
         # something unexpected (e.g. a person / obstacle mid-corridor).  Treat
         # it like ROOM — allow full corner escape so the robot isn't stranded.
+        # In HALLWAY mode, brief front-sensor dips are transient (sensor noise
+        # or a passing person).  A 40° corner escape would corrupt the robot's
+        # yaw and break directional scoring for the next frontier pick.
+        # HALLWAY_MIN_FRONT already drops the robot to ROOM mode for real blockages.
         in_hallway = (self._current_state == self.STATE_HALLWAY)
 
-        if front_clear < self._obs_dist:
+        if front_clear < self._obs_dist and not in_hallway:
             # Always increment corner count — including in hallway.
             # HALLWAY_MIN_FRONT prevents reaching this during normal wall-follow;
             # if we're here anyway something is genuinely blocking the path.

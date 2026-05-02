@@ -70,8 +70,10 @@ GOAL_BIAS_W     = 0.18         # rad, clamped
 # Hallway mode: when both walls visible + front clear, center + run fast
 HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
 HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
-HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
-HALLWAY_CENTER_GAIN = 0.30     # strafe centering gain (was 0.6 — now drives strafe not turn)
+HALLWAY_SPEED    = 0.35        # m/s — reduced from 0.52 to stay below physical
+                                # wheel max (~0.509 m/s), leaving ~0.37 m/s headroom
+                                # for lateral strafe when centering
+HALLWAY_CENTER_GAIN = 0.60     # strafe centering gain — increased for faster convergence
 HALLWAY_ALIGN_GAIN  = 0.5       # yaw alignment gain in hallway — halved to prevent
                                  # alignment+goal-nudge stacking into lateral drift
 
@@ -79,7 +81,7 @@ HALLWAY_ALIGN_GAIN  = 0.5       # yaw alignment gain in hallway — halved to pr
 NORMAL_SPEED     = 0.25        # m/s
 
 # Max strafe speed as fraction of move_speed
-MAX_STRAFE_FRAC  = 0.50        # 50% of move_speed max
+MAX_STRAFE_FRAC  = 0.70        # 70% of move_speed max (increased to allow stronger centering)
 MAX_ALIGN_TURN   = 0.10        # rad/s — absolute cap on alignment yaw corrections
 
 # Return-to-home
@@ -718,7 +720,14 @@ class ExplorationController(Node):
                 turn += max(-0.03, min(0.03, gh * 0.06))
                 goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
 
-            target_speed = HALLWAY_SPEED
+            # Slow down when far off-center so strafe can actually execute.
+            # At HALLWAY_SPEED=0.35, wheels have headroom. When L-R error > 0.15m
+            # the robot is significantly offset — prioritize lateral correction.
+            center_err_abs = abs(left_clear - right_clear)
+            if center_err_abs > 0.15:
+                target_speed = 0.20  # centering mode: slow forward, strong strafe
+            else:
+                target_speed = HALLWAY_SPEED
 
         elif self._current_state == self.STATE_ROOM_PERIMETER:
             SIN60 = 0.866

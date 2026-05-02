@@ -54,7 +54,7 @@ FREE           = 0
 UNKNOWN        = -1
 
 # Wall-follow: target distance to keep from side walls
-WALL_TARGET     = 0.55         # m — desired side clearance
+WALL_TARGET     = 0.45         # m — desired side clearance (reduced from 0.55 to prevent left-overshoot at hallway entry)
 WALL_DIST_GAIN  = 0.35         # distance correction gain (was 0.7 — reduced to keep strafe gentle)
 WALL_ALIGN_GAIN = 0.50         # alignment gain (was 1.0 — reduced)
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
@@ -776,19 +776,17 @@ class ExplorationController(Node):
                                best_ang * 0.15))
             elif not self._corner_turning:
                 if self._corner_count >= 3:
-                    # Right-hand rule: default to RIGHT turn.
-                    # Only turn LEFT if right side is genuinely blocked (< 0.30 m).
-                    # The old heuristic (left if left_clear > right_clear) was wrong
-                    # at T-junctions: the new hallway on the right reads as "closer"
-                    # (wall nearby) while the open explored space behind reads as
-                    # "more clear" — causing the robot to always turn back left.
-                    if self._goal_world is not None and self._has_tf:
-                        gh = self._heading_to(*self._goal_world)
-                        self._corner_dir = -1.0 if gh <= 0 else 1.0
-                    elif right_clear < 0.30:
-                        self._corner_dir = 1.0   # right truly blocked → go left
+                    # Pure right-hand rule: always turn RIGHT at obstacles.
+                    # Only turn LEFT if right side is physically blocked (< 0.30m).
+                    # Do NOT use goal heading — when the robot is at or near the
+                    # goal, heading_to() returns noise (dx≈0, dy≈0 → undefined angle)
+                    # which was randomly choosing LEFT and sending the robot back.
+                    if right_clear >= 0.30:
+                        self._corner_dir = -1.0   # RIGHT (right-hand rule)
+                    elif left_clear >= 0.30:
+                        self._corner_dir = 1.0    # left only if right truly blocked
                     else:
-                        self._corner_dir = -1.0  # default: RIGHT (right-hand rule)
+                        self._corner_dir = -1.0 if right_clear >= left_clear else 1.0
                     self._corner_turning   = True
                     self._corner_start_yaw = self._robot_yaw
                 else:

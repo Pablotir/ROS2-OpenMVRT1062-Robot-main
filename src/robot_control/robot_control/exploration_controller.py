@@ -54,7 +54,7 @@ FREE           = 0
 UNKNOWN        = -1
 
 # Wall-follow: target distance to keep from side walls
-WALL_TARGET     = 0.45         # m — desired side clearance (reduced from 0.55 to prevent left-overshoot at hallway entry)
+WALL_TARGET     = 0.55         # m — desired side clearance
 WALL_DIST_GAIN  = 0.35         # distance correction gain (was 0.7 — reduced to keep strafe gentle)
 WALL_ALIGN_GAIN = 0.50         # alignment gain (was 1.0 — reduced)
 WALL_SECTOR_L   = N_SECTORS // 4        # ~90° left
@@ -240,6 +240,11 @@ class ExplorationController(Node):
         if self._map is None:
             return
         if self._exploration_complete:
+            return
+        # Don't plan from SLAM's startup map — wait for the first real LiDAR scan
+        # from THIS run.  Without this, the first goal is assigned from stale/
+        # pre-scan map data and points backward or to wrong areas.
+        if not self._scan_received:
             return
 
         self._update_tf()
@@ -775,7 +780,7 @@ class ExplorationController(Node):
                            min(math.radians(5) * (self._turn_spd / math.radians(45)),
                                best_ang * 0.15))
             elif not self._corner_turning:
-                if self._corner_count >= 3:
+                if self._corner_count >= 8:
                     # Pure right-hand rule: always turn RIGHT at obstacles.
                     # Only turn LEFT if right side is physically blocked (< 0.30m).
                     # Do NOT use goal heading — when the robot is at or near the

@@ -72,7 +72,8 @@ HALLWAY_MAX_SIDE = 1.4         # m — both L+R within this = hallway
 HALLWAY_MIN_FRONT = 0.80       # m — front must be clear
 HALLWAY_SPEED    = 0.52        # m/s top speed in hallway
 HALLWAY_CENTER_GAIN = 0.30     # strafe centering gain (was 0.6 — now drives strafe not turn)
-HALLWAY_ALIGN_GAIN  = 1.0      # yaw alignment gain in hallway — same strength as ROOM mode
+HALLWAY_ALIGN_GAIN  = 0.5       # yaw alignment gain in hallway — halved to prevent
+                                 # alignment+goal-nudge stacking into lateral drift
 
 # Normal speed (open room)
 NORMAL_SPEED     = 0.25        # m/s
@@ -710,12 +711,11 @@ class ExplorationController(Node):
             if abs(turn) < math.radians(2.0):
                 turn = 0.0
 
-            # Mild goal nudge in hallway: steer toward frontier goal so the
-            # robot naturally drifts toward doorways rather than charging into
-            # dead ends.  Capped at 0.08 rad/s — won't override wall centering.
+            # Mild goal nudge in hallway — capped at 0.03 rad/s so it cannot
+            # stack with alignment correction to create lateral drift.
             if self._goal_world is not None and self._has_tf:
                 gh = self._heading_to(*self._goal_world)
-                turn += max(-0.08, min(0.08, gh * 0.12))
+                turn += max(-0.03, min(0.03, gh * 0.06))
                 goal_str = f'({self._goal_world[0]:.1f},{self._goal_world[1]:.1f})'
 
             target_speed = HALLWAY_SPEED

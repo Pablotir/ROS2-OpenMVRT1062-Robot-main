@@ -40,9 +40,9 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 import tf2_ros
 import heapq
 import os
@@ -88,9 +88,10 @@ MAP_SAVE_DIR        = '/root/ros2_ws/maps'
 
 # Trajectory-based LiDAR coverage blacklisting
 TRAJ_RECORD_DIST = 0.8    # m — record a waypoint every 0.8 m of travel
-TRAJ_COVERED_RAD = 3.0    # m — suppress frontier clusters this close to any
-                           #     recorded position (360° LiDAR covers 10m, 3.0m
-                           #     is the conservative occlusion-safe radius)
+TRAJ_COVERED_RAD = 2.0    # m — suppress frontier clusters this close to any
+                           #     recorded position.  2m is conservative: covers
+                           #     the 1.95m cubby from home but allows clusters
+                           #     2-3m to the sides of the corridor to survive.
 
 
 class ExplorationController(Node):
@@ -155,13 +156,13 @@ class ExplorationController(Node):
         self._hugging_side = 'RIGHT'
 
         # Corner escape: count consecutive front-blocked cycles
-        self._corner_count   = 0          # cycles with front < obs_dist
-        self._corner_turning = False      # in forced hard-turn phase
-        self._corner_dir     = 1.0        # +1 = left, -1 = right
-        # Odometry-based corner turn exit: record yaw at start, exit when
-        # robot has rotated >= corner_target_rad (instead of ticking time)
-        self._corner_start_yaw   = None   # robot yaw when hard-turn began
+        self._corner_count       = 0          # cycles with front < obs_dist
+        self._corner_turning     = False      # in forced hard-turn phase
+        self._corner_dir         = 1.0        # +1 = left, -1 = right
+        self._corner_turns_done  = 0          # total turns completed for current goal
+        self._corner_start_yaw   = None       # robot yaw when hard-turn began
         self._corner_target_rad  = math.radians(40.0)  # rotate 40° then stop
+        MAX_CORNER_TURNS_PER_GOAL = 5         # abandon goal if robot spins > 5 times
 
         # Return-to-home
         self._home_x = 0.0
@@ -178,7 +179,8 @@ class ExplorationController(Node):
         self._tf_lis = tf2_ros.TransformListener(self._tf_buf, self)
 
         # ── Pub/Sub ───────────────────────────────────────────────────────────
-        self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._path_pub = self.create_publisher(Path, '/robot_path', 10)
 
         scan_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                               history=HistoryPolicy.KEEP_LAST, depth=1)
@@ -191,7 +193,8 @@ class ExplorationController(Node):
 
         # ── Timers ────────────────────────────────────────────────────────────
         self.create_timer(0.1,  self._control_loop)    # 10 Hz driving
-        self.create_timer(2.0,  self._plan_frontier)   # 0.5 Hz goal update (was 5s — now reacts faster)
+        self.create_timer(2.0,  self._plan_frontier)   # 0.5 Hz goal update
+        self.create_timer(1.0,  self._publish_path)    # 1 Hz path visualization (was 5s — now reacts faster)
 
         self.get_logger().info(
             f'Exploration controller (wall-follow+frontier) ready | '
@@ -302,6 +305,7 @@ class ExplorationController(Node):
                 if best is not None:
                     gx, gy = best
                     self._goal_world = (gx, gy)
+                    self._corner_turns_done = 0   # reset spin counter for new goal
                     self._last_pos_x = self._robot_x
                     self._last_pos_y = self._robot_y
                     self._last_move_t = now
@@ -328,6 +332,29 @@ class ExplorationController(Node):
                     self.get_logger().info(
                         f'No frontiers ({self._no_frontier_count}/'
                         f'{NO_FRONTIER_CONFIRM}) — confirming...')
+
+    def _publish_path(self):
+        """Publish robot trajectory as nav_msgs/Path for Foxglove/RViz visualization."""
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        for tx, ty in self._trajectory:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = tx
+            ps.pose.position.y = ty
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+        # Also append current robot position for a live tip
+        if self._has_tf:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = self._robot_x
+            ps.pose.position.y = self._robot_y
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+        self._path_pub.publish(msg)
 
     def _heading_to(self, gx, gy) -> float:
         dx = gx - self._robot_x
@@ -814,6 +841,20 @@ class ExplorationController(Node):
                 if rotated >= self._corner_target_rad:
                     self._corner_turning = False
                     self._corner_start_yaw = None
+                    self._corner_turns_done += 1
+                    # Abandon current goal if robot has spun too many times in one spot
+                    MAX_CORNER_TURNS_PER_GOAL = 5
+                    if (self._corner_turns_done >= MAX_CORNER_TURNS_PER_GOAL
+                            and self._goal_world is not None):
+                        gx, gy = self._goal_world
+                        self.get_logger().warn(
+                            f'TOO MANY CORNER TURNS ({self._corner_turns_done}) '
+                            f'— abandoning goal ({gx:.1f},{gy:.1f}), '
+                            f'will replan')
+                        self._visited.append((gx, gy))
+                        self._goal_world  = None
+                        self._goal_heading = None
+                        self._corner_turns_done = 0
                 else:
                     turn = self._corner_dir * self._turn_spd
                     target_speed *= 0.2

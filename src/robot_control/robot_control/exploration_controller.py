@@ -776,7 +776,19 @@ class ExplorationController(Node):
                                best_ang * 0.15))
             elif not self._corner_turning:
                 if self._corner_count >= 3:
-                    self._corner_dir       = 1.0 if left_clear > right_clear else -1.0
+                    # Right-hand rule: default to RIGHT turn.
+                    # Only turn LEFT if right side is genuinely blocked (< 0.30 m).
+                    # The old heuristic (left if left_clear > right_clear) was wrong
+                    # at T-junctions: the new hallway on the right reads as "closer"
+                    # (wall nearby) while the open explored space behind reads as
+                    # "more clear" — causing the robot to always turn back left.
+                    if self._goal_world is not None and self._has_tf:
+                        gh = self._heading_to(*self._goal_world)
+                        self._corner_dir = -1.0 if gh <= 0 else 1.0
+                    elif right_clear < 0.30:
+                        self._corner_dir = 1.0   # right truly blocked → go left
+                    else:
+                        self._corner_dir = -1.0  # default: RIGHT (right-hand rule)
                     self._corner_turning   = True
                     self._corner_start_yaw = self._robot_yaw
                 else:

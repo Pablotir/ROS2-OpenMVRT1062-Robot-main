@@ -37,12 +37,14 @@ Publishes:  /cmd_vel  (linear.x + linear.y + angular.z)
 
 import math
 import time
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, PoseStamped
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid, Path
+from std_srvs.srv import Trigger
 import tf2_ros
 import heapq
 import os
@@ -166,6 +168,7 @@ class ExplorationController(Node):
         self._corner_start_yaw   = None       # robot yaw when hard-turn began
         self._corner_target_rad  = math.radians(40.0)  # rotate 40° then stop
         MAX_CORNER_TURNS_PER_GOAL = 5         # abandon goal if robot spins > 5 times
+        self._goal_score         = -float('inf')  # score of current goal for hysteresis
 
         # Return-to-home
         self._home_x = 0.0
@@ -194,10 +197,13 @@ class ExplorationController(Node):
                              history=HistoryPolicy.KEEP_LAST, depth=1)
         self.create_subscription(OccupancyGrid, '/map', self._on_map, map_qos)
 
+        # ── Services ──────────────────────────────────────────────────────────
+        self.create_service(Trigger, '/save_map_and_stop', self._srv_save_and_stop)
+
         # ── Timers ────────────────────────────────────────────────────────────
         self.create_timer(0.1,  self._control_loop)    # 10 Hz driving
-        self.create_timer(2.0,  self._plan_frontier)   # 0.5 Hz goal update
-        self.create_timer(1.0,  self._publish_path)    # 1 Hz path visualization (was 5s — now reacts faster)
+        self.create_timer(2.0,  self._plan_frontier)   # 0.5 Hz backup planner (primary trigger is _on_map)
+        self.create_timer(1.0,  self._publish_path)    # 1 Hz path visualization
 
         self.get_logger().info(
             f'Exploration controller (wall-follow+frontier) ready | '
@@ -217,11 +223,23 @@ class ExplorationController(Node):
     def _on_map(self, msg):
         first_map = (self._map is None)
         self._map = msg
-        # Trigger frontier planning immediately on the first map so the robot
-        # has a goal before it can reach any T-junction and corner-turn into
-        # already-scanned areas like cubby alcoves.
-        if first_map and self._has_tf:
+        # Replan on every map update — the map is the source of truth.
+        # With numpy vectorization this takes ~2ms, so it's free to run
+        # at the SLAM publish rate (~1-2 Hz).  This makes the robot
+        # continuously adaptive: new map data → immediate re-evaluation
+        # of the best frontier → smooth redirect if something better appeared.
+        if self._has_tf and self._scan_received:
             self._plan_frontier()
+
+    def _srv_save_and_stop(self, request, response):
+        """Manual save: `ros2 service call /save_map_and_stop std_srvs/srv/Trigger`"""
+        self.get_logger().info('Manual SAVE MAP AND STOP requested via service')
+        self._cmd_pub.publish(Twist())          # immediate motor stop
+        self._save_map()
+        self._exploration_complete = True        # halt all further motion
+        response.success = True
+        response.message = 'Map saved and exploration stopped.'
+        return response
 
     def _update_tf(self) -> bool:
         try:
@@ -284,6 +302,7 @@ class ExplorationController(Node):
                 self._visited.append((gx, gy))
                 self._goal_world = None
                 self._goal_heading = None
+                self._goal_score = -float('inf')
 
         # Check stuck — position tracking now happens in control_loop (10 Hz)
         # Just read the result here
@@ -297,18 +316,27 @@ class ExplorationController(Node):
                 self._visited.append((gx, gy))
                 self._goal_world = None
                 self._goal_heading = None
+                self._goal_score = -float('inf')
                 self._last_move_t = now
 
-        # Pick new frontier if we don't have a goal
-        if self._goal_world is None:
-            clusters = self._find_frontiers()
-            if clusters:
-                self._no_frontier_count = 0   # reset — frontiers still exist
-                best = self._pick_frontier(clusters)
-                if best is not None:
-                    gx, gy = best
+        # ── Always re-evaluate frontiers (continuous adaptive planning) ────
+        # Even when we have a goal, re-score all clusters.  If a significantly
+        # better frontier appears (30% higher score), switch smoothly.
+        # This eliminates the dead zone between goals and lets the robot
+        # redirect mid-travel as the map updates.
+        REPLAN_HYSTERESIS = 1.30  # new goal must score 30% higher to switch
+
+        clusters = self._find_frontiers()
+        if clusters:
+            self._no_frontier_count = 0
+            best_pos, best_score = self._pick_frontier(clusters)
+            if best_pos is not None:
+                if self._goal_world is None:
+                    # No current goal — assign immediately
+                    gx, gy = best_pos
                     self._goal_world = (gx, gy)
-                    self._corner_turns_done = 0   # reset spin counter for new goal
+                    self._goal_score = best_score
+                    self._corner_turns_done = 0
                     self._last_pos_x = self._robot_x
                     self._last_pos_y = self._robot_y
                     self._last_move_t = now
@@ -318,23 +346,39 @@ class ExplorationController(Node):
                             f'NEW GOAL → ({gx:.2f},{gy:.2f}) | '
                             f'dist={math.hypot(gx-self._robot_x,gy-self._robot_y):.2f} m | '
                             f'heading={math.degrees(h):+.0f}° | '
+                            f'score={best_score:.1f} | '
                             f'{len(clusters)} clusters | {len(self._visited)} visited')
+                elif best_score > self._goal_score * REPLAN_HYSTERESIS:
+                    # Significantly better goal found — smooth redirect
+                    old_gx, old_gy = self._goal_world
+                    gx, gy = best_pos
+                    self._goal_world = (gx, gy)
+                    self._goal_score = best_score
+                    self._corner_turns_done = 0
+                    # Don't reset _last_move_t — preserve stuck tracking continuity
+                    if self._has_tf:
+                        h = self._heading_to(gx, gy)
+                        self.get_logger().info(
+                            f'REDIRECT → ({gx:.2f},{gy:.2f}) | '
+                            f'from ({old_gx:.1f},{old_gy:.1f}) | '
+                            f'score {self._goal_score:.1f}→{best_score:.1f} | '
+                            f'heading={math.degrees(h):+.0f}°')
+        else:
+            # No frontiers — confirm over multiple cycles before declaring done
+            self._no_frontier_count += 1
+            if (self._no_frontier_count >= NO_FRONTIER_CONFIRM
+                    and self._home_recorded):
+                self._returning_home = True
+                self._goal_world = (self._home_x, self._home_y)
+                self._plan_path_home()
+                self.get_logger().info(
+                    f'EXPLORATION COMPLETE — returning home '
+                    f'({self._home_x:.1f},{self._home_y:.1f}) | '
+                    f'{len(self._home_path)} waypoints')
             else:
-                # No frontiers — confirm over multiple cycles before declaring done
-                self._no_frontier_count += 1
-                if (self._no_frontier_count >= NO_FRONTIER_CONFIRM
-                        and self._home_recorded):
-                    self._returning_home = True
-                    self._goal_world = (self._home_x, self._home_y)
-                    self._plan_path_home()
-                    self.get_logger().info(
-                        f'EXPLORATION COMPLETE — returning home '
-                        f'({self._home_x:.1f},{self._home_y:.1f}) | '
-                        f'{len(self._home_path)} waypoints')
-                else:
-                    self.get_logger().info(
-                        f'No frontiers ({self._no_frontier_count}/'
-                        f'{NO_FRONTIER_CONFIRM}) — confirming...')
+                self.get_logger().info(
+                    f'No frontiers ({self._no_frontier_count}/'
+                    f'{NO_FRONTIER_CONFIRM}) — confirming...')
 
     def _publish_path(self):
         """Publish robot trajectory as nav_msgs/Path for Foxglove/RViz visualization."""
@@ -368,66 +412,77 @@ class ExplorationController(Node):
 
     def _is_visited(self, x, y) -> bool:
         # Goal blacklist: explicit reached-goal suppression
-        if any(math.hypot(x - vx, y - vy) < self._visited_rad
-               for vx, vy in self._visited):
-            return True
+        if self._visited:
+            va = np.array(self._visited)               # shape (V, 2)
+            dists = np.hypot(va[:, 0] - x, va[:, 1] - y)
+            if np.any(dists < self._visited_rad):
+                return True
         # Trajectory coverage: every recorded robot position represents a full
-        # 360° LiDAR scan at 10m range.  Frontier clusters within 2.5m of any
-        # trajectory point were definitively scanned and need not be revisited.
-        if any(math.hypot(x - tx, y - ty) < TRAJ_COVERED_RAD
-               for tx, ty in self._trajectory):
-            return True
+        # 360° LiDAR scan at 10m range.  Frontier clusters within TRAJ_COVERED_RAD
+        # of any trajectory point were definitively scanned.
+        if self._trajectory:
+            ta = np.array(self._trajectory)             # shape (T, 2)
+            dists = np.hypot(ta[:, 0] - x, ta[:, 1] - y)
+            if np.any(dists < TRAJ_COVERED_RAD):
+                return True
         return False
 
     def _find_frontiers(self):
+        """Vectorized frontier detection using numpy.
+
+        Complexity: O(W×H) via numpy C-level ops (~50-100x faster than Python loops)
+        Space: O(W×H) for the grid array (already allocated by ROS)
+        """
         m = self._map
         w, h   = m.info.width, m.info.height
         res    = m.info.resolution
         ox, oy = m.info.origin.position.x, m.info.origin.position.y
-        data   = m.data
 
-        def get(r, c):
-            if r < 0 or r >= h or c < 0 or c >= w:
-                return UNKNOWN
-            return data[r * w + c]
+        # Convert to numpy 2D array — O(W×H) but in C, not Python
+        grid = np.array(m.data, dtype=np.int8).reshape(h, w)
 
-        def world(r, c):
-            return ox + (c + 0.5) * res, oy + (r + 0.5) * res
+        # Boolean mask: which cells are FREE?
+        free_mask = (grid == FREE)
 
-        frontier = set()
-        for row in range(h):
-            for col in range(w):
-                if get(row, col) != FREE:
-                    continue
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    if get(row + dr, col + dc) == UNKNOWN:
-                        frontier.add(row * w + col)
-                        break
+        # Boolean mask: which cells are UNKNOWN?  Pad edges as UNKNOWN.
+        unk_mask = np.ones((h + 2, w + 2), dtype=bool)  # border = unknown
+        unk_mask[1:-1, 1:-1] = (grid == UNKNOWN)
 
+        # A frontier cell is FREE and has at least one UNKNOWN 4-neighbor.
+        # Check all 4 directions using slicing on the padded array.
+        has_unk_neighbor = (
+            unk_mask[0:-2, 1:-1] |   # up
+            unk_mask[2:,   1:-1] |   # down
+            unk_mask[1:-1, 0:-2] |   # left
+            unk_mask[1:-1, 2:]       # right
+        )
+        frontier_mask = free_mask & has_unk_neighbor
+
+        # Extract frontier cell coordinates
+        frows, fcols = np.nonzero(frontier_mask)
+        if len(frows) == 0:
+            return []
+
+        # BFS clustering on frontier cells — use a set of (row, col) for O(1) lookup
+        frontier_set = set(zip(frows.tolist(), fcols.tolist()))
         visited_cells = set()
         clusters = []
-        # 0.35m (7 cells at 5cm res): filters single-cell noise while still
-        # qualifying doorways (~0.8m wide = 16 cells) and the main hallway.
-        # The cubby won't generate a large cluster because its walls are fully
-        # visible from the junction — all cells become FREE, not frontier.
         min_cells = max(1, int(0.35 / res))
 
-        for start in frontier:
-            if start in visited_cells:
+        for sr, sc in frontier_set:
+            if (sr, sc) in visited_cells:
                 continue
-            pts, queue = [], [start]
-            visited_cells.add(start)
+            pts = []
+            queue = [(sr, sc)]
+            visited_cells.add((sr, sc))
             while queue:
-                cur = queue.pop()
-                r, c = divmod(cur, w)
-                pts.append(world(r, c))
+                cr, cc = queue.pop()
+                pts.append((ox + (cc + 0.5) * res, oy + (cr + 0.5) * res))
                 for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nr, nc = r + dr, c + dc
-                    ni = nr * w + nc
-                    if (0 <= nr < h and 0 <= nc < w
-                            and ni in frontier and ni not in visited_cells):
-                        visited_cells.add(ni)
-                        queue.append(ni)
+                    nr, nc = cr + dr, cc + dc
+                    if (nr, nc) in frontier_set and (nr, nc) not in visited_cells:
+                        visited_cells.add((nr, nc))
+                        queue.append((nr, nc))
             if len(pts) >= min_cells:
                 clusters.append(pts)
 
@@ -435,10 +490,8 @@ class ExplorationController(Node):
 
     def _pick_frontier(self, clusters):
         """
-        Pick the best frontier cluster.
+        Pick the best frontier cluster.  Returns (position, score) tuple.
         Scoring: large clusters, moderate distance, forward bias, open LiDAR path.
-        Rear frontiers ARE allowed — the wall-follow will navigate around obstacles
-        naturally. We just add a mild forward preference (+3 pts if within ±90°).
         """
         best_score = -float('inf')
         best_pos   = None
@@ -457,9 +510,6 @@ class ExplorationController(Node):
             heading = self._heading_to(cx, cy) if self._has_tf else 0.0
             clear   = self._lidar_clearance(heading)
 
-            # Base score: large and not too far away
-            score = size * 1.5 - dist * 1.5
-
             # Bonus for moving forward, heavy penalty for going backward
             local_ang = heading
             fwd_score = 5.0 * math.cos(local_ang)
@@ -468,17 +518,14 @@ class ExplorationController(Node):
 
             # Right-hand rule: proportional bonus for rightward frontiers,
             # proportional penalty for leftward frontiers.
-            # local_ang: negative = right, positive = left (ROS convention)
-            right_bonus = 20.0 * max(0.0, -local_ang / math.pi)  # 0..+20 for right
-            left_penalty = 10.0 * max(0.0,  local_ang / math.pi)  # 0..+10 for left
+            right_bonus = 20.0 * max(0.0, -local_ang / math.pi)
+            left_penalty = 10.0 * max(0.0,  local_ang / math.pi)
 
             score = (size * 1.5) - (dist * 1.5) + fwd_score + right_bonus - left_penalty
 
-            # Prefer open LiDAR paths — penalty kept modest so perpendicular
-            # hallways (LiDAR sees corner wall, not the hallway beyond) don't
-            # score worse than backward targets with open corridors behind them.
+            # Prefer open LiDAR paths
             if clear < self._obs_dist:
-                score -= 20.0   # blocked: lower priority but not disqualifying
+                score -= 20.0
             else:
                 score += min(clear, 4.0) * 1.5
 
@@ -486,7 +533,7 @@ class ExplorationController(Node):
                 best_score = score
                 best_pos   = (cx, cy)
 
-        return best_pos
+        return best_pos, best_score
 
     def _lidar_clearance(self, heading_local):
         scan = self._latest_scan
@@ -863,6 +910,7 @@ class ExplorationController(Node):
                         self._visited.append((gx, gy))
                         self._goal_world  = None
                         self._goal_heading = None
+                        self._goal_score = -float('inf')
                         self._corner_turns_done = 0
                 else:
                     turn = self._corner_dir * self._turn_spd
@@ -1105,7 +1153,8 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Ctrl+C received — saving map before shutdown...')
+        node._save_map()
     finally:
         node._cmd_pub.publish(Twist())
         node.destroy_node()

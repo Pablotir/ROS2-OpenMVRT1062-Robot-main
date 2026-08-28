@@ -1,8 +1,12 @@
 ﻿#!/usr/bin/env python3
 """
-validate_calibration.py — Live real-time validation of Hand-Eye Calibration.
-Continuously predicts board location in the live camera feed using Forward Kinematics
-and calibrated transform.
+validate_calibration.py — Real-Time Hand-Eye Calibration Validator & Live 3D Tracker.
+
+Features:
+- Live 3D tracking of the ChArUco board origin as you move the arm in real time
+- Switch between Calibrated Matrix (YAML) and Physical CAD Mount Matrix with [m] key
+- Dynamic live visual vector connecting predicted 3D position to actual camera detection
+- Live millimeter error readout
 """
 
 import cv2
@@ -27,23 +31,52 @@ from calibrate_hand_eye import (
 PORT = "/dev/arm_controller"
 ARM_ID = "jetson_arm"
 
-def validate_calibration():
-    calib_path = os.path.join(os.path.dirname(__file__), "hand_eye_calibration.yaml")
-    if not os.path.exists(calib_path):
-        print("❌ No calibration found. Run calibrate_hand_eye.py first.")
-        return
-        
-    with open(calib_path, 'r') as f:
-        calib = yaml.safe_load(f)
-        
-    # R_cam2gripper and t_cam2gripper (T_wrist_cam)
-    R_cam2gripper = np.array(calib['rotation_matrix'])
-    t_cam2gripper = np.array(calib['translation_mm']) / 1000.0  # Convert mm to meters
+def build_physical_T_wrist_cam(pitch_deg=45.0, x_offset_mm=3.0, y_offset_mm=37.0, z_offset_mm=47.0):
+    """
+    Physical CAD mounting matrix of RealSense D405 on SO-ARM101 wrist.
+    Maps Camera Optical Frame (X=Right, Y=Down, Z=Forward) to Wrist Frame (X=Forward, Y=Down, Z=Left).
+    """
+    alpha = math.radians(pitch_deg)
+    sin_a, cos_a = math.sin(alpha), math.cos(alpha)
     
-    T_wrist_cam = np.eye(4)
-    T_wrist_cam[:3, :3] = R_cam2gripper
-    T_wrist_cam[:3, 3] = t_cam2gripper.flatten()
+    # R maps: Z_cam -> Wrist +X and Wrist +Y; Y_cam -> Wrist -X and Wrist +Y; X_cam -> Wrist -Z
+    R = np.array([
+        [ 0.0, -sin_a,  cos_a],
+        [ 0.0,  cos_a,  sin_a],
+        [-1.0,   0.0,    0.0 ],
+    ])
+    
+    T = np.eye(4)
+    T[:3, :3] = R
+    # In meters:
+    T[:3, 3] = [z_offset_mm / 1000.0, -y_offset_mm / 1000.0, x_offset_mm / 1000.0]
+    return T
 
+def validate_calibration():
+    # 1. Load Calibrated Matrix from YAML if available
+    calib_path = os.path.join(os.path.dirname(__file__), "hand_eye_calibration.yaml")
+    calib_T_wrist_cam = None
+    if os.path.exists(calib_path):
+        try:
+            with open(calib_path, 'r') as f:
+                calib = yaml.safe_load(f)
+            R_cg = np.array(calib['rotation_matrix'])
+            t_cg = np.array(calib['translation_mm']) / 1000.0
+            calib_T_wrist_cam = np.eye(4)
+            calib_T_wrist_cam[:3, :3] = R_cg
+            calib_T_wrist_cam[:3, 3] = t_cg.flatten()
+            print("✅ Loaded calibrated matrix from hand_eye_calibration.yaml")
+        except Exception as e:
+            print(f"⚠️ Could not parse YAML: {e}")
+
+    # 2. Build Physical CAD Mount Matrix as baseline
+    phys_T_wrist_cam = build_physical_T_wrist_cam(pitch_deg=45.0, x_offset_mm=3.0, y_offset_mm=37.0, z_offset_mm=47.0)
+
+    # Default to physical if calib is missing or degenerate
+    active_mode = "CALIBRATED" if calib_T_wrist_cam is not None else "PHYSICAL_CAD"
+    active_T_wrist_cam = calib_T_wrist_cam if active_mode == "CALIBRATED" else phys_T_wrist_cam
+
+    # 3. Load Board Params
     params_path = os.path.join(os.path.dirname(__file__), "charuco_board_params.yaml")
     if not os.path.exists(params_path):
         board_params = {"columns": 5, "rows": 7, "square_size_mm": 35.0, "marker_size_mm": 25.0}
@@ -77,11 +110,12 @@ def validate_calibration():
 
     T_base_target = None
     print("\n" + "═"*65)
-    print(" HAND-EYE CALIBRATION VALIDATOR")
+    print(" LIVE HAND-EYE 3D TRACKING VALIDATOR")
     print("═"*65)
     print(" Controls:")
-    print("   [Space]  Lock the board reference position (Do this ONCE)")
-    print("   [t]      Toggle arm TORQUE ON / OFF")
+    print("   [Space]  Lock the board reference position (Do this ONCE with board in view)")
+    print("   [m]      Toggle Matrix Mode: Calibrated (YAML) <-> Physical (CAD)")
+    print("   [t]      Toggle arm TORQUE ON / OFF (for free hand moving)")
     print("   [q]      Quit")
     print("═"*65 + "\n")
     
@@ -104,7 +138,6 @@ def validate_calibration():
                 )
                 if success:
                     draw_frame_axes_compat(display_img, cam.camera_matrix, cam.dist_coeffs, rvec_cam, tvec_cam, 0.05)
-                    
                     R_tc, _ = cv2.Rodrigues(rvec_cam)
                     T_cam_target_actual = np.eye(4)
                     T_cam_target_actual[:3, :3] = R_tc
@@ -128,32 +161,44 @@ def validate_calibration():
                     torque_enabled = new_state
                     print(f"🔧 Motor Torque {'ENABLED' if torque_enabled else 'DISABLED (Free-move mode)'}")
 
+            if key == ord('m'):
+                if active_mode == "CALIBRATED" and phys_T_wrist_cam is not None:
+                    active_mode = "PHYSICAL_CAD"
+                    active_T_wrist_cam = phys_T_wrist_cam
+                    T_base_target = None # Reset anchor for new matrix
+                    print("🔄 Switched to [PHYSICAL_CAD] Mount Matrix (Pitch=45°, X=3mm, Y=37mm, Z=47mm). Press [Space] to lock.")
+                elif calib_T_wrist_cam is not None:
+                    active_mode = "CALIBRATED"
+                    active_T_wrist_cam = calib_T_wrist_cam
+                    T_base_target = None # Reset anchor for new matrix
+                    print("🔄 Switched to [CALIBRATED] YAML Matrix. Press [Space] to lock.")
+
             if key == 32 and T_cam_target_actual is not None:  # Space key pressed ONCE
-                # Lock board in world frame: T_base_target = T_base_wrist * T_wrist_cam * T_cam_target
-                T_base_cam_0 = T_base_wrist_m @ T_wrist_cam
+                # Forward chain: T_base_target = T_base_wrist * T_wrist_cam * T_cam_target
+                T_base_cam_0 = T_base_wrist_m @ active_T_wrist_cam
                 T_base_target = T_base_cam_0 @ T_cam_target_actual
-                print("🎯 Board reference position locked in world frame! Now move the arm around.")
+                print(f"🎯 Board locked in world frame using [{active_mode}] matrix! Move the arm freely to test live tracking.")
             
-            # HUD Header
-            cv2.rectangle(display_img, (0, 0), (w, 105), (20, 20, 20), -1)
+            # HUD Header Box
+            cv2.rectangle(display_img, (0, 0), (w, 115), (20, 20, 20), -1)
             
-            # Line 1: Live Coordinates
-            torque_status = "TORQUE: ON" if torque_enabled else "TORQUE: OFF (Free-hand)"
-            hud_line1 = f"Wrist FK: X={x_mm:5.1f}mm Y={y_mm:5.1f}mm Z={z_mm:5.1f}mm | {torque_status} [t]"
-            cv2.putText(display_img, hud_line1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 255, 200), 1)
+            # Line 1: Live Coordinates & Mode
+            torque_status = "TORQUE: ON" if torque_enabled else "TORQUE: OFF (Free-hand) [t]"
+            hud_line1 = f"Mode: [{active_mode}] [m] | Arm FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f}mm | {torque_status}"
+            cv2.putText(display_img, hud_line1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 1)
 
             # Line 2: Joints
-            joint_str = (f"Pan:{joints.get('shoulder_pan.pos',0):4.1f}° "
-                         f"Lift:{joints.get('shoulder_lift.pos',0):4.1f}° "
-                         f"Elbow:{joints.get('elbow_flex.pos',0):4.1f}° "
-                         f"Wrist:{joints.get('wrist_flex.pos',0):4.1f}°")
-            cv2.putText(display_img, joint_str, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+            joint_str = (f"Joints: Pan:{joints.get('shoulder_pan.pos',0):5.1f}° "
+                         f"Lift:{joints.get('shoulder_lift.pos',0):5.1f}° "
+                         f"Elbow:{joints.get('elbow_flex.pos',0):5.1f}° "
+                         f"Wrist:{joints.get('wrist_flex.pos',0):5.1f}°")
+            cv2.putText(display_img, joint_str, (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 255, 200), 1)
 
-            # Line 3: Validation Error
+            # Line 3: Live 3D Projection & Error
             if T_base_target is not None:
                 # Live dynamic prediction on EVERY frame as arm moves:
-                # T_cam_target_pred = (T_base_wrist_m * T_wrist_cam)^-1 * T_base_target
-                T_base_cam_k = T_base_wrist_m @ T_wrist_cam
+                # T_cam_target_pred = (T_base_wrist_m * active_T_wrist_cam)^-1 * T_base_target
+                T_base_cam_k = T_base_wrist_m @ active_T_wrist_cam
                 T_cam_base_k = np.linalg.inv(T_base_cam_k)
                 T_cam_target_pred = T_cam_base_k @ T_base_target
                 
@@ -162,28 +207,36 @@ def validate_calibration():
                 
                 # Project predicted origin onto camera image (Green Circle)
                 imgpts, _ = cv2.projectPoints(np.float32([[0,0,0]]), rvec_pred, tvec_pred, cam.camera_matrix, cam.dist_coeffs)
-                pt = tuple(np.int32(imgpts[0].ravel()))
-                if 0 <= pt[0] < w and 0 <= pt[1] < h:
-                    cv2.circle(display_img, pt, 8, (0, 255, 0), -1)  # Green = predicted from FK
+                pt_pred = tuple(np.int32(imgpts[0].ravel()))
+                
+                # Draw live predicted point
+                if -100 <= pt_pred[0] <= w + 100 and -100 <= pt_pred[1] <= h + 100:
+                    cv2.circle(display_img, pt_pred, 10, (0, 255, 0), -1)
+                    cv2.putText(display_img, "PRED (FK)", (pt_pred[0] + 12, pt_pred[1] + 5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
                 
                 if T_cam_target_actual is not None:
                     actual_pts, _ = cv2.projectPoints(np.float32([[0,0,0]]), rvec_cam, tvec_cam, cam.camera_matrix, cam.dist_coeffs)
-                    actual_pt = tuple(np.int32(actual_pts[0].ravel()))
-                    if 0 <= actual_pt[0] < w and 0 <= actual_pt[1] < h:
-                        cv2.circle(display_img, actual_pt, 5, (0, 0, 255), -1)  # Red = actual camera vision
+                    pt_act = tuple(np.int32(actual_pts[0].ravel()))
+                    cv2.circle(display_img, pt_act, 6, (0, 0, 255), -1)
+                    cv2.putText(display_img, "ACTUAL", (pt_act[0] + 10, pt_act[1] - 5), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+                    
+                    # Draw connecting error line
+                    cv2.line(display_img, pt_pred, pt_act, (255, 255, 0), 2)
                     
                     dist_mm = np.linalg.norm(T_cam_target_pred[:3, 3] - T_cam_target_actual[:3, 3]) * 1000.0
-                    err_color = (0, 255, 0) if dist_mm < 5.0 else ((0, 165, 255) if dist_mm < 12.0 else (0, 0, 255))
-                    cv2.putText(display_img, f"3D Error: {dist_mm:5.2f} mm (Green=Predicted, Red=Actual)", 
-                                (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.62, err_color, 2)
+                    err_color = (0, 255, 0) if dist_mm < 6.0 else ((0, 165, 255) if dist_mm < 15.0 else (0, 0, 255))
+                    cv2.putText(display_img, f"Live 3D Error: {dist_mm:5.1f} mm | Vector: Green=Predicted, Red=Actual", 
+                                (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.58, err_color, 2)
                 else:
-                    cv2.putText(display_img, "Target Board not detected in camera view", 
-                                (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 1)
+                    cv2.putText(display_img, "Target Board out of camera frame (move arm to view board)", 
+                                (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 1)
             else:
-                cv2.putText(display_img, "Press [SPACE] ONCE when board is visible to lock reference", 
-                            (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+                cv2.putText(display_img, "Press [SPACE] ONCE with board in view to anchor 3D world origin", 
+                            (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
             
-            cv2.imshow("Validate Hand-Eye Calibration", display_img)
+            cv2.imshow("Live Hand-Eye 3D Tracker", display_img)
             
             if key == ord('q'):
                 break

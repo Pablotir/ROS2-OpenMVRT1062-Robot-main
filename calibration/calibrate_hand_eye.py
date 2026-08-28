@@ -413,6 +413,22 @@ def main():
                 cam_dist_mm = np.linalg.norm(t_tc) * 1000.0
                 print(f"📸 Captured pose #{pose_count:2d} | Wrist FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f} | Cam Dist: {cam_dist_mm:4.0f}mm")
 
+                # Save raw dataset to avoid recapturing if math changes later
+                dataset_file = os.path.join(os.path.dirname(__file__), "calibration_dataset.json")
+                try:
+                    import json
+                    if not os.path.exists(dataset_file):
+                        with open(dataset_file, "w") as jf: json.dump([], jf)
+                    with open(dataset_file, "r") as jf: ds = json.load(jf)
+                    ds.append({
+                        "joints": joints,
+                        "rvec_cam": rvec_cam.flatten().tolist(),
+                        "tvec_cam": tvec_cam.flatten().tolist()
+                    })
+                    with open(dataset_file, "w") as jf: json.dump(ds, jf, indent=2)
+                except Exception as e:
+                    pass
+
             elif key == ord('c'):
                 if pose_count < 5:
                     print(f"⚠️ Need at least 5 poses to compute calibration (currently have {pose_count}).")

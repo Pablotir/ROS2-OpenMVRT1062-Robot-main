@@ -1,0 +1,82 @@
+# SO-ARM101 Arm Parameters
+# All safety constraints from arm_picker.py V6
+
+link_lengths:
+  shoulder_to_elbow: 115.0    # L1 (mm)
+  elbow_to_wrist: 137.5       # L2 (mm)
+  wrist_to_gripper: 90.0      # L3 (mm)
+  shoulder_height: 170.0      # pivot height above table (mm)
+
+pan_zero_offset_deg: -4.6
+
+joint_limits:
+  shoulder_pan:  { min: -113.8, max: 113.8 }
+  shoulder_lift: { min: -110.0, max: 150.0, backward_guard: -90.0 }
+  elbow_flex:    { min: -120.0, max: 120.0 }
+  wrist_flex:    { min: -120.0, max: 120.0 }
+
+workspace_bounds:
+  x_min_mm: -140.0
+  x_max_mm:  285.0
+  y_min_mm: -235.0
+  y_max_mm:  235.0
+  z_min_mm: -225.0
+  z_max_mm:  275.0
+  rho_max_mm: 285.0
+
+depth_guards:
+  min_range_mm: 70.0
+  max_grab_depth_mm: 600.0
+  grasp_penetration_mm: 20.0
+
+mask_guard:
+  max_area_fraction: 0.15
+
+alignment:
+  max_pan_deg_per_frame: 3.0
+  max_lift_deg_per_frame: 1.5
+  pan_k: 0.04
+  lift_k: 0.05
+  threshold_px: 35
+  lost_grace_frames: 25
+  max_frames: 150
+  centered_need: 3
+
+gripper:
+  load_threshold: 150
+  backoff_deg: 15.0
+  close_timeout_s: 1.5
+
+motion:
+  smooth_step_size_deg: 2.0
+  smooth_step_delay_s: 0.03
+  level_approach_step_size_deg: 2.0
+  level_approach_step_delay_s: 0.03
+
+ik_solver:
+  pitch_min_deg: -80.0
+  pitch_max_deg: -5.0
+  lift_weight: 3.0
+  elbow_weight: 2.0
+  wrist_weight: 1.0
+
+search:
+  sweep_range_deg: 80.0
+  sweep_speed_deg: 0.5
+
+# Named poses (joint angles in degrees)
+poses:
+  scan_base:
+    shoulder_pan: -1.4
+    shoulder_lift: -57.6
+    elbow_flex: -3.3
+    wrist_flex: 86.0
+    wrist_roll: 0.0
+    gripper: 60.0
+  stow_base:
+    shoulder_pan: 0.0
+    shoulder_lift: -104.5
+    elbow_flex: 96.5
+    wrist_flex: 0.0
+    wrist_roll: 0.0
+    gripper: 60.0

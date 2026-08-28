@@ -28,6 +28,8 @@ setup(
             'exploration_controller  = robot_control.exploration_controller:main',
             'frontier_explorer       = robot_control.frontier_explorer:main',
             'llm_planner             = robot_control.llm_planner:main',
+            'arm_lidar_mask_node     = robot_control.arm_lidar_mask_node:main',
+            'map_manager             = robot_control.map_manager:main',
         ],
     },
 )

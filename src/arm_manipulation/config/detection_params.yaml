@@ -1,0 +1,9 @@
+# YOLO Detection Parameters
+model_path: /root/ros2_ws/models/yolo11n-seg.engine  # TensorRT engine (auto-exported from .pt)
+model_fallback_path: /root/ros2_ws/models/yolo11n-seg.pt
+target_class_id: 32  # COCO class 32 = sports ball
+target_description: 'red ball'
+confidence_threshold: 0.5
+imgsz: 640
+device: 'cuda:0'
+half: true  # FP16 inference

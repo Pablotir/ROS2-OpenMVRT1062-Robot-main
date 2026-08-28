@@ -25,6 +25,7 @@ services:
     image: jetson_bot_custom:latest
     container_name: jetson_bot_vila
     network_mode: "host"
+    privileged: true
     runtime: nvidia
     stdin_open: true
     tty: true
@@ -37,12 +38,15 @@ services:
       - /dev/roboclaw_left:/dev/roboclaw_left    # RoboClaw Left  (M1=Rear-Left,  M2=Front-Left)
       - /dev/roboclaw_right:/dev/roboclaw_right  # RoboClaw Right (M1=Rear-Right, M2=Front-Right)
       - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x → /dev/lidar symlink)
+      - /dev/arm_controller:/dev/arm_controller  # SO-ARM101 Feetech bus
       # - /dev/video0:/dev/video0                  # USB camera (uncomment when connected)
       # - /dev/video1:/dev/video1                  # USB camera (alternate index)
     volumes:
       - ./src:/root/ros2_ws/src           # live-reload Python nodes
       - ./maps:/root/maps                 # persisted SLAM maps
       - ./logs:/root/ros2_ws/logs         # AI decision logs + captured frames
+      - ./calibration:/root/ros2_ws/calibration # hand-eye calibration data
+      - ./models:/root/ros2_ws/models     # YOLO .pt and .engine files
       - ./setup_vila.sh:/root/ros2_ws/setup_vila.sh  # setup script
       - nano_llm_models:/root/.cache      # persist downloaded VILA model
       - /tmp/.X11-unix:/tmp/.X11-unix     # X11 display socket for RViz

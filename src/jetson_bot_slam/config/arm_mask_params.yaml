@@ -1,0 +1,67 @@
+# ──────────────────────────────────────────────────────────────
+# Arm LiDAR Mask — configuration parameters
+# ──────────────────────────────────────────────────────────────
+# Loaded by arm_lidar_mask_node via launch file.
+#
+# This file contains ONLY masking-specific parameters.
+# Arm link lengths and zero offsets are duplicated here (from
+# arm_params.yaml) so the masking node has zero dependency on
+# the arm_manipulation package.  If you change the physical arm,
+# update BOTH files.
+# ──────────────────────────────────────────────────────────────
+
+arm_lidar_mask:
+  ros__parameters:
+
+    # ── Robot geometry ──────────────────────────────────────────
+    # Rear bubble: any LiDAR return in the rear 180° closer than
+    # this distance is ignored (robot seeing itself + arm envelope).
+    # 23 in = 0.584 m  (chassis + arm tip + 2 in safety buffer)
+    rear_bubble_radius: 0.584
+
+    # LiDAR scan plane height above ground (from URDF: lidar_link z)
+    lidar_scan_height: 0.376
+
+    # LiDAR position in base_link frame (dead center per URDF)
+    lidar_x_offset: 0.0
+    lidar_y_offset: 0.0
+
+    # base_link height above ground (wheel_radius + base_height/2)
+    # = 0.0508 + 0.040 = 0.0908 m
+    base_z_above_ground: 0.0908
+
+    # ── Arm mounting ────────────────────────────────────────────
+    # Position of arm base in base_link frame
+    arm_mount_x: -0.1715   # rear edge (half of 0.343 m chassis length)
+    arm_mount_y:  0.0       # centered widthwise
+    arm_mount_z:  0.040     # chassis top surface in base_link frame
+
+    # True if arm +x axis (pan=0 forward) points toward robot rear.
+    # The SO-ARM101 is mounted at the back facing backward.
+    arm_faces_rear: true
+
+    # ── Arm link lengths (meters) ───────────────────────────────
+    # Mirrors arm_params.yaml values (converted mm → m)
+    shoulder_height: 0.170    # pivot height above arm base
+    l1: 0.115                 # shoulder to elbow
+    l2: 0.1375                # elbow to wrist
+    l3: 0.090                 # wrist to gripper/camera tip
+
+    # ── Arm joint zero offsets ──────────────────────────────────
+    pan_zero_offset_deg:   -4.6
+    elbow_zero_offset_deg:  81.0
+    wrist_zero_offset_deg:   5.0
+
+    # ── Masking tuning ──────────────────────────────────────────
+    # Vertical tolerance: a link within ±this distance of the scan
+    # plane is considered "in the plane" and generates shadow rays.
+    scan_height_tolerance: 0.06
+
+    # Angular padding added to each side of computed shadow regions
+    shadow_padding_deg: 4.0
+
+    # Effective cylindrical radius of arm links (for angular padding)
+    link_radius: 0.025
+
+    # Camera + cable effective radius (wider than bare links)
+    camera_radius: 0.035

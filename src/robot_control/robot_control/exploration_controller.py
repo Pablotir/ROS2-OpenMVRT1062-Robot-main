@@ -49,6 +49,14 @@ import tf2_ros
 import heapq
 import os
 import subprocess
+from .map_manager import (
+    get_maps_base_dir,
+    create_session_directory,
+    save_occupancy_grid,
+    save_session_metadata,
+    request_serialize_posegraph,
+    update_latest_symlink
+)
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 N_SECTORS      = 24            # 360 / 24 = 15° per sector
@@ -110,6 +118,7 @@ class ExplorationController(Node):
         self.declare_parameter('emergency_stop_dist',  0.20)
         self.declare_parameter('robot_radius',         0.27)
         self.declare_parameter('sensor_timeout',       8.0)
+        self.declare_parameter('map_save_dir',         '/root/maps')
 
         self._move_spd   = self.get_parameter('move_speed').value
         self._turn_spd   = self.get_parameter('turn_speed').value
@@ -117,6 +126,7 @@ class ExplorationController(Node):
         self._estop_dist = self.get_parameter('emergency_stop_dist').value
         self._robot_rad  = self.get_parameter('robot_radius').value
         self._timeout    = self.get_parameter('sensor_timeout').value
+        self._map_save_dir = get_maps_base_dir(self.get_parameter('map_save_dir').value)
 
         # ── State ─────────────────────────────────────────────────────────────
         self._latest_scan   = None
@@ -190,7 +200,7 @@ class ExplorationController(Node):
 
         scan_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                               history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.create_subscription(LaserScan, '/scan', self._on_scan, scan_qos)
+        self.create_subscription(LaserScan, '/scan_filtered', self._on_scan, scan_qos)
 
         map_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -1079,71 +1089,58 @@ class ExplorationController(Node):
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _save_map(self):
-        """Save the current map as PGM + YAML and request pose graph serialization."""
-        os.makedirs(MAP_SAVE_DIR, exist_ok=True)
-
+        """Save the current map as PGM + YAML, metadata.json, and request pose graph serialization."""
         m = self._map
         if m is None:
             self.get_logger().warn('No map data available to save')
             return
 
-        w, h = m.info.width, m.info.height
-        res   = m.info.resolution
-        ox    = m.info.origin.position.x
-        oy    = m.info.origin.position.y
+        base_dir = get_maps_base_dir(self._map_save_dir)
+        session_dir = create_session_directory(base_dir)
 
-        # ── Write PGM (P5 binary grayscale) ───────────────────────────────
-        pgm_path = os.path.join(MAP_SAVE_DIR, 'exploration_map.pgm')
+        # ── 1. Save OccupancyGrid as binary PGM (P5) and YAML ─────────────────
         try:
-            with open(pgm_path, 'wb') as f:
-                f.write(f'P5\n{w} {h}\n255\n'.encode())
-                # OccupancyGrid row 0 = bottom of map; PGM row 0 = top → flip
-                for row in range(h - 1, -1, -1):
-                    row_data = bytearray(w)
-                    for col in range(w):
-                        val = m.data[row * w + col]
-                        if val == -1:       # unknown
-                            row_data[col] = 205
-                        elif val == 0:      # free
-                            row_data[col] = 254
-                        else:               # occupied (typically 100)
-                            row_data[col] = 0
-                    f.write(row_data)
-            self.get_logger().info(f'Map image saved: {pgm_path}')
+            pgm_path, yaml_path = save_occupancy_grid(m, session_dir, base_name='exploration_map')
+            self.get_logger().info(f'Map image & YAML saved to: {session_dir}')
         except Exception as e:
-            self.get_logger().error(f'Failed to save PGM: {e}')
+            self.get_logger().error(f'Failed to save PGM/YAML: {e}')
+            pgm_path, yaml_path = '', ''
 
-        # ── Write YAML metadata ───────────────────────────────────────────
-        yaml_path = os.path.join(MAP_SAVE_DIR, 'exploration_map.yaml')
+        # ── 2. Request slam_toolbox pose graph serialization ──────────────────
+        posegraph_prefix = ''
         try:
-            with open(yaml_path, 'w') as f:
-                f.write(f'image: exploration_map.pgm\n')
-                f.write(f'resolution: {res}\n')
-                f.write(f'origin: [{ox}, {oy}, 0.0]\n')
-                f.write(f'negate: 0\n')
-                f.write(f'occupied_thresh: 0.65\n')
-                f.write(f'free_thresh: 0.196\n')
-            self.get_logger().info(f'Map metadata saved: {yaml_path}')
-        except Exception as e:
-            self.get_logger().error(f'Failed to save YAML: {e}')
-
-        # ── Request slam_toolbox pose graph serialization ─────────────────
-        posegraph_path = os.path.join(MAP_SAVE_DIR, 'exploration_posegraph')
-        try:
-            subprocess.Popen([
-                'ros2', 'service', 'call',
-                '/slam_toolbox/serialize_map',
-                'slam_toolbox/srv/SerializePoseGraph',
-                f"{{filename: '{posegraph_path}'}}"
-            ])
-            self.get_logger().info(
-                f'Pose graph serialization requested: {posegraph_path}')
+            posegraph_prefix = request_serialize_posegraph(
+                session_dir,
+                base_name='exploration_posegraph',
+                logger=self.get_logger()
+            )
+            self.get_logger().info(f'Pose graph serialization requested: {posegraph_prefix}')
         except Exception as e:
             self.get_logger().warn(f'Pose graph serialization failed: {e}')
 
+        # ── 3. Save session metadata.json ─────────────────────────────────────
+        meta = {
+            'width': m.info.width,
+            'height': m.info.height,
+            'resolution': m.info.resolution,
+            'origin': [m.info.origin.position.x, m.info.origin.position.y, 0.0],
+            'robot_final_pose': [self._robot_x, self._robot_y, self._robot_yaw],
+            'saved_pgm': os.path.basename(pgm_path) if pgm_path else '',
+            'saved_yaml': os.path.basename(yaml_path) if yaml_path else '',
+            'saved_posegraph': os.path.basename(posegraph_prefix) if posegraph_prefix else ''
+        }
+        try:
+            save_session_metadata(session_dir, meta)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to write session metadata.json: {e}')
+
+        # ── 4. Atomically update latest symlink ───────────────────────────────
+        update_latest_symlink(session_dir, base_dir)
+        self.get_logger().info(f'Active latest map symlink updated -> {session_dir}')
+
         self.get_logger().info(
             '══════════════════════════════════════════════════\n'
-            '  EXPLORATION COMPLETE — MAP SAVED — MOTORS STOPPED\n'
+            f'  EXPLORATION COMPLETE — MAP SAVED ({os.path.basename(session_dir)}) — MOTORS STOPPED\n'
             '══════════════════════════════════════════════════')
 
 

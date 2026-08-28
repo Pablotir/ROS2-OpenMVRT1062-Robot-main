@@ -21,9 +21,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, Command
+from launch.substitutions import LaunchConfiguration, Command, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -38,6 +38,13 @@ def generate_launch_description():
         DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar'),
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
         DeclareLaunchArgument('rviz',               default_value='false'),
+        # SLAM / Lifelong Mapping mode: 'mapping' | 'lifelong' | 'localization'
+        DeclareLaunchArgument('map_mode',           default_value='mapping',
+                              description='SLAM mode: mapping (fresh), lifelong (resume+expand), localization (static)'),
+        DeclareLaunchArgument('maps_dir',           default_value='/root/maps',
+                              description='Directory for saved map sessions and pose graphs'),
+        DeclareLaunchArgument('enable_exploration', default_value='true',
+                              description='Enable autonomous exploration controller'),
         # Motion tuning
         DeclareLaunchArgument('move_speed',          default_value='0.18'),
         DeclareLaunchArgument('turn_speed',          default_value='0.50'),
@@ -119,8 +126,18 @@ def generate_launch_description():
     )
 
     # ── SLAM Toolbox ──────────────────────────────────────────────────────
-    slam_toolbox_pkg  = get_package_share_directory('slam_toolbox')
-    slam_params_file  = os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml')
+    slam_toolbox_pkg    = get_package_share_directory('slam_toolbox')
+    params_mapping      = os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml')
+    params_lifelong     = os.path.join(slam_pkg, 'config', 'mapper_params_lifelong.yaml')
+    params_localization = os.path.join(slam_pkg, 'config', 'mapper_params_localization.yaml')
+
+    # Dynamically select parameter configuration based on map_mode
+    slam_params_file = PythonExpression([
+        "'", params_localization, "' if '", LaunchConfiguration('map_mode'), "' == 'localization' else (",
+        "'", params_lifelong, "' if '", LaunchConfiguration('map_mode'), "' == 'lifelong' else ",
+        "'", params_mapping, "')"
+    ])
+
     slam_toolbox = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(slam_toolbox_pkg, 'launch', 'online_async_launch.py')),
@@ -132,18 +149,44 @@ def generate_launch_description():
         }.items(),
     )
 
+    # ── Arm LiDAR mask ────────────────────────────────────────────────────
+    # Sits between the raw /scan and all downstream consumers.
+    # Filters out arm shadow + rear body bubble → publishes /scan_filtered.
+    arm_mask_params_file = os.path.join(slam_pkg, 'config', 'arm_mask_params.yaml')
+    arm_lidar_mask = Node(
+        package='robot_control',
+        executable='arm_lidar_mask_node',
+        name='arm_lidar_mask',
+        parameters=[arm_mask_params_file],
+        output='screen',
+    )
+
+    # ── Map Manager ───────────────────────────────────────────────────────
+    # Handles session versioning, metadata tracking, and on-demand saves.
+    map_manager = Node(
+        package='robot_control',
+        executable='map_manager',
+        name='map_manager',
+        parameters=[{
+            'maps_dir': LaunchConfiguration('maps_dir'),
+        }],
+        output='screen',
+    )
+
     # ── Exploration controller ─────────────────────────────────────────────
-    # The ONLY node that publishes /cmd_vel.
+    # The ONLY node that publishes /cmd_vel during autonomous mapping.
     # Smooth reactive: steers toward open space, scales speed by clearance.
     exploration_ctrl = Node(
         package='robot_control',
         executable='exploration_controller',
         name='exploration_controller',
+        condition=IfCondition(LaunchConfiguration('enable_exploration')),
         parameters=[{
             'move_speed':          LaunchConfiguration('move_speed'),
             'turn_speed':          LaunchConfiguration('turn_speed'),
             'obstacle_distance':   LaunchConfiguration('obstacle_distance'),
             'emergency_stop_dist': LaunchConfiguration('emergency_stop_dist'),
+            'map_save_dir':        LaunchConfiguration('maps_dir'),
         }],
         output='screen',
     )
@@ -218,8 +261,10 @@ def generate_launch_description():
         roboclaw,           # Dual RoboClaw motor control + encoder reads
         mecanum_odom,       # /odom from encoders
         lidar,              # /scan from STL-27L
-        slam_toolbox,       # /scan + /odom → /map
-        exploration_ctrl,   # /scan → /cmd_vel (only motion publisher)
+        arm_lidar_mask,     # /scan → /scan_filtered (FK arm shadow + rear bubble)
+        map_manager,        # Lifelong map lifecycle & versioning
+        slam_toolbox,       # /scan_filtered + /odom → /map
+        exploration_ctrl,   # /scan_filtered → /cmd_vel (only motion publisher)
         usb_camera,         # opt-in: use_camera:=true
         image_convert,      # opt-in
         vila_labeller,      # opt-in

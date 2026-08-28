@@ -3,11 +3,7 @@
 calibrate_hand_eye.py — SO-ARM101 + RealSense D405 ChArUco Hand-Eye Calibration
 & Live Arm Position / Pose Inspector.
 
-Features:
-1. Live Joint & FK Coordinate Inspector (displays real-time X, Y, Z, rho, and joint angles)
-2. Torque Toggle (disable torque to freely move arm by hand into scan/stow/test poses)
-3. ChArUco Eye-in-Hand Calibration (cv2.calibrateHandEye with Tsai method)
-4. Saves hand_eye_calibration.yaml and updates reference poses
+Cross-version compatible with OpenCV 4.5 through 4.10+.
 """
 
 import cv2
@@ -104,6 +100,51 @@ def get_fk_transform(joints: dict) -> np.ndarray:
 
     return T
 
+def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs):
+    """Robust Charuco board pose estimation working on OpenCV 4.5 through 4.10+."""
+    if charuco_ids is None or len(charuco_ids) < 4:
+        return False, None, None
+
+    # Method 1: OpenCV 4.7+ / 4.8+ / 4.9+ modern API
+    if hasattr(board, "matchImagePoints"):
+        try:
+            obj_points, img_points = board.matchImagePoints(charuco_corners, charuco_ids)
+            if obj_points is not None and len(obj_points) >= 4:
+                success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs)
+                return success, rvec, tvec
+        except Exception:
+            pass
+
+    # Method 2: OpenCV <=4.6 legacy API
+    if hasattr(cv2.aruco, "estimatePoseCharucoBoard"):
+        try:
+            return cv2.aruco.estimatePoseCharucoBoard(
+                charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs, None, None
+            )
+        except Exception:
+            pass
+
+    # Method 3: Direct chessboard corner mapping fallback
+    try:
+        corners = board.getChessboardCorners() if hasattr(board, "getChessboardCorners") else getattr(board, "chessboardCorners", None)
+        if corners is not None:
+            obj_pts = np.array([corners[i[0]] for i in charuco_ids], dtype=np.float32)
+            img_pts = np.array(charuco_corners, dtype=np.float32)
+            if len(obj_pts) >= 4:
+                success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, camera_matrix, dist_coeffs)
+                return success, rvec, tvec
+    except Exception:
+        pass
+
+    return False, None, None
+
+def draw_frame_axes_compat(image, camera_matrix, dist_coeffs, rvec, tvec, length=0.05):
+    """Draw 3D coordinate axes across OpenCV versions."""
+    if hasattr(cv2, "drawFrameAxes"):
+        cv2.drawFrameAxes(image, camera_matrix, dist_coeffs, rvec, tvec, length)
+    elif hasattr(cv2.aruco, "drawAxis"):
+        cv2.aruco.drawAxis(image, camera_matrix, dist_coeffs, rvec, tvec, length)
+
 class D405Camera:
     def __init__(self):
         self.pipeline = rs.pipeline()
@@ -161,7 +202,6 @@ class D405Camera:
 def main():
     params_path = os.path.join(os.path.dirname(__file__), "charuco_board_params.yaml")
     if not os.path.exists(params_path):
-        # Generate default board params if missing
         board_params = {"columns": 5, "rows": 7, "square_size_mm": 30.0, "marker_size_mm": 22.0}
         with open(params_path, "w") as f:
             yaml.dump(board_params, f)
@@ -240,11 +280,12 @@ def main():
 
             if charuco_ids is not None and len(charuco_ids) >= 6:
                 cv2.aruco.drawDetectedCornersCharuco(display_img, charuco_corners, charuco_ids, (0, 255, 0))
-                success, rvec_cam, tvec_cam = cv2.aruco.estimatePoseCharucoBoard(
-                    charuco_corners, charuco_ids, board, cam.camera_matrix, cam.dist_coeffs, None, None
+                
+                success, rvec_cam, tvec_cam = estimate_pose_charuco(
+                    charuco_corners, charuco_ids, board, cam.camera_matrix, cam.dist_coeffs
                 )
                 if success:
-                    cv2.drawFrameAxes(display_img, cam.camera_matrix, cam.dist_coeffs, rvec_cam, tvec_cam, 0.05)
+                    draw_frame_axes_compat(display_img, cam.camera_matrix, cam.dist_coeffs, rvec_cam, tvec_cam, 0.05)
                     can_capture = True
 
             # HUD Overlay
@@ -288,7 +329,6 @@ def main():
                     print(f"⚠️  Torque toggle error: {e}")
 
             elif key == ord('s'):
-                # Note down starting / custom position
                 pose_name = input("\nEnter name for this pose (e.g. scan_base, stow_base, floor_grab): ").strip()
                 if not pose_name:
                     pose_name = f"pose_{len(recorded_poses)+1}"

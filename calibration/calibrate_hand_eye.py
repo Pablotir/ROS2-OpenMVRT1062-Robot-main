@@ -86,11 +86,11 @@ def set_torque(robot, enable: bool) -> bool:
     return False
 
 def forward_kinematics(q: dict) -> np.ndarray:
-    pan  = math.radians(q.get("shoulder_pan.pos", 0.0) - PAN_ZERO_OFFSET_DEG)
+    pan  = math.radians(-q.get("shoulder_pan.pos", 0.0) - PAN_ZERO_OFFSET_DEG)
     lift = q.get("shoulder_lift.pos", 0.0)
     elb  = q.get("elbow_flex.pos",    0.0)
     wst  = q.get("wrist_flex.pos",    0.0)
-    roll = math.radians(q.get("wrist_roll.pos",   0.0))
+    roll = math.radians(-q.get("wrist_roll.pos",   0.0))
 
     t1 = math.radians(90.0 - lift)
     t2 = t1 - math.radians(elb + 81.0)

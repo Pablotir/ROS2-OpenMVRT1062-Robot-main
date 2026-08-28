@@ -36,12 +36,14 @@ def validate_calibration():
     with open(calib_path, 'r') as f:
         calib = yaml.safe_load(f)
         
-    R_cg = np.array(calib['rotation_matrix'])
-    t_cg = np.array(calib['translation_mm']) / 1000.0  # Convert to meters
-    T_cam_gripper = np.eye(4)
-    T_cam_gripper[:3, :3] = R_cg
-    T_cam_gripper[:3, 3] = t_cg.flatten()
-    T_gripper_cam = np.linalg.inv(T_cam_gripper)
+    # R_cam2gripper is Rotation from Camera to Gripper (T_gripper_cam)
+    # t_cam2gripper is Translation from Camera to Gripper in meters
+    R_cam2gripper = np.array(calib['rotation_matrix'])
+    t_cam2gripper = np.array(calib['translation_mm']) / 1000.0  # Convert mm to meters
+    
+    T_gripper_cam = np.eye(4)
+    T_gripper_cam[:3, :3] = R_cam2gripper
+    T_gripper_cam[:3, 3] = t_cam2gripper.flatten()
 
     # Load Board Params
     params_path = os.path.join(os.path.dirname(__file__), "charuco_board_params.yaml")
@@ -63,7 +65,7 @@ def validate_calibration():
     print("\n📷 Connecting to RealSense D405...")
     cam = D405Camera()
     
-    print("🔌 Connecting to SO-ARM101...")
+    print("🔌 Connecting to SO-ARM101 on", PORT, "...")
     robot = None
     torque_enabled = True
     if SOFollower is not None:
@@ -71,7 +73,7 @@ def validate_calibration():
             config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
             robot = SOFollower(config)
             robot.connect()
-            print("   ✅ Robot connected")
+            print("   ✅ Robot connected successfully!")
         except Exception as e:
             print(f"   ⚠️ Robot connect failed: {e}")
 
@@ -112,10 +114,15 @@ def validate_calibration():
 
             key = cv2.waitKey(20) & 0xFF
             
+            # Read live robot telemetry
             joints = get_pos(robot)
             T_base_gripper = get_fk_transform(joints)
             T_base_gripper_m = T_base_gripper.copy()
             T_base_gripper_m[:3, 3] /= 1000.0 # to meters
+
+            x_mm = T_base_gripper[0, 3]
+            y_mm = T_base_gripper[1, 3]
+            z_mm = T_base_gripper[2, 3]
 
             if key == ord('t') and robot:
                 new_state = not torque_enabled
@@ -123,45 +130,60 @@ def validate_calibration():
                     torque_enabled = new_state
                     print(f"🔧 Motor Torque {'ENABLED' if torque_enabled else 'DISABLED (Free-move mode)'}")
 
-            if key == 32 and T_cam_target_actual is not None:  # Space
-                T_base_cam = T_base_gripper_m @ T_gripper_cam
-                T_base_target = T_base_cam @ T_cam_target_actual
-                print("🎯 Board position locked in base frame! Now move the arm to test accuracy.")
+            if key == 32 and T_cam_target_actual is not None:  # Space key
+                # Forward chain: T_base_target = T_base_gripper * T_gripper_cam * T_cam_target
+                T_base_cam_0 = T_base_gripper_m @ T_gripper_cam
+                T_base_target = T_base_cam_0 @ T_cam_target_actual
+                print("🎯 Board reference position locked in base frame! Move arm to test accuracy.")
             
             # HUD Overlay Header
-            cv2.rectangle(display_img, (0, 0), (w, 75), (20, 20, 20), -1)
-            torque_status = "TORQUE: ON" if torque_enabled else "TORQUE: OFF (Free-move)"
-            hud_line1 = f"Status: {'LOCKED (Move Arm)' if T_base_target is not None else 'Press [SPACE] when Board is Visible'} | {torque_status}"
-            cv2.putText(display_img, hud_line1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            cv2.rectangle(display_img, (0, 0), (w, 105), (20, 20, 20), -1)
+            
+            # Line 1: Live Coordinates & Torque
+            torque_status = "TORQUE: ON" if torque_enabled else "TORQUE: OFF (Free-hand)"
+            hud_line1 = f"Arm FK: X={x_mm:5.1f}mm Y={y_mm:5.1f}mm Z={z_mm:5.1f}mm | {torque_status} [t]"
+            cv2.putText(display_img, hud_line1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 255, 200), 1)
 
+            # Line 2: Joints
+            joint_str = (f"Pan:{joints.get('shoulder_pan.pos',0):4.1f}°  "
+                         f"Lift:{joints.get('shoulder_lift.pos',0):4.1f}°  "
+                         f"Elbow:{joints.get('elbow_flex.pos',0):4.1f}°  "
+                         f"Wrist:{joints.get('wrist_flex.pos',0):4.1f}°")
+            cv2.putText(display_img, joint_str, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+
+            # Line 3: Validation Error
             if T_base_target is not None:
-                # Predict cam target
-                T_cam_base = np.linalg.inv(T_base_gripper_m @ T_gripper_cam)
-                T_cam_target_pred = T_cam_base @ T_base_target
+                # Predict where the board should appear in current camera frame
+                # T_cam_target_pred = (T_base_gripper_m * T_gripper_cam)^-1 * T_base_target
+                T_base_cam_k = T_base_gripper_m @ T_gripper_cam
+                T_cam_base_k = np.linalg.inv(T_base_cam_k)
+                T_cam_target_pred = T_cam_base_k @ T_base_target
                 
                 rvec_pred, _ = cv2.Rodrigues(T_cam_target_pred[:3, :3])
                 tvec_pred = T_cam_target_pred[:3, 3]
                 
-                # Project board origin
+                # Project predicted origin onto camera image (Green Circle)
                 imgpts, _ = cv2.projectPoints(np.float32([[0,0,0]]), rvec_pred, tvec_pred, cam.camera_matrix, cam.dist_coeffs)
                 pt = tuple(np.int32(imgpts[0].ravel()))
-                cv2.circle(display_img, pt, 8, (0, 255, 0), -1)  # Green = predicted from FK + calibration
+                if 0 <= pt[0] < w and 0 <= pt[1] < h:
+                    cv2.circle(display_img, pt, 8, (0, 255, 0), -1)  # Green = predicted
                 
                 if T_cam_target_actual is not None:
                     actual_pts, _ = cv2.projectPoints(np.float32([[0,0,0]]), rvec_cam, tvec_cam, cam.camera_matrix, cam.dist_coeffs)
                     actual_pt = tuple(np.int32(actual_pts[0].ravel()))
-                    cv2.circle(display_img, actual_pt, 5, (0, 0, 255), -1)  # Red = actual camera vision
+                    if 0 <= actual_pt[0] < w and 0 <= actual_pt[1] < h:
+                        cv2.circle(display_img, actual_pt, 5, (0, 0, 255), -1)  # Red = actual camera vision
                     
                     dist_mm = np.linalg.norm(T_cam_target_pred[:3, 3] - T_cam_target_actual[:3, 3]) * 1000.0
-                    err_color = (0, 255, 0) if dist_mm < 3.5 else ((0, 165, 255) if dist_mm < 6.0 else (0, 0, 255))
-                    cv2.putText(display_img, f"3D Reprojection Error: {dist_mm:5.2f} mm  (Green=Predicted, Red=Actual)", 
-                                (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.60, err_color, 2)
+                    err_color = (0, 255, 0) if dist_mm < 5.0 else ((0, 165, 255) if dist_mm < 10.0 else (0, 0, 255))
+                    cv2.putText(display_img, f"3D Error: {dist_mm:5.2f} mm (Green=Predicted, Red=Actual)", 
+                                (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.62, err_color, 2)
                 else:
-                    cv2.putText(display_img, "Target Board not currently visible in camera view", (10, 58),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
+                    cv2.putText(display_img, "Target Board not detected (keep board in camera FOV)", 
+                                (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 1)
             else:
-                cv2.putText(display_img, "Press [Space] to lock reference board pose | [t] Toggle Torque | [q] Quit", 
-                            (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
+                cv2.putText(display_img, "Press [SPACE] when board is visible to lock reference position", 
+                            (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
             
             cv2.imshow("Validate Hand-Eye Calibration", display_img)
             

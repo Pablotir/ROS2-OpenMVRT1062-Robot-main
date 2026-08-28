@@ -1,11 +1,8 @@
 ﻿#!/usr/bin/env python3
 """
 calibrate_hand_eye.py — High-Precision ChArUco Hand-Eye Calibration for SO-ARM101 + D405.
-Features:
-- Planar IPPE Pose Estimation (eliminates 180° flip ambiguity)
-- Multi-Algorithm Hand-Eye Solver (tests Tsai, Park, Horaud, Daniilidis & auto-selects lowest error)
-- Outlier filtering & per-pose reprojection verification
-- Live FK & Telemetry HUD
+Uses the exact geometric Forward Kinematics from arm_picker.py with IPPE planar PnP
+and multi-algorithm optimization.
 """
 
 import cv2
@@ -19,6 +16,12 @@ from datetime import datetime
 
 PORT = "/dev/arm_controller"
 ARM_ID = "jetson_arm"
+
+IK_L1 = 115.0 # mm (shoulder -> elbow)
+IK_L2 = 137.5 # mm (elbow -> wrist)
+IK_L3 = 90.0  # mm (wrist -> gripper tip)
+SHOULDER_HEIGHT = 170.0
+PAN_ZERO_OFFSET_DEG = -4.6
 
 try:
     from lerobot.robots.so_follower.so_follower import SOFollower
@@ -82,68 +85,54 @@ def set_torque(robot, enable: bool) -> bool:
         pass
     return False
 
-def get_fk_transform(joints: dict) -> np.ndarray:
-    """Computes Forward Kinematics to get T_base_gripper (4x4 matrix, coordinates in mm)."""
-    shoulder_pan = joints.get("shoulder_pan.pos", 0.0)
-    shoulder_lift = joints.get("shoulder_lift.pos", 0.0)
-    elbow_flex = joints.get("elbow_flex.pos", 0.0)
-    wrist_flex = joints.get("wrist_flex.pos", 0.0)
-    wrist_roll = joints.get("wrist_roll.pos", 0.0)
+def forward_kinematics(q: dict) -> np.ndarray:
+    """
+    Exact 4x4 Forward Kinematics from arm_picker.py: returns T_wrist_base.
+    Wrist frame: X = approach (along link), Y = down/pitch, Z = left.
+    """
+    pan  = math.radians(q.get("shoulder_pan.pos", 0.0) - PAN_ZERO_OFFSET_DEG)
+    lift = q.get("shoulder_lift.pos", 0.0)
+    elb  = q.get("elbow_flex.pos",    0.0)
+    wst  = q.get("wrist_flex.pos",    0.0)
 
-    L1 = 115.0 # mm (shoulder -> elbow)
-    L2 = 137.5 # mm (elbow -> wrist)
-    L3 = 90.0  # mm (wrist -> gripper tip)
-    SHOULDER_HEIGHT = 170.0
-    PAN_ZERO_OFFSET_DEG = -4.6
+    t1 = math.radians(90.0 - lift)
+    t2 = t1 - math.radians(elb + 81.0)
+    t3 = t2 - math.radians(wst + 5.0)
 
-    pan_rad = math.radians(shoulder_pan + PAN_ZERO_OFFSET_DEG)
-    t1 = math.radians(90.0 - shoulder_lift)
-    t2 = t1 - math.radians(elbow_flex + 81.0)
-    t3 = t2 - math.radians(wrist_flex + 5.0)
+    rho_w = IK_L1 * math.cos(t1) + IK_L2 * math.cos(t2)
+    z_w   = IK_L1 * math.sin(t1) + IK_L2 * math.sin(t2)
 
-    wx = L1 * math.cos(t1) + L2 * math.cos(t2)
-    wz = L1 * math.sin(t1) + L2 * math.sin(t2)
-    
-    gx = wx + L3 * math.cos(t3)
-    gz = wz + L3 * math.sin(t3)
+    wx = rho_w * math.cos(pan)
+    wy = rho_w * math.sin(pan)
+    wz = z_w
 
-    x = gx * math.cos(pan_rad)
-    y = gx * math.sin(pan_rad)
-    z = gz
+    # Approach direction (Wrist X)
+    ax = math.cos(t3) * math.cos(pan)
+    ay = math.cos(t3) * math.sin(pan)
+    az = math.sin(t3)
 
-    R_pan = np.array([
-        [math.cos(pan_rad), -math.sin(pan_rad), 0],
-        [math.sin(pan_rad),  math.cos(pan_rad), 0],
-        [0, 0, 1]
+    # Perpendicular direction (Wrist Z)
+    zx = -math.sin(pan)
+    zy =  math.cos(pan)
+    zz = 0.0
+
+    # Wrist Y = Z cross X
+    yx = zy * az - zz * ay
+    yy = zz * ax - zx * az
+    yz = zx * ay - zy * ax
+
+    T = np.array([
+        [ax, yx, zx, wx],
+        [ay, yy, zy, wy],
+        [az, yz, zz, wz],
+        [0., 0., 0., 1.],
     ])
-    
-    R_pitch = np.array([
-        [math.cos(t3), 0, math.sin(t3)],
-        [0, 1, 0],
-        [-math.sin(t3), 0, math.cos(t3)]
-    ])
-
-    roll_rad = math.radians(wrist_roll)
-    R_roll = np.array([
-        [1, 0, 0],
-        [0, math.cos(roll_rad), -math.sin(roll_rad)],
-        [0, math.sin(roll_rad),  math.cos(roll_rad)]
-    ])
-    
-    R = R_pan @ R_pitch @ R_roll
-
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = [x, y, z]
-
     return T
 
 def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs):
-    """High-precision planar Charuco pose estimation using IPPE."""
     if charuco_ids is None or len(charuco_ids) < 4:
         return False, None, None
 
-    # Get 3D object points and 2D image points
     obj_points, img_points = None, None
     if hasattr(board, "matchImagePoints"):
         try:
@@ -161,7 +150,6 @@ def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, di
             pass
 
     if obj_points is not None and len(obj_points) >= 4:
-        # Use SOLVEPNP_IPPE for planar targets (prevents flip ambiguity)
         try:
             flag = getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)
             success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs, flags=flag)
@@ -234,7 +222,6 @@ class D405Camera:
             pass
 
 def evaluate_calibration_error(R_gripper2base, t_gripper2base, R_target2cam, t_target2cam, R_cam2gripper, t_cam2gripper):
-    """Computes the root-mean-square 3D transformation consistency error across all poses."""
     T_gc = np.eye(4)
     T_gc[:3, :3] = R_cam2gripper
     T_gc[:3, 3] = t_cam2gripper.flatten()
@@ -249,12 +236,10 @@ def evaluate_calibration_error(R_gripper2base, t_gripper2base, R_target2cam, t_t
         T_ct[:3, :3] = R_target2cam[i]
         T_ct[:3, 3] = t_target2cam[i].flatten()
 
-        # Board in Base: T_bt = T_bg * T_gc * T_ct
         T_bt = T_bg @ T_gc @ T_ct
         target_positions_base.append(T_bt[:3, 3])
 
     target_positions_base = np.array(target_positions_base)
-    # Mean position of board in base frame
     mean_target = np.mean(target_positions_base, axis=0)
     errors_mm = np.linalg.norm(target_positions_base - mean_target, axis=1) * 1000.0
     return float(np.mean(errors_mm)), errors_mm
@@ -262,7 +247,7 @@ def evaluate_calibration_error(R_gripper2base, t_gripper2base, R_target2cam, t_t
 def main():
     params_path = os.path.join(os.path.dirname(__file__), "charuco_board_params.yaml")
     if not os.path.exists(params_path):
-        board_params = {"columns": 5, "rows": 7, "square_size_mm": 30.0, "marker_size_mm": 22.0}
+        board_params = {"columns": 5, "rows": 7, "square_size_mm": 35.0, "marker_size_mm": 25.0}
         with open(params_path, "w") as f:
             yaml.dump(board_params, f)
     else:
@@ -297,23 +282,19 @@ def main():
     t_gripper2base = []
     R_target2cam = []
     t_target2cam = []
-    pose_telemetry = []
     
     recorded_poses = {}
     pose_count = 0
 
     print("\n" + "═"*65)
-    print(" SO-ARM101 HIGH-PRECISION CALIBRATION & INSPECTOR")
+    print(" SO-ARM101 HIGH-PRECISION CALIBRATION")
     print("═"*65)
-    print(" Important Guidelines for Sub-Millimeter Accuracy:")
-    print("   1. Check your printed board square size is 30mm with a ruler.")
-    print("   2. Capture ~15 poses with diverse heights, tilts, and yaw angles.")
-    print("   3. Keep arm still when pressing [Enter].")
+    print(f" Board specs: {board_params['columns']}x{board_params['rows']} grid | Square: {board_params['square_size_mm']}mm | Marker: {board_params['marker_size_mm']}mm")
     print(" Controls:")
     print("   [Enter]  Capture pose for calibration (when green axes visible)")
     print("   [s]      Save named reference pose")
     print("   [t]      Toggle arm TORQUE ON / OFF")
-    print("   [c]      Compute Multi-Algorithm Calibration (finds lowest error)")
+    print("   [c]      Compute Multi-Algorithm Calibration")
     print("   [q]      Quit")
     print("═"*65 + "\n")
     
@@ -325,11 +306,11 @@ def main():
                 continue
                 
             joints = get_pos(robot)
-            T_base_gripper = get_fk_transform(joints)
+            T_base_wrist = forward_kinematics(joints)
             
-            x_mm = T_base_gripper[0, 3]
-            y_mm = T_base_gripper[1, 3]
-            z_mm = T_base_gripper[2, 3]
+            x_mm = T_base_wrist[0, 3]
+            y_mm = T_base_wrist[1, 3]
+            z_mm = T_base_wrist[2, 3]
             rho_mm = math.sqrt(x_mm**2 + y_mm**2)
 
             display_img = color_img.copy()
@@ -355,26 +336,25 @@ def main():
             cv2.rectangle(display_img, (0, 0), (w, 135), (20, 20, 20), -1)
 
             # Line 1: Live Coordinates
-            coord_str = f"FK: X={x_mm:5.1f}mm  Y={y_mm:5.1f}mm  Z={z_mm:5.1f}mm | Reach: {rho_mm:5.1f}mm"
+            coord_str = f"Wrist FK: X={x_mm:5.1f}mm  Y={y_mm:5.1f}mm  Z={z_mm:5.1f}mm | Reach: {rho_mm:5.1f}mm"
             cv2.putText(display_img, coord_str, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
             # Line 2: Joint Angles
             joint_str = (f"Pan:{joints.get('shoulder_pan.pos',0):4.1f}° "
                          f"Lift:{joints.get('shoulder_lift.pos',0):4.1f}° "
                          f"Elbow:{joints.get('elbow_flex.pos',0):4.1f}° "
-                         f"Wrist:{joints.get('wrist_flex.pos',0):4.1f}° "
-                         f"Roll:{joints.get('wrist_roll.pos',0):4.1f}°")
+                         f"Wrist:{joints.get('wrist_flex.pos',0):4.1f}°")
             cv2.putText(display_img, joint_str, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 255, 200), 1)
 
             # Line 3: Calibration status
             status_color = (0, 255, 0) if can_capture else (0, 0, 255)
-            status_str = f"Board: {'DETECTED (Ready to capture)' if can_capture else 'NOT DETECTED'} | Captured Poses: {pose_count}/15"
+            status_str = f"Board: {'DETECTED (Ready)' if can_capture else 'NOT DETECTED'} | Poses: {pose_count}/15"
             cv2.putText(display_img, status_str, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, status_color, 1)
 
             torque_str = f"Torque: {'ON' if torque_enabled else 'OFF (Free-move)'} [t] | Capture [Enter] | Calibrate [c] | Quit [q]"
             cv2.putText(display_img, torque_str, (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 100), 1)
 
-            cv2.imshow("SO-ARM101 ChArUco Calibration & Inspector", display_img)
+            cv2.imshow("SO-ARM101 ChArUco Calibration", display_img)
             key = cv2.waitKey(20) & 0xFF
             
             if key == ord('q'):
@@ -402,11 +382,11 @@ def main():
                 print(f"✅ Saved pose '{pose_name}' to {poses_file}")
 
             elif key == 13 and can_capture:  # Enter key
-                T_base_gripper_m = T_base_gripper.copy()
-                T_base_gripper_m[:3, 3] /= 1000.0 # to meters
+                T_base_wrist_m = T_base_wrist.copy()
+                T_base_wrist_m[:3, 3] /= 1000.0 # to meters
                 
-                R_gb = T_base_gripper_m[:3, :3]
-                t_gb = T_base_gripper_m[:3, 3]
+                R_gb = T_base_wrist_m[:3, :3]
+                t_gb = T_base_wrist_m[:3, 3]
                 
                 R_gripper2base.append(R_gb)
                 t_gripper2base.append(t_gb)
@@ -416,11 +396,10 @@ def main():
                 
                 R_target2cam.append(R_tc)
                 t_target2cam.append(t_tc)
-                pose_telemetry.append((joints, (x_mm, y_mm, z_mm)))
                 
                 pose_count += 1
                 cam_dist_mm = np.linalg.norm(t_tc) * 1000.0
-                print(f"📸 Captured pose #{pose_count:2d} | Arm FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f} | Cam Dist: {cam_dist_mm:4.0f}mm")
+                print(f"📸 Captured pose #{pose_count:2d} | Wrist FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f} | Cam Dist: {cam_dist_mm:4.0f}mm")
 
             elif key == ord('c'):
                 if pose_count < 5:
@@ -440,7 +419,6 @@ def main():
                 best_error = float("inf")
                 best_R = None
                 best_t = None
-                best_per_pose_errors = None
 
                 for name, flag in methods.items():
                     try:
@@ -460,7 +438,6 @@ def main():
                             best_method = name
                             best_R = R_cg
                             best_t = t_cg
-                            best_per_pose_errors = per_pose_err
                     except Exception as e:
                         print(f"   • {name:28s}: Failed ({e})")
 
@@ -481,7 +458,7 @@ def main():
                     
                 print(f"✅ Calibration saved to: {out_path}")
                 print(f"   Translation (mm): X={best_t[0,0]*1000:.2f}, Y={best_t[1,0]*1000:.2f}, Z={best_t[2,0]*1000:.2f}")
-                print("Now run 'python3 validate_calibration.py' to verify live on screen!")
+                print("\nNow run 'python3 validate_calibration.py' to verify live tracking!")
                 break
 
     finally:

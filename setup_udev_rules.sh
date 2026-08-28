@@ -37,11 +37,13 @@ SUBSYSTEM=="tty", KERNELS=="1-2.2", SYMLINK+="roboclaw_right", MODE="0666"
 
 # ============================================================
 # SO-ARM101 Servo Motor Controller
-# TO FILL IN once arm is connected — run:
-#   udevadm info -a -n /dev/ttyACM2 | grep 'KERNELS'
-# Then replace FILL_IN_ARM_PORT below with the port (e.g. 1-2.3)
+# If your arm adapter uses CH340 (idVendor=1a86, idProduct=7523):
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="arm_controller", MODE="0666"
+# Or if matched by physical USB port:
+# Run: udevadm info -a -n /dev/ttyACM0 (or /dev/ttyUSB0) | grep -m 1 'KERNELS=="'
+# And set KERNELS=="..." below:
 # ============================================================
-# SUBSYSTEM=="tty", KERNELS=="FILL_IN_ARM_PORT", SYMLINK+="arm_controller", MODE="0666"
+# SUBSYSTEM=="tty", KERNELS=="1-2.3", SYMLINK+="arm_controller", MODE="0666"
 
 # NOTE: Arduino Mega mapping REMOVED — retired, replaced by RoboClaws.
 EOF
@@ -51,5 +53,6 @@ udevadm control --reload-rules
 udevadm trigger
 
 echo ""
-echo "Done! Verify with:"
-echo "  ls -la /dev/roboclaw_left /dev/roboclaw_right /dev/lidar"
+echo "Done! Verify existing devices with:"
+echo "  ls -la /dev/roboclaw_left /dev/roboclaw_right /dev/lidar /dev/arm_controller 2>/dev/null"
+

@@ -114,7 +114,7 @@ class ArmKinematics:
 
         # 1. Compute pan
         pan_rad = math.atan2(y, x)
-        pan_deg = math.degrees(pan_rad) - self.pan_zero_offset_deg
+        pan_deg = -(math.degrees(pan_rad) - self.pan_zero_offset_deg)
         
         if pan_deg < self.limits['shoulder_pan']['min'] or pan_deg > self.limits['shoulder_pan']['max']:
             return None

@@ -86,14 +86,11 @@ def set_torque(robot, enable: bool) -> bool:
     return False
 
 def forward_kinematics(q: dict) -> np.ndarray:
-    """
-    Exact 4x4 Forward Kinematics from arm_picker.py: returns T_wrist_base.
-    Wrist frame: X = approach (along link), Y = down/pitch, Z = left.
-    """
     pan  = math.radians(q.get("shoulder_pan.pos", 0.0) - PAN_ZERO_OFFSET_DEG)
     lift = q.get("shoulder_lift.pos", 0.0)
     elb  = q.get("elbow_flex.pos",    0.0)
     wst  = q.get("wrist_flex.pos",    0.0)
+    roll = math.radians(q.get("wrist_roll.pos",   0.0))
 
     t1 = math.radians(90.0 - lift)
     t2 = t1 - math.radians(elb + 81.0)
@@ -120,11 +117,26 @@ def forward_kinematics(q: dict) -> np.ndarray:
     yx = zy * az - zz * ay
     yy = zz * ax - zx * az
     yz = zx * ay - zy * ax
+    
+    R_base = np.array([
+        [ax, yx, zx],
+        [ay, yy, zy],
+        [az, yz, zz]
+    ])
+    
+    # Apply wrist roll around Wrist X axis
+    R_roll = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, math.cos(roll), -math.sin(roll)],
+        [0.0, math.sin(roll),  math.cos(roll)]
+    ])
+    
+    R_final = R_base @ R_roll
 
     T = np.array([
-        [ax, yx, zx, wx],
-        [ay, yy, zy, wy],
-        [az, yz, zz, wz],
+        [R_final[0,0], R_final[0,1], R_final[0,2], wx],
+        [R_final[1,0], R_final[1,1], R_final[1,2], wy],
+        [R_final[2,0], R_final[2,1], R_final[2,2], wz],
         [0., 0., 0., 1.],
     ])
     return T

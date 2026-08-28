@@ -1,0 +1,6 @@
+board_type: charuco
+columns: 5
+dictionary: DICT_4X4_50
+marker_size_mm: 22.0
+rows: 7
+square_size_mm: 30.0

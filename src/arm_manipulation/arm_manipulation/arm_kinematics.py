@@ -58,7 +58,7 @@ class ArmKinematics:
         wrist = joints.get('wrist_flex', joints.get('wrist_flex.pos', 0.0))
 
         # Forward kinematics equations
-        pan_rad = math.radians(pan + self.pan_zero_offset_deg)
+        pan_rad = math.radians(-pan + self.pan_zero_offset_deg)
         t1 = math.radians(90.0 - lift)
         t2 = t1 - math.radians(elbow + 81.0)  # 81.0 is elbow zero offset
         t3 = t2 - math.radians(wrist + 5.0)   # 5.0 is wrist zero offset

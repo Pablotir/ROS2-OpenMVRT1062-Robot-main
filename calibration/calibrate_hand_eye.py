@@ -3,7 +3,7 @@
 calibrate_hand_eye.py — SO-ARM101 + RealSense D405 ChArUco Hand-Eye Calibration
 & Live Arm Position / Pose Inspector.
 
-Cross-version compatible with OpenCV 4.5 through 4.10+.
+Cross-version compatible with OpenCV 4.5 through 4.10+ and all LeRobot bus versions.
 """
 
 import cv2
@@ -41,6 +41,59 @@ def get_pos(robot) -> dict:
               "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
     return {k: float(v) for k, v in obs.items() if k in joints}
 
+def set_torque(robot, enable: bool) -> bool:
+    """Safely enable/disable torque across all LeRobot bus versions."""
+    if robot is None or not hasattr(robot, "bus"):
+        return False
+    val = 1 if enable else 0
+    motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex",
+                   "wrist_flex", "wrist_roll", "gripper"]
+
+    # 1. Native methods
+    try:
+        if enable and hasattr(robot.bus, "enable_torque"):
+            robot.bus.enable_torque()
+            return True
+        elif not enable and hasattr(robot.bus, "disable_torque"):
+            robot.bus.disable_torque()
+            return True
+    except Exception:
+        pass
+
+    # 2. write(data_name, value, motor_names)
+    try:
+        robot.bus.write("Torque_Enable", val, motor_names)
+        return True
+    except Exception:
+        pass
+
+    # 3. write(data_name, list_values, motor_names)
+    try:
+        robot.bus.write("Torque_Enable", [val] * len(motor_names), motor_names)
+        return True
+    except Exception:
+        pass
+
+    # 4. write(data_name, motor_names, value)
+    try:
+        robot.bus.write("Torque_Enable", motor_names, val)
+        return True
+    except Exception:
+        pass
+
+    # 5. per-motor write
+    try:
+        for m in motor_names:
+            try:
+                robot.bus.write("Torque_Enable", val, [m])
+            except Exception:
+                robot.bus.write("Torque_Enable", [m], val)
+        return True
+    except Exception:
+        pass
+
+    return False
+
 def get_fk_transform(joints: dict) -> np.ndarray:
     """
     Computes Forward Kinematics to get T_gripper_base (4x4 matrix, coordinates in mm).
@@ -68,7 +121,6 @@ def get_fk_transform(joints: dict) -> np.ndarray:
     gx = wx + L3 * math.cos(t3)
     gz = wz + L3 * math.sin(t3)
 
-    # Base frame coordinates (origin = shoulder pivot)
     x = gx * math.cos(pan_rad)
     y = gx * math.sin(pan_rad)
     z = gz # relative to shoulder
@@ -105,7 +157,6 @@ def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, di
     if charuco_ids is None or len(charuco_ids) < 4:
         return False, None, None
 
-    # Method 1: OpenCV 4.7+ / 4.8+ / 4.9+ modern API
     if hasattr(board, "matchImagePoints"):
         try:
             obj_points, img_points = board.matchImagePoints(charuco_corners, charuco_ids)
@@ -115,7 +166,6 @@ def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, di
         except Exception:
             pass
 
-    # Method 2: OpenCV <=4.6 legacy API
     if hasattr(cv2.aruco, "estimatePoseCharucoBoard"):
         try:
             return cv2.aruco.estimatePoseCharucoBoard(
@@ -124,7 +174,6 @@ def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, di
         except Exception:
             pass
 
-    # Method 3: Direct chessboard corner mapping fallback
     try:
         corners = board.getChessboardCorners() if hasattr(board, "getChessboardCorners") else getattr(board, "chessboardCorners", None)
         if corners is not None:
@@ -320,13 +369,12 @@ def main():
                 break
 
             elif key == ord('t') and robot:
-                torque_enabled = not torque_enabled
-                try:
-                    val = 1 if torque_enabled else 0
-                    robot.bus.write("Torque_Enable", [val]*6)
+                new_state = not torque_enabled
+                if set_torque(robot, new_state):
+                    torque_enabled = new_state
                     print(f"🔧 Motor Torque {'ENABLED' if torque_enabled else 'DISABLED (Free-move mode)'}")
-                except Exception as e:
-                    print(f"⚠️  Torque toggle error: {e}")
+                else:
+                    print("⚠️  Could not change torque state.")
 
             elif key == ord('s'):
                 pose_name = input("\nEnter name for this pose (e.g. scan_base, stow_base, floor_grab): ").strip()
@@ -394,6 +442,7 @@ def main():
         cam.stop()
         cv2.destroyAllWindows()
         if robot:
+            set_torque(robot, True) # restore torque
             robot.disconnect()
 
 if __name__ == "__main__":

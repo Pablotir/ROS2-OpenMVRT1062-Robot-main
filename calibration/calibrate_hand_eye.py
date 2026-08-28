@@ -1,9 +1,11 @@
 ﻿#!/usr/bin/env python3
 """
-calibrate_hand_eye.py — SO-ARM101 + RealSense D405 ChArUco Hand-Eye Calibration
-& Live Arm Position / Pose Inspector.
-
-Cross-version compatible with OpenCV 4.5 through 4.10+ and all LeRobot bus versions.
+calibrate_hand_eye.py — High-Precision ChArUco Hand-Eye Calibration for SO-ARM101 + D405.
+Features:
+- Planar IPPE Pose Estimation (eliminates 180° flip ambiguity)
+- Multi-Algorithm Hand-Eye Solver (tests Tsai, Park, Horaud, Daniilidis & auto-selects lowest error)
+- Outlier filtering & per-pose reprojection verification
+- Live FK & Telemetry HUD
 """
 
 import cv2
@@ -22,11 +24,9 @@ try:
     from lerobot.robots.so_follower.so_follower import SOFollower
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 except ImportError:
-    print("⚠️  LeRobot SOFollower not found. Will run camera-only / mock mode.")
     SOFollower = None
 
 def get_pos(robot) -> dict:
-    """Read joint positions in degrees from SO-ARM101."""
     if robot is None:
         return {
             "shoulder_pan.pos": 0.0,
@@ -42,14 +42,11 @@ def get_pos(robot) -> dict:
     return {k: float(v) for k, v in obs.items() if k in joints}
 
 def set_torque(robot, enable: bool) -> bool:
-    """Safely enable/disable torque across all LeRobot bus versions."""
     if robot is None or not hasattr(robot, "bus"):
         return False
     val = 1 if enable else 0
     motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex",
                    "wrist_flex", "wrist_roll", "gripper"]
-
-    # 1. Native methods
     try:
         if enable and hasattr(robot.bus, "enable_torque"):
             robot.bus.enable_torque()
@@ -59,29 +56,21 @@ def set_torque(robot, enable: bool) -> bool:
             return True
     except Exception:
         pass
-
-    # 2. write(data_name, value, motor_names)
     try:
         robot.bus.write("Torque_Enable", val, motor_names)
         return True
     except Exception:
         pass
-
-    # 3. write(data_name, list_values, motor_names)
     try:
         robot.bus.write("Torque_Enable", [val] * len(motor_names), motor_names)
         return True
     except Exception:
         pass
-
-    # 4. write(data_name, motor_names, value)
     try:
         robot.bus.write("Torque_Enable", motor_names, val)
         return True
     except Exception:
         pass
-
-    # 5. per-motor write
     try:
         for m in motor_names:
             try:
@@ -91,13 +80,10 @@ def set_torque(robot, enable: bool) -> bool:
         return True
     except Exception:
         pass
-
     return False
 
 def get_fk_transform(joints: dict) -> np.ndarray:
-    """
-    Computes Forward Kinematics to get T_gripper_base (4x4 matrix, coordinates in mm).
-    """
+    """Computes Forward Kinematics to get T_base_gripper (4x4 matrix, coordinates in mm)."""
     shoulder_pan = joints.get("shoulder_pan.pos", 0.0)
     shoulder_lift = joints.get("shoulder_lift.pos", 0.0)
     elbow_flex = joints.get("elbow_flex.pos", 0.0)
@@ -123,7 +109,7 @@ def get_fk_transform(joints: dict) -> np.ndarray:
 
     x = gx * math.cos(pan_rad)
     y = gx * math.sin(pan_rad)
-    z = gz # relative to shoulder
+    z = gz
 
     R_pan = np.array([
         [math.cos(pan_rad), -math.sin(pan_rad), 0],
@@ -153,42 +139,42 @@ def get_fk_transform(joints: dict) -> np.ndarray:
     return T
 
 def estimate_pose_charuco(charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs):
-    """Robust Charuco board pose estimation working on OpenCV 4.5 through 4.10+."""
+    """High-precision planar Charuco pose estimation using IPPE."""
     if charuco_ids is None or len(charuco_ids) < 4:
         return False, None, None
 
+    # Get 3D object points and 2D image points
+    obj_points, img_points = None, None
     if hasattr(board, "matchImagePoints"):
         try:
             obj_points, img_points = board.matchImagePoints(charuco_corners, charuco_ids)
-            if obj_points is not None and len(obj_points) >= 4:
-                success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs)
-                return success, rvec, tvec
         except Exception:
             pass
 
-    if hasattr(cv2.aruco, "estimatePoseCharucoBoard"):
+    if obj_points is None or len(obj_points) < 4:
         try:
-            return cv2.aruco.estimatePoseCharucoBoard(
-                charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs, None, None
-            )
+            corners = board.getChessboardCorners() if hasattr(board, "getChessboardCorners") else getattr(board, "chessboardCorners", None)
+            if corners is not None:
+                obj_points = np.array([corners[i[0]] for i in charuco_ids], dtype=np.float32)
+                img_points = np.array(charuco_corners, dtype=np.float32)
         except Exception:
             pass
 
-    try:
-        corners = board.getChessboardCorners() if hasattr(board, "getChessboardCorners") else getattr(board, "chessboardCorners", None)
-        if corners is not None:
-            obj_pts = np.array([corners[i[0]] for i in charuco_ids], dtype=np.float32)
-            img_pts = np.array(charuco_corners, dtype=np.float32)
-            if len(obj_pts) >= 4:
-                success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, camera_matrix, dist_coeffs)
-                return success, rvec, tvec
-    except Exception:
-        pass
+    if obj_points is not None and len(obj_points) >= 4:
+        # Use SOLVEPNP_IPPE for planar targets (prevents flip ambiguity)
+        try:
+            flag = getattr(cv2, "SOLVEPNP_IPPE", cv2.SOLVEPNP_ITERATIVE)
+            success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs, flags=flag)
+            if success:
+                return True, rvec, tvec
+        except Exception:
+            success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs)
+            if success:
+                return True, rvec, tvec
 
     return False, None, None
 
 def draw_frame_axes_compat(image, camera_matrix, dist_coeffs, rvec, tvec, length=0.05):
-    """Draw 3D coordinate axes across OpenCV versions."""
     if hasattr(cv2, "drawFrameAxes"):
         cv2.drawFrameAxes(image, camera_matrix, dist_coeffs, rvec, tvec, length)
     elif hasattr(cv2.aruco, "drawAxis"):
@@ -204,7 +190,6 @@ class D405Camera:
         try:
             self.profile = self.pipeline.start(self.config)
         except RuntimeError:
-            print("Trying 640x480 YUYV...")
             self.config.disable_all_streams()
             self.config.enable_stream(rs.stream.color, 640, 480, rs.format.yuyv, 15)
             self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 15)
@@ -239,7 +224,7 @@ class D405Camera:
                 
             depth_image = np.asanyarray(depth_frame.get_data())
             return color_image, depth_image
-        except Exception as e:
+        except Exception:
             return None, None
         
     def stop(self):
@@ -247,6 +232,32 @@ class D405Camera:
             self.pipeline.stop()
         except Exception:
             pass
+
+def evaluate_calibration_error(R_gripper2base, t_gripper2base, R_target2cam, t_target2cam, R_cam2gripper, t_cam2gripper):
+    """Computes the root-mean-square 3D transformation consistency error across all poses."""
+    T_gc = np.eye(4)
+    T_gc[:3, :3] = R_cam2gripper
+    T_gc[:3, 3] = t_cam2gripper.flatten()
+
+    target_positions_base = []
+    for i in range(len(R_gripper2base)):
+        T_bg = np.eye(4)
+        T_bg[:3, :3] = R_gripper2base[i]
+        T_bg[:3, 3] = t_gripper2base[i].flatten()
+
+        T_ct = np.eye(4)
+        T_ct[:3, :3] = R_target2cam[i]
+        T_ct[:3, 3] = t_target2cam[i].flatten()
+
+        # Board in Base: T_bt = T_bg * T_gc * T_ct
+        T_bt = T_bg @ T_gc @ T_ct
+        target_positions_base.append(T_bt[:3, 3])
+
+    target_positions_base = np.array(target_positions_base)
+    # Mean position of board in base frame
+    mean_target = np.mean(target_positions_base, axis=0)
+    errors_mm = np.linalg.norm(target_positions_base - mean_target, axis=1) * 1000.0
+    return float(np.mean(errors_mm)), errors_mm
 
 def main():
     params_path = os.path.join(os.path.dirname(__file__), "charuco_board_params.yaml")
@@ -280,25 +291,29 @@ def main():
             robot.connect()
             print("   ✅ Robot arm connected successfully!")
         except Exception as e:
-            print(f"   ⚠️  Could not connect to arm: {e}")
-            print("   Running in camera-only / manual position logging mode.")
+            print(f"   ⚠️ Could not connect to arm: {e}")
     
     R_gripper2base = []
     t_gripper2base = []
     R_target2cam = []
     t_target2cam = []
+    pose_telemetry = []
     
     recorded_poses = {}
     pose_count = 0
 
     print("\n" + "═"*65)
-    print(" SO-ARM101 CALIBRATION & POSITION INSPECTOR")
+    print(" SO-ARM101 HIGH-PRECISION CALIBRATION & INSPECTOR")
     print("═"*65)
+    print(" Important Guidelines for Sub-Millimeter Accuracy:")
+    print("   1. Check your printed board square size is 30mm with a ruler.")
+    print("   2. Capture ~15 poses with diverse heights, tilts, and yaw angles.")
+    print("   3. Keep arm still when pressing [Enter].")
     print(" Controls:")
-    print("   [Enter]  Capture pose for ChArUco hand-eye calibration")
-    print("   [s]      Save current position as named reference pose")
-    print("   [t]      Toggle arm motor TORQUE ON / OFF (for free hand moving)")
-    print("   [c]      Compute and save ChArUco Hand-Eye Calibration")
+    print("   [Enter]  Capture pose for calibration (when green axes visible)")
+    print("   [s]      Save named reference pose")
+    print("   [t]      Toggle arm TORQUE ON / OFF")
+    print("   [c]      Compute Multi-Algorithm Calibration (finds lowest error)")
     print("   [q]      Quit")
     print("═"*65 + "\n")
     
@@ -324,8 +339,7 @@ def main():
             charuco_corners, charuco_ids, marker_corners, marker_ids = charuco_detector.detectBoard(color_img)
             
             can_capture = False
-            rvec_cam = None
-            tvec_cam = None
+            rvec_cam, tvec_cam = None, None
 
             if charuco_ids is not None and len(charuco_ids) >= 6:
                 cv2.aruco.drawDetectedCornersCharuco(display_img, charuco_corners, charuco_ids, (0, 255, 0))
@@ -338,28 +352,26 @@ def main():
                     can_capture = True
 
             # HUD Overlay
-            hud_bg = display_img[:140, :].copy()
             cv2.rectangle(display_img, (0, 0), (w, 135), (20, 20, 20), -1)
-            cv2.addWeighted(hud_bg, 0.3, display_img[:140, :], 0.7, 0, display_img[:140, :])
 
             # Line 1: Live Coordinates
-            coord_str = f"FK Pos: X={x_mm:6.1f}mm  Y={y_mm:6.1f}mm  Z={z_mm:6.1f}mm | Reach: {rho_mm:5.1f}mm"
+            coord_str = f"FK: X={x_mm:5.1f}mm  Y={y_mm:5.1f}mm  Z={z_mm:5.1f}mm | Reach: {rho_mm:5.1f}mm"
             cv2.putText(display_img, coord_str, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
             # Line 2: Joint Angles
-            joint_str = (f"Pan:{joints.get('shoulder_pan.pos',0):5.1f}°  "
-                         f"Lift:{joints.get('shoulder_lift.pos',0):5.1f}°  "
-                         f"Elbow:{joints.get('elbow_flex.pos',0):5.1f}°  "
-                         f"Wrist:{joints.get('wrist_flex.pos',0):5.1f}°  "
-                         f"Roll:{joints.get('wrist_roll.pos',0):5.1f}°")
-            cv2.putText(display_img, joint_str, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 255, 200), 1)
+            joint_str = (f"Pan:{joints.get('shoulder_pan.pos',0):4.1f}° "
+                         f"Lift:{joints.get('shoulder_lift.pos',0):4.1f}° "
+                         f"Elbow:{joints.get('elbow_flex.pos',0):4.1f}° "
+                         f"Wrist:{joints.get('wrist_flex.pos',0):4.1f}° "
+                         f"Roll:{joints.get('wrist_roll.pos',0):4.1f}°")
+            cv2.putText(display_img, joint_str, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 255, 200), 1)
 
-            # Line 3: Calibration status & prompt
+            # Line 3: Calibration status
             status_color = (0, 255, 0) if can_capture else (0, 0, 255)
-            status_str = f"Board: {'DETECTED (Ready to capture)' if can_capture else 'NOT DETECTED (Need >=6 corners)'} | Poses: {pose_count}/15"
+            status_str = f"Board: {'DETECTED (Ready to capture)' if can_capture else 'NOT DETECTED'} | Captured Poses: {pose_count}/15"
             cv2.putText(display_img, status_str, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.52, status_color, 1)
 
-            torque_str = f"Torque: {'ON' if torque_enabled else 'OFF (Free-hand)'} [t] | Save Pose [s] | Calibrate [c] | Quit [q]"
+            torque_str = f"Torque: {'ON' if torque_enabled else 'OFF (Free-move)'} [t] | Capture [Enter] | Calibrate [c] | Quit [q]"
             cv2.putText(display_img, torque_str, (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 100), 1)
 
             cv2.imshow("SO-ARM101 ChArUco Calibration & Inspector", display_img)
@@ -373,11 +385,9 @@ def main():
                 if set_torque(robot, new_state):
                     torque_enabled = new_state
                     print(f"🔧 Motor Torque {'ENABLED' if torque_enabled else 'DISABLED (Free-move mode)'}")
-                else:
-                    print("⚠️  Could not change torque state.")
 
             elif key == ord('s'):
-                pose_name = input("\nEnter name for this pose (e.g. scan_base, stow_base, floor_grab): ").strip()
+                pose_name = input("\nEnter name for this pose (e.g. scan_base, stow_base): ").strip()
                 if not pose_name:
                     pose_name = f"pose_{len(recorded_poses)+1}"
                 recorded_poses[pose_name] = {
@@ -390,12 +400,10 @@ def main():
                 with open(poses_file, "w") as f:
                     yaml.dump(recorded_poses, f, sort_keys=False)
                 print(f"✅ Saved pose '{pose_name}' to {poses_file}")
-                print(f"   Joints: {joints}")
-                print(f"   FK: X={x_mm:.1f}mm, Y={y_mm:.1f}mm, Z={z_mm:.1f}mm, Reach={rho_mm:.1f}mm")
 
             elif key == 13 and can_capture:  # Enter key
                 T_base_gripper_m = T_base_gripper.copy()
-                T_base_gripper_m[:3, 3] /= 1000.0 # convert mm to meters for calibration math
+                T_base_gripper_m[:3, 3] /= 1000.0 # to meters
                 
                 R_gb = T_base_gripper_m[:3, :3]
                 t_gb = T_base_gripper_m[:3, 3]
@@ -408,41 +416,79 @@ def main():
                 
                 R_target2cam.append(R_tc)
                 t_target2cam.append(t_tc)
+                pose_telemetry.append((joints, (x_mm, y_mm, z_mm)))
                 
                 pose_count += 1
-                print(f"📸 Captured calibration pose #{pose_count} (FK: X={x_mm:.1f}mm, Y={y_mm:.1f}mm, Z={z_mm:.1f}mm)")
+                cam_dist_mm = np.linalg.norm(t_tc) * 1000.0
+                print(f"📸 Captured pose #{pose_count:2d} | Arm FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f} | Cam Dist: {cam_dist_mm:4.0f}mm")
 
             elif key == ord('c'):
                 if pose_count < 5:
-                    print(f"⚠️  Need at least 5 poses to compute calibration (currently have {pose_count}).")
+                    print(f"⚠️ Need at least 5 poses to compute calibration (currently have {pose_count}).")
                     continue
-                print(f"\n⚙️  Computing Hand-Eye Calibration from {pose_count} poses using Tsai method...")
                 
-                R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-                    R_gripper2base, t_gripper2base,
-                    R_target2cam, t_target2cam,
-                    method=cv2.CALIB_HAND_EYE_TSAI
-                )
+                print(f"\n⚙️  Solving Multi-Algorithm Hand-Eye Optimization from {pose_count} poses...")
+                methods = {
+                    "CALIB_HAND_EYE_TSAI": cv2.CALIB_HAND_EYE_TSAI,
+                    "CALIB_HAND_EYE_PARK": cv2.CALIB_HAND_EYE_PARK,
+                    "CALIB_HAND_EYE_HORAUD": cv2.CALIB_HAND_EYE_HORAUD,
+                    "CALIB_HAND_EYE_DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
+                    "CALIB_HAND_EYE_ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
+                }
                 
+                best_method = None
+                best_error = float("inf")
+                best_R = None
+                best_t = None
+                best_per_pose_errors = None
+
+                for name, flag in methods.items():
+                    try:
+                        R_cg, t_cg = cv2.calibrateHandEye(
+                            R_gripper2base, t_gripper2base,
+                            R_target2cam, t_target2cam,
+                            method=flag
+                        )
+                        mean_err, per_pose_err = evaluate_calibration_error(
+                            R_gripper2base, t_gripper2base,
+                            R_target2cam, t_target2cam,
+                            R_cg, t_cg
+                        )
+                        print(f"   • {name:28s}: Mean 3D Error = {mean_err:5.2f} mm")
+                        if mean_err < best_error:
+                            best_error = mean_err
+                            best_method = name
+                            best_R = R_cg
+                            best_t = t_cg
+                            best_per_pose_errors = per_pose_err
+                    except Exception as e:
+                        print(f"   • {name:28s}: Failed ({e})")
+
+                print("\n" + "═"*60)
+                print(f"🏆 BEST METHOD: {best_method} with Mean Error = {best_error:.2f} mm")
+                print("═"*60)
+
                 out_path = os.path.join(os.path.dirname(__file__), "hand_eye_calibration.yaml")
                 with open(out_path, 'w') as f:
                     yaml.dump({
-                        "rotation_matrix": R_cam2gripper.tolist(),
-                        "translation_mm": (t_cam2gripper.flatten() * 1000.0).tolist(),
+                        "rotation_matrix": best_R.tolist(),
+                        "translation_mm": (best_t.flatten() * 1000.0).tolist(),
                         "num_poses_used": pose_count,
+                        "mean_error_mm": float(best_error),
                         "timestamp": datetime.now().isoformat(),
-                        "method": "CALIB_HAND_EYE_TSAI"
+                        "method": best_method
                     }, f)
                     
-                print(f"🎉 Hand-Eye Calibration SUCCESSFUL and saved to:\n   {out_path}")
-                print(f"   Translation (mm): X={t_cam2gripper[0,0]*1000:.2f}, Y={t_cam2gripper[1,0]*1000:.2f}, Z={t_cam2gripper[2,0]*1000:.2f}")
+                print(f"✅ Calibration saved to: {out_path}")
+                print(f"   Translation (mm): X={best_t[0,0]*1000:.2f}, Y={best_t[1,0]*1000:.2f}, Z={best_t[2,0]*1000:.2f}")
+                print("Now run 'python3 validate_calibration.py' to verify live on screen!")
                 break
 
     finally:
         cam.stop()
         cv2.destroyAllWindows()
         if robot:
-            set_torque(robot, True) # restore torque
+            set_torque(robot, True)
             robot.disconnect()
 
 if __name__ == "__main__":

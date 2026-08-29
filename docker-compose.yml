@@ -42,6 +42,8 @@ services:
       - /dev/arm_controller:/dev/arm_controller  # SO-ARM101 Feetech bus
       - /dev/video0:/dev/video0                  # Dell WB3023 RGB Camera
     volumes:
+      - /dev/bus/usb:/dev/bus/usb         # REQUIRED for RealSense libusb / RSUSB backend
+      - /dev:/dev                         # Dynamic USB devices (/dev/arm_controller, /dev/tty*, etc.)
       - ./src:/root/ros2_ws/src           # live-reload Python nodes
       - ./scripts:/root/ros2_ws/scripts   # helper and test scripts
       - ./maps:/root/maps                 # persisted SLAM maps

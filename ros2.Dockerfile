@@ -84,12 +84,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cd / && rm -rf /tmp/librealsense && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Install LeRobot for SO-ARM101 ─────────────────────────────────────────────
+# ── Install LeRobot for SO-ARM101 (Python 3.10 LTS tag v0.4.0) ────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple --upgrade setuptools wheel && \
-    git clone https://github.com/huggingface/lerobot.git /opt/lerobot && \
+    pip3 install --no-cache-dir -i https://pypi.org/simple einops draccus "huggingface-hub>=0.20.0" safetensors && \
+    git clone --depth 1 -b v0.4.0 https://github.com/huggingface/lerobot.git /opt/lerobot && \
     cd /opt/lerobot && \
-    (pip3 install --no-cache-dir -i https://pypi.org/simple --no-build-isolation -e ".[feetech]" || \
-     pip3 install --no-cache-dir -i https://pypi.org/simple -e ".[feetech]")
+    pip3 install --no-cache-dir -i https://pypi.org/simple --no-deps -e .
 
 # ── Install Ultralytics ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics

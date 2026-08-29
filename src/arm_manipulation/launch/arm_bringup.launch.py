@@ -33,6 +33,12 @@ def generate_launch_description():
         default_value=os.path.join(pkg_share, 'config', 'arm_params.yaml'),
         description='Path to arm parameters YAML file'
     )
+    
+    skip_moondream_arg = DeclareLaunchArgument(
+        'skip_moondream',
+        default_value='true',
+        description='Skip loading moondream vision-language model'
+    )
 
     # 1. robot_state_publisher with xacro processing
     urdf_path = os.path.join(pkg_share, 'urdf', 'so_arm101.urdf.xacro')
@@ -118,6 +124,7 @@ def generate_launch_description():
         calibration_file_arg,
         model_path_arg,
         config_path_arg,
+        skip_moondream_arg,
         robot_state_publisher_node,
         realsense_node,
         arm_driver_node,

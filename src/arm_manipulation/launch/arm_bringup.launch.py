@@ -18,7 +18,7 @@ def generate_launch_description():
     
     calibration_file_arg = DeclareLaunchArgument(
         'calibration_file',
-        default_value=os.path.join(pkg_share, 'config', 'calibration.yaml'),
+        default_value='/root/ros2_ws/calibration/hand_eye_calibration.yaml',
         description='Path to hand-eye calibration file'
     )
     

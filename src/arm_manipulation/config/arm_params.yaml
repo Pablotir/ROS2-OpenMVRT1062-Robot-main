@@ -64,19 +64,19 @@ search:
   sweep_range_deg: 80.0
   sweep_speed_deg: 0.5
 
-# Named poses (joint angles in degrees)
+# Named poses (joint angles in degrees from calibration)
 poses:
-  scan_base:
-    shoulder_pan: -1.4
-    shoulder_lift: -57.6
-    elbow_flex: -3.3
-    wrist_flex: 86.0
-    wrist_roll: 0.0
-    gripper: 60.0
   stow_base:
-    shoulder_pan: 0.0
-    shoulder_lift: -104.5
-    elbow_flex: 96.5
-    wrist_flex: 0.0
-    wrist_roll: 0.0
-    gripper: 60.0
+    shoulder_pan: -4.48
+    shoulder_lift: -106.11
+    elbow_flex: 100.00
+    wrist_flex: 75.96
+    wrist_roll: -156.75
+    gripper: 73.77
+  scan_base:
+    shoulder_pan: -4.48
+    shoulder_lift: -106.02
+    elbow_flex: 99.91
+    wrist_flex: 33.41
+    wrist_roll: -155.96
+    gripper: 73.84

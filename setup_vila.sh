@@ -68,9 +68,12 @@ fi
 # ── 4. Device permissions ─────────────────────────────────────────────────────
 echo ""
 echo "▸ Setting device permissions..."
-chmod 777 /dev/roboclaw_left  2>/dev/null || echo "  ⚠ /dev/roboclaw_left not found (plug in RoboClaw)"
-chmod 777 /dev/roboclaw_right 2>/dev/null || echo "  ⚠ /dev/roboclaw_right not found (plug in RoboClaw)"
-chmod 777 /dev/lidar          2>/dev/null || echo "  ⚠ /dev/lidar not found (plug in LiDAR)"
+chmod 777 /dev/roboclaw_left  2>/dev/null || echo "  ⚠ /dev/roboclaw_left not found"
+chmod 777 /dev/roboclaw_right 2>/dev/null || echo "  ⚠ /dev/roboclaw_right not found"
+chmod 777 /dev/ttyTHS1        2>/dev/null || echo "  ⚠ /dev/ttyTHS1 not found (check GPIO UART)"
+chmod 777 /dev/lidar          2>/dev/null || echo "  ⚠ /dev/lidar not found"
+chmod 777 /dev/arm_controller 2>/dev/null || echo "  ⚠ /dev/arm_controller not found"
+chmod 777 /dev/video0         2>/dev/null || echo "  ⚠ /dev/video0 not found"
 
 # ── 5. Python dependencies ────────────────────────────────────────────────────
 echo ""

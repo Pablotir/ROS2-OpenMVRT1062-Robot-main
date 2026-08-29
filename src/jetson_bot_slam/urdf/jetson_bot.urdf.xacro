@@ -203,4 +203,20 @@
             rpy="0 0 ${pi}"/>
   </joint>
 
+  <!-- ===================================================================== -->
+  <!-- SO-ARM101 Arm Mount Base (Rear edge of chassis, facing rear)          -->
+  <!-- ===================================================================== -->
+  <link name="arm_base_link">
+    <visual>
+      <geometry><box size="0.080 0.080 0.040"/></geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+
+  <joint name="arm_base_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="arm_base_link"/>
+    <origin xyz="${-base_length/2} 0 0.040" rpy="0 0 ${pi}"/>
+  </joint>
+
 </robot>

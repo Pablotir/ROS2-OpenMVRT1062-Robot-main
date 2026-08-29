@@ -1,0 +1,30 @@
+416:             # Save raw dataset to avoid recapturing if math changes later
+417:             dataset_file = os.path.join(os.path.dirname(__file__), "calibration_dataset.json")
+418:             try:
+419:                 import json
+420:                 if not os.path.exists(dataset_file):
+421:                     with open(dataset_file, "w") as jf: json.dump([], jf)
+422:                 with open(dataset_file, "r") as jf: ds = json.load(jf)
+423:                 ds.append({
+424:                     "joints": joints,
+425:                     "rvec_cam": rvec_b.flatten().tolist(),
+426:                     "tvec_cam": tvec_b.flatten().tolist()
+427:                 })
+428:                 with open(dataset_file, "w") as jf: json.dump(ds, jf, indent=2)
+429:             except Exception as e:
+430:                 pass
+431: 
+432:             elif key == ord('c'):
+433:                 if pose_count < 5:
+434:                     print(f"⚠️ Need at least 5 poses to compute calibration (currently have {pose_count}).")
+435:                     continue
+436:                 
+437:                 print(f"\n⚙️  Solving Multi-Algorithm Hand-Eye Optimization from {pose_count} poses...")
+438:                 methods = {
+439:                     "CALIB_HAND_EYE_TSAI": cv2.CALIB_HAND_EYE_TSAI,
+440:                     "CALIB_HAND_EYE_PARK": cv2.CALIB_HAND_EYE_PARK,
+441:                     "CALIB_HAND_EYE_HORAUD": cv2.CALIB_HAND_EYE_HORAUD,
+442:                     "CALIB_HAND_EYE_DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
+443:                     "CALIB_HAND_EYE_ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
+444:                 }
+445:                 

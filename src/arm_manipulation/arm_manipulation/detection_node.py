@@ -17,12 +17,14 @@ class DetectionNode(Node):
         # Parameters
         self.declare_parameter('model_path', '/root/ros2_ws/models/yolo11n-seg.engine')
         self.declare_parameter('model_fallback_path', '/root/ros2_ws/models/yolo11n-seg.pt')
-        self.declare_parameter('target_class_id', 32)
+        self.declare_parameter('target_class_id', 39) # 39 = bottle in COCO
+        self.declare_parameter('target_label', 'bottle')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('publish_rate', 30.0)
         
         self.target_class_id = self.get_parameter('target_class_id').value
+        self.target_label = self.get_parameter('target_label').value
         self.conf_thresh = self.get_parameter('confidence_threshold').value
         
         self.bridge = CvBridge()
@@ -33,10 +35,27 @@ class DetectionNode(Node):
         self.latest_depth = None
         self.latest_camera_info = None
         
+        # COCO Class name mapping dictionary
+        self.class_name_map = {
+            'bottle': 39,
+            'cup': 41,
+            'can': 39,
+            'ball': 32,
+            'sports ball': 32,
+            'bowl': 45,
+            'apple': 47,
+            'banana': 46,
+            'remote': 65,
+            'cell phone': 67,
+            'book': 73,
+            'box': 39
+        }
+        
         # Subscribers
         self.create_subscription(CameraInfo, '/camera/color/camera_info', self.info_callback, 10)
         self.create_subscription(Image, '/camera/depth/image_rect_raw', self.depth_callback, 10)
         self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
+        self.create_subscription(String, '/arm/set_target', self.set_target_callback, 10)
         
         # Publishers
         self.det_pub = self.create_publisher(Detection2DArray, '/arm/detections', 10)
@@ -61,6 +80,16 @@ class DetectionNode(Node):
         else:
             self.get_logger().error(f'No model found at {engine_path} or {pt_path}')
             raise FileNotFoundError(f'YOLO model not found')
+
+    def set_target_callback(self, msg: String):
+        label = msg.data.lower().strip()
+        self.target_label = label
+        if label in self.class_name_map:
+            self.target_class_id = self.class_name_map[label]
+            self.get_logger().info(f"Target object set to '{label}' (Class ID: {self.target_class_id})")
+        else:
+            self.get_logger().warn(f"Target label '{label}' not in standard map, defaulting to bottle (ID: 39)")
+            self.target_class_id = 39
 
     def info_callback(self, msg):
         self.latest_camera_info = msg
@@ -159,7 +188,7 @@ class DetectionNode(Node):
         if best_target is not None:
             pt_msg = PointStamped()
             pt_msg.header = msg.header
-            pt_msg.header.frame_id = 'camera_color_optical_frame' # Standard realsense optical frame, or 'camera_link'
+            pt_msg.header.frame_id = 'd405_color_optical_frame'
             pt_msg.point.x = best_target[0]
             pt_msg.point.y = best_target[1]
             pt_msg.point.z = best_target[2]

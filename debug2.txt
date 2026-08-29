@@ -1,0 +1,30 @@
+391:                 poses_file = os.path.join(os.path.dirname(__file__), "arm_reference_poses.yaml")
+392:                 with open(poses_file, "w") as f:
+393:                     yaml.dump(recorded_poses, f, sort_keys=False)
+394:                 print(f"✅ Saved pose '{pose_name}' to {poses_file}")
+395: 
+396:             elif key == 13 and can_capture:  # Enter key
+397:                 T_base_wrist_m = T_base_wrist.copy()
+398:                 T_base_wrist_m[:3, 3] /= 1000.0 # to meters
+399:                 
+400:                 R_gb = T_base_wrist_m[:3, :3]
+401:                 t_gb = T_base_wrist_m[:3, 3]
+402:                 
+403:                 R_gripper2base.append(R_gb)
+404:                 t_gripper2base.append(t_gb)
+405:                 
+406:                 R_tc, _ = cv2.Rodrigues(rvec_cam)
+407:                 t_tc = tvec_cam.flatten()
+408:                 
+409:                 R_target2cam.append(R_tc)
+410:                 t_target2cam.append(t_tc)
+411:                 
+412:                 pose_count += 1
+413:                 cam_dist_mm = np.linalg.norm(t_tc) * 1000.0
+414:                 print(f"📸 Captured pose #{pose_count:2d} | Wrist FK: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f} | Cam Dist: {cam_dist_mm:4.0f}mm")
+415: 
+416:             # Save raw dataset to avoid recapturing if math changes later
+417:             dataset_file = os.path.join(os.path.dirname(__file__), "calibration_dataset.json")
+418:             try:
+419:                 import json
+420:                 if not os.path.exists(dataset_file):

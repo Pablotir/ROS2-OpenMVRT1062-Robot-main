@@ -37,10 +37,10 @@ services:
     devices:
       - /dev/roboclaw_left:/dev/roboclaw_left    # RoboClaw Left  (M1=Rear-Left,  M2=Front-Left)
       - /dev/roboclaw_right:/dev/roboclaw_right  # RoboClaw Right (M1=Rear-Right, M2=Front-Right)
-      - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x → /dev/lidar symlink)
+      - /dev/ttyTHS1:/dev/ttyTHS1                # STL-27L LiDAR (Jetson 40-pin UART Pins 8/10)
+      - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x fallback symlink)
       - /dev/arm_controller:/dev/arm_controller  # SO-ARM101 Feetech bus
-      # - /dev/video0:/dev/video0                  # USB camera (uncomment when connected)
-      # - /dev/video1:/dev/video1                  # USB camera (alternate index)
+      - /dev/video0:/dev/video0                  # Dell WB3023 RGB Camera
     volumes:
       - ./src:/root/ros2_ws/src           # live-reload Python nodes
       - ./maps:/root/maps                 # persisted SLAM maps

@@ -35,7 +35,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('left_port',          default_value='/dev/roboclaw_left'),
         DeclareLaunchArgument('right_port',         default_value='/dev/roboclaw_right'),
-        DeclareLaunchArgument('lidar_port',         default_value='/dev/lidar'),
+        DeclareLaunchArgument('lidar_port',         default_value='/dev/ttyTHS1'),
         DeclareLaunchArgument('camera_device',      default_value='/dev/video0'),
         DeclareLaunchArgument('rviz',               default_value='false'),
         # SLAM / Lifelong Mapping mode: 'mapping' | 'lifelong' | 'localization'
@@ -45,6 +45,8 @@ def generate_launch_description():
                               description='Directory for saved map sessions and pose graphs'),
         DeclareLaunchArgument('enable_exploration', default_value='true',
                               description='Enable autonomous exploration controller'),
+        DeclareLaunchArgument('enable_scene_graph', default_value='true',
+                              description='Enable Layer 1 Topological Scene Graph and waypoint server'),
         # Motion tuning
         DeclareLaunchArgument('move_speed',          default_value='0.18'),
         DeclareLaunchArgument('turn_speed',          default_value='0.50'),
@@ -173,6 +175,33 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ── Layer 1: Topological Scene Graph Node ──────────────────────────────
+    # Voronoi distance transform partitioning, region crossing & on-demand snapshots.
+    topological_scene_graph = Node(
+        package='robot_control',
+        executable='topological_scene_graph_node',
+        name='topological_scene_graph_node',
+        condition=IfCondition(LaunchConfiguration('enable_scene_graph')),
+        parameters=[{
+            'maps_dir': LaunchConfiguration('maps_dir'),
+            'camera_topic': '/image_raw',
+        }],
+        output='screen',
+    )
+
+    # ── Semantic Waypoint Server ───────────────────────────────────────────
+    # Resolves room names from SQLite scene graph and sends goals to Nav2.
+    semantic_waypoint_server = Node(
+        package='robot_control',
+        executable='semantic_waypoint_server',
+        name='semantic_waypoint_server',
+        condition=IfCondition(LaunchConfiguration('enable_scene_graph')),
+        parameters=[{
+            'maps_dir': LaunchConfiguration('maps_dir'),
+        }],
+        output='screen',
+    )
+
     # ── Exploration controller ─────────────────────────────────────────────
     # The ONLY node that publishes /cmd_vel during autonomous mapping.
     # Smooth reactive: steers toward open space, scales speed by clearance.
@@ -198,10 +227,10 @@ def generate_launch_description():
         name='usb_cam',
         parameters=[{
             'video_device':    LaunchConfiguration('camera_device'),
-            'image_width':     640,
-            'image_height':    480,
+            'image_width':     1280,
+            'image_height':    720,
             'framerate':       15.0,
-            'pixel_format':    'yuyv',
+            'pixel_format':    'mjpeg',
             'auto_white_balance': True,
             'autoexposure':    True,
             'camera_frame_id': 'camera_optical_link',
@@ -261,10 +290,12 @@ def generate_launch_description():
         roboclaw,           # Dual RoboClaw motor control + encoder reads
         mecanum_odom,       # /odom from encoders
         lidar,              # /scan from STL-27L
-        arm_lidar_mask,     # /scan → /scan_filtered (FK arm shadow + rear bubble)
-        map_manager,        # Lifelong map lifecycle & versioning
-        slam_toolbox,       # /scan_filtered + /odom → /map
-        exploration_ctrl,   # /scan_filtered → /cmd_vel (only motion publisher)
+        arm_lidar_mask,             # /scan → /scan_filtered (FK arm shadow + rear bubble)
+        map_manager,                # Lifelong map lifecycle & versioning
+        slam_toolbox,               # /scan_filtered + /odom → /map
+        topological_scene_graph,    # Layer 1: Topological Partitioning & Scene Graph
+        semantic_waypoint_server,   # Semantic room goal dispatcher for Nav2
+        exploration_ctrl,           # /scan_filtered → /cmd_vel (only motion publisher)
         usb_camera,         # opt-in: use_camera:=true
         image_convert,      # opt-in
         vila_labeller,      # opt-in

@@ -37,10 +37,23 @@ class PickPlaceNode(Node):
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
         self.declare_parameter('tick_rate', 5.0)
 
-        config_path = self.get_parameter('config_path').get_parameter_value().string_value
+        raw_config = self.get_parameter('config_path').get_parameter_value().string_value
         self.skip_moondream = self.get_parameter('skip_moondream').get_parameter_value().bool_value
         self.ollama_url = self.get_parameter('ollama_url').get_parameter_value().string_value
         self.tick_rate = self.get_parameter('tick_rate').get_parameter_value().double_value
+
+        # Resolve config_path safely
+        config_path = raw_config
+        if not os.path.isabs(config_path) or not os.path.exists(config_path):
+            candidate_paths = [
+                os.path.join('/root/ros2_ws/install/arm_manipulation/share/arm_manipulation/config', os.path.basename(raw_config)),
+                os.path.join('/root/ros2_ws/src/arm_manipulation/config', os.path.basename(raw_config)),
+                os.path.join(os.getcwd(), raw_config),
+            ]
+            for cp in candidate_paths:
+                if os.path.exists(cp):
+                    config_path = cp
+                    break
 
         self.get_logger().info(f"Initializing PickPlaceNode with config: {config_path}")
 

@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose, BoundingBox2D
 from cv_bridge import CvBridge
 from ultralytics import YOLO

@@ -28,10 +28,10 @@ def generate_launch_description():
         description='Path to the YOLO model engine'
     )
     
-    skip_moondream_arg = DeclareLaunchArgument(
-        'skip_moondream',
-        default_value='true',
-        description='Skip loading moondream vision-language model'
+    config_path_arg = DeclareLaunchArgument(
+        'config_path',
+        default_value=os.path.join(pkg_share, 'config', 'arm_params.yaml'),
+        description='Path to arm parameters YAML file'
     )
 
     # 1. robot_state_publisher with xacro processing
@@ -107,6 +107,9 @@ def generate_launch_description():
         package=pkg_name,
         executable='pick_place_node',
         name='pick_place_node',
+        parameters=[{
+            'config_path': LaunchConfiguration('config_path'),
+        }],
         output='screen'
     )
 
@@ -114,7 +117,7 @@ def generate_launch_description():
         arm_port_arg,
         calibration_file_arg,
         model_path_arg,
-        skip_moondream_arg,
+        config_path_arg,
         robot_state_publisher_node,
         realsense_node,
         arm_driver_node,

@@ -16,12 +16,11 @@ FROM dustynv/nano_llm:humble-r36.3.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# ── Fix dead jetson.webredirect.org pip mirror & configure official PyPI ─────
+# ── Configure clean official PyPI mirror ─────────────────────────────────────
 ENV PIP_INDEX_URL=https://pypi.org/simple
-ENV PIP_EXTRA_INDEX_URL=https://pypi.ngc.nvidia.com
 RUN rm -f /etc/pip.conf /root/.pip/pip.conf /root/.config/pip/pip.conf 2>/dev/null || true && \
     mkdir -p /root/.pip && \
-    printf "[global]\nindex-url = https://pypi.org/simple\nextra-index-url = https://pypi.ngc.nvidia.com\ntrusted-host = pypi.org files.pythonhosted.org pypi.ngc.nvidia.com\n" > /root/.pip/pip.conf && \
+    printf "[global]\nindex-url = https://pypi.org/simple\ntrusted-host = pypi.org files.pythonhosted.org\n" > /root/.pip/pip.conf && \
     cp /root/.pip/pip.conf /etc/pip.conf
 
 # ── Fix ROS2 GPG key ──────────────────────────────────────────────────────────
@@ -60,7 +59,7 @@ RUN apt-get update && \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ────────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow "numpy<2.0.0,>=1.24.4"
 
 # ── Build librealsense2 from source (RSUSB backend + CUDA) ───────────────────
 # No apt package for ARM64 JetPack 6. RSUSB avoids kernel patching.
@@ -85,14 +84,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Install LeRobot for SO-ARM101 (Python 3.10 LTS tag v0.4.0) ────────────────
-RUN pip3 install --no-cache-dir -i https://pypi.org/simple "setuptools<70.0.0" "wheel<0.44.0" && \
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple "setuptools<70.0.0" "wheel<0.44.0" "numpy<2.0.0,>=1.24.4" && \
     pip3 install --no-cache-dir -i https://pypi.org/simple einops draccus "huggingface-hub>=0.20.0" safetensors && \
     git clone --depth 1 -b v0.4.0 https://github.com/huggingface/lerobot.git /opt/lerobot && \
     cd /opt/lerobot && \
     pip3 install --no-cache-dir -i https://pypi.org/simple --no-deps -e .
 
-# ── Install Ultralytics ────────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics
+# ── Install Ultralytics & Ensure NumPy 1.x ABI ────────────────────────────────
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics && \
+    pip3 install --no-cache-dir -i https://pypi.org/simple "numpy<2.0.0,>=1.24.4"
 
 # ── Clone external ROS2 packages ──────────────────────────────────────────────
 RUN mkdir -p /root/ros2_ws/src && \

@@ -61,11 +61,15 @@ def generate_launch_description():
             'camera_name': 'd405',
             'enable_color': True,
             'enable_depth': True,
-            'enable_sync': True,
-            'rgb_camera.profile': '848x480x30',
-            'depth_module.profile': '848x480x30',
+            'enable_infra': False,
+            'enable_infra1': False,
+            'enable_infra2': False,
+            'enable_sync': False,
+            'rgb_camera.profile': '848x480x15',
+            'depth_module.profile': '848x480x15',
             'align_depth.enable': False,
             'pointcloud.enable': False,
+            'initial_reset': True,
         }],
         output='screen'
     )

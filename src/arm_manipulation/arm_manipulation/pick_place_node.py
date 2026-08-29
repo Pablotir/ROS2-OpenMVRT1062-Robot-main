@@ -63,7 +63,7 @@ class PickPlaceNode(Node):
             self.kinematics = ArmKinematics(config_path)
             self.named_poses = getattr(self.kinematics, 'named_poses', {})
             if not self.named_poses and hasattr(self.kinematics, 'params'):
-                self.named_poses = self.kinematics.params.get('named_poses', {})
+                self.named_poses = self.kinematics.params.get('poses', {}) or self.kinematics.params.get('named_poses', {})
         except Exception as e:
             self.get_logger().error(f"Failed to load kinematics: {e}")
             raise e

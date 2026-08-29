@@ -22,7 +22,6 @@ setup(
     maintainer_email='robot@example.com',
     description='SLAM and autonomous exploration for mecanum Jetson robot',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'roboclaw_node       = jetson_bot_slam.roboclaw_node:main',

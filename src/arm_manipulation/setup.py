@@ -22,7 +22,6 @@ setup(
     maintainer_email='pablo@todo.todo',
     description='SO-ARM101 6-DOF robotic arm manipulation with ChArUco-calibrated eye-in-hand vision',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'arm_driver_node = arm_manipulation.arm_driver_node:main',

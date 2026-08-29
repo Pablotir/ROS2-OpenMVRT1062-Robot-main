@@ -42,6 +42,11 @@ RUN apt-get update && \
         -o Dpkg::Options::="--force-overwrite" \
         python3-serial \
         python3-colcon-common-extensions \
+        ros-humble-teleop-twist-keyboard \
+        ros-humble-teleop-twist-joy \
+        usbutils \
+        v4l-utils \
+        udev \
         ros-humble-slam-toolbox \
         ros-humble-xacro \
         ros-humble-robot-state-publisher \

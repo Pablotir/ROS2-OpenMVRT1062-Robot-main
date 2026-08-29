@@ -16,6 +16,14 @@ FROM dustynv/nano_llm:humble-r36.3.0
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# ── Fix dead jetson.webredirect.org pip mirror & configure official PyPI ─────
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_EXTRA_INDEX_URL=https://pypi.ngc.nvidia.com
+RUN rm -f /etc/pip.conf /root/.pip/pip.conf /root/.config/pip/pip.conf 2>/dev/null || true && \
+    mkdir -p /root/.pip && \
+    printf "[global]\nindex-url = https://pypi.org/simple\nextra-index-url = https://pypi.ngc.nvidia.com\ntrusted-host = pypi.org files.pythonhosted.org pypi.ngc.nvidia.com\n" > /root/.pip/pip.conf && \
+    cp /root/.pip/pip.conf /etc/pip.conf
+
 # ── Fix ROS2 GPG key ──────────────────────────────────────────────────────────
 RUN rm -f /usr/share/keyrings/ros-archive-keyring.gpg && \
     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
@@ -77,11 +85,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Install LeRobot for SO-ARM101 ─────────────────────────────────────────────
-RUN git clone https://github.com/huggingface/lerobot.git /opt/lerobot && \
-    cd /opt/lerobot && pip3 install --no-cache-dir -e ".[feetech]"
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple --upgrade setuptools wheel && \
+    git clone https://github.com/huggingface/lerobot.git /opt/lerobot && \
+    cd /opt/lerobot && \
+    (pip3 install --no-cache-dir -i https://pypi.org/simple --no-build-isolation -e ".[feetech]" || \
+     pip3 install --no-cache-dir -i https://pypi.org/simple -e ".[feetech]")
 
 # ── Install Ultralytics ────────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir ultralytics
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics
 
 # ── Clone external ROS2 packages ──────────────────────────────────────────────
 RUN mkdir -p /root/ros2_ws/src && \

@@ -69,7 +69,7 @@ def generate_launch_description():
             'depth_module.profile': '848x480x15',
             'align_depth.enable': False,
             'pointcloud.enable': False,
-            'initial_reset': True,
+            'initial_reset': False,
         }],
         output='screen'
     )

@@ -73,13 +73,9 @@ class DetectionNode(Node):
         elif os.path.exists(pt_path):
             self.get_logger().warn(f'TensorRT engine not found, using PyTorch: {pt_path}')
             self.model = YOLO(pt_path)
-            # Auto-export TensorRT engine for next time
-            self.get_logger().info('Exporting TensorRT engine (first-time, may take ~5 min)...')
-            self.model.export(format='engine', imgsz=640, device='cuda:0', half=True)
-            self.model = YOLO(engine_path, task='segment')
         else:
-            self.get_logger().error(f'No model found at {engine_path} or {pt_path}')
-            raise FileNotFoundError(f'YOLO model not found')
+            self.get_logger().info('Model not found at specified path, auto-loading yolo11n-seg.pt...')
+            self.model = YOLO('yolo11n-seg.pt')
 
     def set_target_callback(self, msg: String):
         label = msg.data.lower().strip()

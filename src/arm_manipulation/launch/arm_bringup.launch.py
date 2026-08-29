@@ -61,15 +61,11 @@ def generate_launch_description():
             'camera_name': 'd405',
             'enable_color': True,
             'enable_depth': True,
-            'enable_infra1': False,
-            'enable_infra2': False,
-            'enable_gyro': False,
-            'enable_accel': False,
-            'rgb_camera.color_profile': '848x480x30',  # 30 FPS target
-            'depth_module.depth_profile': '848x480x30',
-            'align_depth.enable': False,  # D405 is natively aligned — align CORRUPTS depth
-            'pointcloud.enable': False,  # Save GPU memory on Orin Nano
-            'json_file_path': '',
+            'enable_sync': True,
+            'rgb_camera.profile': '848x480x30',
+            'depth_module.profile': '848x480x30',
+            'align_depth.enable': False,
+            'pointcloud.enable': False,
         }],
         output='screen'
     )

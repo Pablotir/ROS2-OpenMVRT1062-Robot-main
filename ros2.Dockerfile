@@ -48,26 +48,28 @@ RUN apt-get update && \
         ros-humble-nav2-costmap-2d \
         ros-humble-visualization-msgs \
         ros-humble-vision-msgs \
+        ros-humble-diagnostic-updater \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow
 
-# ── Build librealsense2 from source (RSUSB backend + CUDA) ───────────────────
-# No apt package for ARM64 JetPack 6. RSUSB avoids kernel patching.
+# ── Build librealsense2 from source (RSUSB backend, lightweight) ─────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl-dev libusb-1.0-0-dev pkg-config libgtk-3-dev \
-        libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev && \
-    git clone --depth 1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
-    mkdir /tmp/librealsense/build && cd /tmp/librealsense/build && \
+        libssl-dev libusb-1.0-0-dev pkg-config libudev-dev && \
+    git clone --depth 1 -b v2.55.1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
+    mkdir -p /tmp/librealsense/build && cd /tmp/librealsense/build && \
     cmake .. \
-        -DBUILD_PYTHON_BINDINGS:bool=true \
+        -DFORCE_RSUSB_BACKEND=ON \
+        -DBUILD_WITH_CUDA=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_GRAPHICAL_EXAMPLES=OFF \
+        -DBUILD_PYTHON_BINDINGS=ON \
         -DPYTHON_EXECUTABLE=$(which python3) \
-        -DFORCE_RSUSB_BACKEND=true \
-        -DBUILD_WITH_CUDA=true \
         -DCMAKE_BUILD_TYPE=Release && \
-    make -j$(nproc) && make install && \
-    cp /tmp/librealsense/build/wrappers/python/*.so $(python3 -c 'import site; print(site.getsitepackages()[0])')/ && \
+    make -j2 && make install && \
+    ldconfig && \
+    (find /tmp/librealsense/build/wrappers/python/ -name "*.so*" -exec cp {} $(python3 -c 'import site; print(site.getsitepackages()[0])')/ \; 2>/dev/null || true) && \
     cd / && rm -rf /tmp/librealsense && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -82,7 +84,7 @@ RUN pip3 install --no-cache-dir ultralytics
 RUN mkdir -p /root/ros2_ws/src && \
     cd /root/ros2_ws/src && \
     git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git && \
-    git clone --depth 1 https://github.com/IntelRealSense/realsense-ros.git
+    git clone --depth 1 -b ros2-development https://github.com/IntelRealSense/realsense-ros.git
 
 # ── Copy robot workspace source ────────────────────────────────────────────────
 COPY ./src /root/ros2_ws/src

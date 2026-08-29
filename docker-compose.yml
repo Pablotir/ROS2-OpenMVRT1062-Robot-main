@@ -41,6 +41,7 @@ services:
       - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x fallback symlink)
       - /dev/arm_controller:/dev/arm_controller  # SO-ARM101 Feetech bus
       - /dev/video0:/dev/video0                  # Dell WB3023 RGB Camera
+    volumes:
       - ./src:/root/ros2_ws/src           # live-reload Python nodes
       - ./scripts:/root/ros2_ws/scripts   # helper and test scripts
       - ./maps:/root/maps                 # persisted SLAM maps

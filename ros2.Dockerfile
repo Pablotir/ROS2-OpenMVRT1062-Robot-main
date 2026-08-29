@@ -54,22 +54,25 @@ RUN apt-get update && \
 # ── Python dependencies ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow
 
-# ── Build librealsense2 from source (RSUSB backend, lightweight) ─────────────
+# ── Build librealsense2 from source (RSUSB backend + CUDA) ───────────────────
+# No apt package for ARM64 JetPack 6. RSUSB avoids kernel patching.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl-dev libusb-1.0-0-dev pkg-config libudev-dev && \
-    git clone --depth 1 -b v2.55.1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
-    mkdir -p /tmp/librealsense/build && cd /tmp/librealsense/build && \
+        libssl-dev libusb-1.0-0-dev pkg-config libgtk-3-dev \
+        libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev && \
+    git clone --depth 1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
+    mkdir /tmp/librealsense/build && cd /tmp/librealsense/build && \
     cmake .. \
-        -DFORCE_RSUSB_BACKEND=ON \
-        -DBUILD_WITH_CUDA=OFF \
-        -DBUILD_EXAMPLES=OFF \
-        -DBUILD_GRAPHICAL_EXAMPLES=OFF \
-        -DBUILD_PYTHON_BINDINGS=ON \
+        -DBUILD_PYTHON_BINDINGS:bool=true \
         -DPYTHON_EXECUTABLE=$(which python3) \
+        -DFORCE_RSUSB_BACKEND=true \
+        -DBUILD_WITH_CUDA=true \
+        -DBUILD_EXAMPLES=false \
+        -DBUILD_GRAPHICAL_EXAMPLES=false \
         -DCMAKE_BUILD_TYPE=Release && \
-    make -j2 && make install && \
+    make -j$(nproc) && make install && \
+    find /tmp/librealsense/build -name "pyrealsense2*.so" -exec cp {} $(python3 -c 'import site; print(site.getsitepackages()[0])')/ \; && \
+    find /tmp/librealsense/build -name "pyrsutils*.so" -exec cp {} $(python3 -c 'import site; print(site.getsitepackages()[0])')/ \; 2>/dev/null || true && \
     ldconfig && \
-    (find /tmp/librealsense/build/wrappers/python/ -name "*.so*" -exec cp {} $(python3 -c 'import site; print(site.getsitepackages()[0])')/ \; 2>/dev/null || true) && \
     cd / && rm -rf /tmp/librealsense && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

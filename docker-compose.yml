@@ -35,15 +35,10 @@ services:
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     #user: "1000:1000"    # write files as pablo (not root) so maps/logs are accessible on host
     devices:
-      - /dev/roboclaw_left:/dev/roboclaw_left    # RoboClaw Left  (M1=Rear-Left,  M2=Front-Left)
-      - /dev/roboclaw_right:/dev/roboclaw_right  # RoboClaw Right (M1=Rear-Right, M2=Front-Right)
       - /dev/ttyTHS1:/dev/ttyTHS1                # STL-27L LiDAR (Jetson 40-pin UART Pins 8/10)
-      - /dev/lidar:/dev/lidar                    # STL-27L LiDAR (CP210x fallback symlink)
-      - /dev/arm_controller:/dev/arm_controller  # SO-ARM101 Feetech bus
-      - /dev/video0:/dev/video0                  # Dell WB3023 RGB Camera
     volumes:
       - /dev/bus/usb:/dev/bus/usb         # REQUIRED for RealSense libusb / RSUSB backend
-      - /dev:/dev                         # Dynamic USB devices (/dev/arm_controller, /dev/tty*, etc.)
+      - /dev:/dev                         # Dynamic USB devices (/dev/arm_controller, /dev/video*, /dev/tty*, etc.)
       - ./src:/root/ros2_ws/src           # live-reload Python nodes
       - ./scripts:/root/ros2_ws/scripts   # helper and test scripts
       - ./maps:/root/maps                 # persisted SLAM maps

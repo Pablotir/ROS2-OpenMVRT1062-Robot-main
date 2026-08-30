@@ -39,7 +39,9 @@ services:
     volumes:
       - /dev/bus/usb:/dev/bus/usb         # REQUIRED for RealSense libusb / RSUSB backend
       - /dev:/dev                         # Dynamic USB devices (/dev/arm_controller, /dev/video*, /dev/tty*, etc.)
-      - ./src:/root/ros2_ws/src           # live-reload Python nodes
+      - ./src/arm_manipulation:/root/ros2_ws/src/arm_manipulation
+      - ./src/jetson_bot_slam:/root/ros2_ws/src/jetson_bot_slam
+      - ./src/robot_control:/root/ros2_ws/src/robot_control
       - ./scripts:/root/ros2_ws/scripts   # helper and test scripts
       - ./maps:/root/maps                 # persisted SLAM maps
       - ./logs:/root/ros2_ws/logs         # AI decision logs + captured frames

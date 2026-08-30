@@ -51,10 +51,10 @@ class DetectionNode(Node):
             'box': 39
         }
         
-        # Subscribers
-        self.create_subscription(CameraInfo, '/camera/color/camera_info', self.info_callback, 10)
-        self.create_subscription(Image, '/camera/depth/image_rect_raw', self.depth_callback, 10)
-        self.create_subscription(Image, '/camera/color/image_raw', self.color_callback, 10)
+        # Subscribers — topics match camera_name='d405' in arm_bringup.launch.py
+        self.create_subscription(CameraInfo, '/d405/color/camera_info', self.info_callback, 10)
+        self.create_subscription(Image, '/d405/depth/image_rect_raw', self.depth_callback, 10)
+        self.create_subscription(Image, '/d405/color/image_raw', self.color_callback, 10)
         self.create_subscription(String, '/arm/set_target', self.set_target_callback, 10)
         
         # Publishers

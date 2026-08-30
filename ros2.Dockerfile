@@ -68,10 +68,11 @@ RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow "num
 
 # ── Build librealsense2 from source (RSUSB backend + CUDA) ───────────────────
 # No apt package for ARM64 JetPack 6. RSUSB avoids kernel patching.
+# Pinned to v2.58.3 — must match realsense-ros tag 4.58.1 below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev libusb-1.0-0-dev pkg-config libgtk-3-dev \
         libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev && \
-    git clone --depth 1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
+    git clone --depth 1 --branch v2.58.3 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense && \
     mkdir /tmp/librealsense/build && cd /tmp/librealsense/build && \
     cmake .. \
         -DBUILD_PYTHON_BINDINGS:bool=true \
@@ -100,10 +101,11 @@ RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics && \
     pip3 install --no-cache-dir -i https://pypi.org/simple "numpy<2.0.0,>=1.24.4"
 
 # ── Clone external ROS2 packages ──────────────────────────────────────────────
+# realsense-ros 4.58.1 is the exact ROS wrapper for librealsense2 v2.58.3
 RUN mkdir -p /root/ros2_ws/src && \
     cd /root/ros2_ws/src && \
     git clone https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git && \
-    git clone --depth 1 -b ros2-development https://github.com/IntelRealSense/realsense-ros.git
+    git clone --depth 1 --branch 4.58.1 https://github.com/IntelRealSense/realsense-ros.git
 
 # ── Copy robot workspace source ────────────────────────────────────────────────
 COPY ./src /root/ros2_ws/src

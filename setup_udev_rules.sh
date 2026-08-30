@@ -44,11 +44,13 @@ SUBSYSTEM=="tty", KERNELS=="1-2.4", SYMLINK+="roboclaw_left", MODE="0666"
 SUBSYSTEM=="tty", KERNELS=="1-2.2", SYMLINK+="roboclaw_right", MODE="0666"
 
 # ============================================================
-# SO-ARM101 Servo Motor Controller (Feetech / CH340 / FTDI)
+# SO-ARM101 Servo Motor Controller (Feetech / CH343 / CH9102 / FTDI)
 # ============================================================
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="arm_controller", MODE="0666"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="arm_controller", MODE="0666"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="arm_controller", MODE="0666"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", SYMLINK+="arm_controller", MODE="0666"
+KERNEL=="ttyACM*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", SYMLINK+="arm_controller", MODE="0666"
 EOF
 
 echo "Reloading udev rules..."

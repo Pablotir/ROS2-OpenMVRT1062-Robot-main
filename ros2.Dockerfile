@@ -66,9 +66,13 @@ RUN apt-get update && \
 # ── Python dependencies ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple/ pyserial pillow "numpy<2.0.0,>=1.24.4"
 
-# ── Build librealsense2 from source (RSUSB backend + CUDA) ───────────────────
-# No apt package for ARM64 JetPack 6. RSUSB avoids kernel patching.
+# ── Build librealsense2 from source (V4L2 kernel backend) ────────────────────
+# No apt package for ARM64 JetPack 6.
 # Pinned to v2.58.3 — must match realsense-ros tag 4.58.1 below.
+# NOTE: FORCE_RSUSB_BACKEND=false → uses V4L2/uvcvideo kernel driver.
+#       RSUSB backend causes "double free or corruption" heap crash on ARM64
+#       Jetson because libusb and the kernel uvcvideo driver both try to claim
+#       the same USB interfaces simultaneously.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev libusb-1.0-0-dev pkg-config libgtk-3-dev \
         libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev && \
@@ -77,8 +81,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake .. \
         -DBUILD_PYTHON_BINDINGS:bool=true \
         -DPYTHON_EXECUTABLE=$(which python3) \
-        -DFORCE_RSUSB_BACKEND=true \
-        -DBUILD_WITH_CUDA=true \
+        -DFORCE_RSUSB_BACKEND=false \
         -DBUILD_EXAMPLES=false \
         -DBUILD_GRAPHICAL_EXAMPLES=false \
         -DCMAKE_BUILD_TYPE=Release && \

@@ -94,7 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── Install LeRobot for SO-ARM101 (Python 3.10 LTS tag v0.4.0) ────────────────
 RUN pip3 install --no-cache-dir -i https://pypi.org/simple "setuptools<70.0.0" "wheel<0.44.0" "numpy<2.0.0,>=1.24.4" && \
-    pip3 install --no-cache-dir -i https://pypi.org/simple einops draccus "huggingface-hub>=0.20.0" safetensors && \
+    pip3 install --no-cache-dir -i https://pypi.org/simple einops draccus "huggingface-hub>=0.20.0" safetensors feetech-servo-sdk && \
     git clone --depth 1 -b v0.4.0 https://github.com/huggingface/lerobot.git /opt/lerobot && \
     cd /opt/lerobot && \
     pip3 install --no-cache-dir -i https://pypi.org/simple --no-deps -e .

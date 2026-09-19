@@ -100,7 +100,7 @@ RUN pip3 install --no-cache-dir -i https://pypi.org/simple "setuptools<70.0.0" "
     pip3 install --no-cache-dir -i https://pypi.org/simple --no-deps -e .
 
 # ── Install Ultralytics & Ensure NumPy 1.x ABI ────────────────────────────────
-RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics && \
+RUN pip3 install --no-cache-dir -i https://pypi.org/simple ultralytics ftfy "git+https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i https://pypi.org/simple "numpy<2.0.0,>=1.24.4"
 
 # ── Clone external ROS2 packages ──────────────────────────────────────────────

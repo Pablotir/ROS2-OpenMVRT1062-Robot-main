@@ -144,33 +144,45 @@ def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
 
 def _build_T_cam_wrist() -> np.ndarray:
     """
-    Build the static 4×4 homogeneous calibration matrix T_cam_wrist.
-    Transforms points from RealSense Camera Optical Frame (X=Right, Y=Down, Z=Forward depth)
-    into the Arm Wrist Frame (X=Forward along gripper, Y=Up, Z=Left).
-
-    CAM_PITCH_DEG is positive when camera is tilted downward toward the table.
+    Build the 4x4 homogeneous calibration matrix T_cam_wrist.
+    Loads the multi-pose optimization result from hand_eye_calibration.yaml
+    if available, otherwise falls back to the CAD mount matrix.
     """
+    import os, yaml
+    calib_paths = [
+        "/root/ros2_ws/calibration/hand_eye_calibration.yaml",
+        os.path.join(os.path.dirname(__file__), "..", "calibration", "hand_eye_calibration.yaml"),
+        os.path.join(os.path.dirname(__file__), "calibration", "hand_eye_calibration.yaml"),
+        "calibration/hand_eye_calibration.yaml",
+        "hand_eye_calibration.yaml"
+    ]
+    for p in calib_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, 'r') as f:
+                    calib = yaml.safe_load(f)
+                R = np.array(calib['rotation_matrix'], dtype=np.float64)
+                t = np.array(calib['translation_mm'], dtype=np.float64).flatten()
+                T = np.eye(4)
+                T[:3, :3] = R
+                T[:3, 3] = t
+                method = calib.get('method', 'CALIBRATED')
+                print(f"✅ Loaded calibrated T_cam_wrist from: {p} ({method})")
+                print(f"   Translation (mm): X={t[0]:.1f}, Y={t[1]:.1f}, Z={t[2]:.1f}")
+                return T
+            except Exception as e:
+                print(f"⚠️ Failed reading {p}: {e}")
+
+    print("⚠️  hand_eye_calibration.yaml not found — using CAD mount matrix fallback.")
     alpha = math.radians(CAM_PITCH_DEG)
-
     sin_a, cos_a = math.sin(alpha), math.cos(alpha)
-
-    # Base rotation mapping Camera Optical Frame to Wrist Frame:
-    # Forward (Z_cam) -> Wrist +X (forward) and Wrist +Y (down)
-    # Down (Y_cam)    -> Wrist -X (backward) and Wrist +Y (down)
-    # Right (X_cam)   -> Wrist -Z (right)
     R = np.array([
-        [ 0.0, -sin_a,  cos_a],   # Wrist X (forward)
-        [ 0.0,  cos_a,  sin_a],   # Wrist Y (down)
-        [-1.0,   0.0,    0.0 ],   # Wrist Z (left)
+        [ 0.0, -sin_a,  cos_a],
+        [ 0.0,  cos_a,  sin_a],
+        [-1.0,   0.0,    0.0 ],
     ])
-
     T = np.eye(4)
     T[:3, :3] = R
-    
-    # Translation mapping offsets to Wrist Frame:
-    # CAM_Z_OFFSET_MM (+ve = forward) -> Wrist +X
-    # CAM_Y_OFFSET_MM (+ve = above)   -> Wrist -Y (since Wrist Y points down)
-    # CAM_X_OFFSET_MM (+ve = left)    -> Wrist +Z (since Wrist Z points left)
     T[:3, 3]  = [CAM_Z_OFFSET_MM, -CAM_Y_OFFSET_MM, CAM_X_OFFSET_MM]
     return T
 
@@ -200,34 +212,32 @@ ALIGN_INIT_MAX_PAN  = 25.0
 ALIGN_INIT_MAX_LIFT = 12.0
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# wrist_roll is now commanded — set to 0° (neutral / horizontal roll)
+# Calibrated scan posture (from calibration/arm_reference_poses.yaml)
 _BASE = {
-    "shoulder_pan.pos":   -1.4,
-    "shoulder_lift.pos": -57.6,
-    "elbow_flex.pos":     -3.3,
-    "wrist_flex.pos":     86.0,
-    "gripper.pos":        60.0,
+    "shoulder_pan.pos":   -4.48,
+    "shoulder_lift.pos": -106.02,
+    "elbow_flex.pos":     99.91,
+    "wrist_flex.pos":     33.41,
+    "wrist_roll.pos":   -155.96,
+    "gripper.pos":        73.84,
 }
-# Store pose: compact folded posture with neutral wrist (0° — does not exceed neutral)
+# Calibrated stow posture (from calibration/arm_reference_poses.yaml)
 _STOW_BASE = {
-    "shoulder_pan.pos":   -1.6,
-    "shoulder_lift.pos": -104.5,
-    "elbow_flex.pos":     96.5,
-    "wrist_flex.pos":      0.0,   # neutral wrist position in store mode
-    "gripper.pos":        60.0,
+    "shoulder_pan.pos":   -4.48,
+    "shoulder_lift.pos": -106.11,
+    "elbow_flex.pos":    100.00,
+    "wrist_flex.pos":     75.96,
+    "wrist_roll.pos":   -156.75,
+    "gripper.pos":        73.77,
 }
 
-
-# Align-ready pose: arm extended forward at a comfortable height (Image 1).
-# The arm snaps to this pose (at the detected pan angle) before closed-loop
-# visual alignment so the wrist is in FRONT of the shoulder pivot and
-# FK-based depth→base transforms produce correct, reachable coordinates.
 _ALIGN_READY = {
-    "shoulder_pan.pos":   -1.4,   # overwritten in pipeline to match ball pan
-    "shoulder_lift.pos":  86.6,   # Image 1 — arm extended forward horizontally
+    "shoulder_pan.pos":   -4.48,   # overwritten in pipeline to match target pan
+    "shoulder_lift.pos":  86.6,   # arm extended forward horizontally
     "elbow_flex.pos":    -73.5,
     "wrist_flex.pos":     -8.9,
-    "gripper.pos":        60.0,
+    "wrist_roll.pos":   -155.96,
+    "gripper.pos":        73.84,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -582,62 +592,58 @@ def _set_torque(robot, enable: bool):
 def forward_kinematics(q: dict) -> np.ndarray:
     """
     Full 4×4 homogeneous Forward Kinematics: returns T_wrist_base.
-
-    T_wrist_base transforms a point expressed in the WRIST frame into
-    the arm BASE frame (origin = shoulder pivot, +X forward, +Y left, +Z up).
-
-    q: dict with shoulder_pan/lift/elbow_flex/wrist_flex in degrees.
-
-    Steps:
-      1. Base pan (rotation about Z)
-      2. Sagittal-plane chain (J2 shoulder_lift, J3 elbow_flex, J4 wrist_flex)
-         using cumulative angles from the horizontal reference
-      3. Combined into standard 4×4 [R | t; 0 0 0 1]
+    Matches calibrate_hand_eye.py and validate_calibration.py.
     """
-    pan  = math.radians(q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
+    pan  = math.radians(-q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
     lift = q.get("shoulder_lift.pos", 0.0)
     elb  = q.get("elbow_flex.pos",    0.0)
     wst  = q.get("wrist_flex.pos",    0.0)
+    roll = math.radians(-q.get("wrist_roll.pos",   0.0))
 
-    # Cumulative sagittal angles (from horizontal, matching FK convention)
-    # SO-ARM101: lift 0 = UP (90° from horizontal). Positive lift = forward tilt.
-    t1 = math.radians(90.0 - lift)          # shoulder absolute angle
-    
-    # Elbow: Straight arm is -81.0°. Increasing elbow folds it forward/down.
-    t2 = t1 - math.radians(elb + 81.0)      # elbow absolute angle
-    
-    # Wrist: Straight wrist is -5.0°. Increasing wrist folds it forward/down.
-    t3 = t2 - math.radians(wst + 5.0)       # wrist absolute angle
+    t1 = math.radians(90.0 - lift)
+    t2 = t1 - math.radians(elb + 81.0)
+    t3 = t2 - math.radians(wst + 5.0)
 
-    # Wrist pivot position in the sagittal plane
     rho_w = IK_L1 * math.cos(t1) + IK_L2 * math.cos(t2)
     z_w   = IK_L1 * math.sin(t1) + IK_L2 * math.sin(t2)
 
-    # Wrist position in 3D base frame
     wx = rho_w * math.cos(pan)
     wy = rho_w * math.sin(pan)
     wz = z_w
 
-    # Orientation of the wrist frame in base frame
-    # X-axis of wrist = approach direction (along wrist link)
+    # Approach direction (Wrist X)
     ax = math.cos(t3) * math.cos(pan)
     ay = math.cos(t3) * math.sin(pan)
     az = math.sin(t3)
 
-    # Z-axis of wrist = perpendicular to sagittal plane (= pan rotation axis)
+    # Perpendicular direction (Wrist Z)
     zx = -math.sin(pan)
     zy =  math.cos(pan)
     zz = 0.0
 
-    # Y-axis = Z cross X
+    # Wrist Y = Z cross X
     yx = zy * az - zz * ay
     yy = zz * ax - zx * az
     yz = zx * ay - zy * ax
 
+    R_base = np.array([
+        [ax, yx, zx],
+        [ay, yy, zy],
+        [az, yz, zz]
+    ])
+
+    R_roll = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, math.cos(roll), -math.sin(roll)],
+        [0.0, math.sin(roll),  math.cos(roll)]
+    ])
+
+    R_final = R_base @ R_roll
+
     T = np.array([
-        [ax, yx, zx, wx],
-        [ay, yy, zy, wy],
-        [az, yz, zz, wz],
+        [R_final[0,0], R_final[0,1], R_final[0,2], wx],
+        [R_final[1,0], R_final[1,1], R_final[1,2], wy],
+        [R_final[2,0], R_final[2,1], R_final[2,2], wz],
         [0., 0., 0., 1.],
     ])
     return T
@@ -646,14 +652,14 @@ def forward_kinematics(q: dict) -> np.ndarray:
 def solve_ik(x_mm: float, y_mm: float, z_mm: float,
              end_pitch_deg: float | None = None,
              current_joints: dict | None = None,
-             wrist_roll_deg: float = 0.0) -> dict | None:
+             wrist_roll_deg: float = -155.96) -> dict | None:
     """
     Closed-form analytical IK for SO-ARM101.
     Target (x_mm, y_mm, z_mm) is in the ARM BASE frame.
     """
     # ── J1 (base pan) ────────────────────────────────────────────────────────
     pan_rad = math.atan2(y_mm, x_mm)
-    pan_deg = math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG
+    pan_deg = -(math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG)
 
     if pan_deg < PAN_MIN_DEG or pan_deg > PAN_MAX_DEG:
         print(f"   ⚠️  IK reject: pan target {pan_deg:.1f}° out of bounds "
@@ -727,6 +733,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 "shoulder_lift.pos": m_lift,
                 "elbow_flex.pos":    m_elbow,
                 "wrist_flex.pos":    m_wrist,
+                "wrist_roll.pos":    wrist_roll_deg,
                 "gripper.pos":       60.0,
             })
 
@@ -1776,11 +1783,37 @@ def main():
     print(f"📐 T_cam_wrist built:")
     print(f"   offsets X={CAM_X_OFFSET_MM}mm  Y={CAM_Y_OFFSET_MM}mm  Z={CAM_Z_OFFSET_MM}mm  pitch={CAM_PITCH_DEG}°")
 
-    # ── YOLO segmentation model ───────────────────────────────────────────────
-    # yolo11n-seg.pt gives us segmentation masks for accurate mask-based depth.
-    # The model is filtered by YOLO_CLASS_ID at runtime.
-    model = YOLO("yolo11n-seg.pt")
-    print(f"   🎯 YOLO-seg targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
+    global TARGET_DESC, YOLO_CLASS_ID
+    target_in = input(f"\n🎯 Enter object to grab (e.g. 'bottle', 'cup', 'red ball') [default '{TARGET_DESC}']: ").strip()
+    if target_in:
+        TARGET_DESC = target_in
+
+    # Resolve model path (prefer yolov8s-worldv2.pt)
+    model_paths = [
+        "/root/ros2_ws/models/yolov8s-worldv2.pt",
+        os.path.join(os.path.dirname(__file__), "..", "models", "yolov8s-worldv2.pt"),
+        os.path.join(os.path.dirname(__file__), "models", "yolov8s-worldv2.pt"),
+        "models/yolov8s-worldv2.pt",
+        "yolov8s-worldv2.pt",
+        "yolov8n-seg.pt",
+        "yolo11n-seg.pt"
+    ]
+    chosen_path = None
+    for mp in model_paths:
+        if os.path.exists(mp):
+            chosen_path = mp
+            break
+    if chosen_path is None:
+        chosen_path = "/root/ros2_ws/models/yolov8s-worldv2.pt"
+
+    print(f"Loading YOLO model: {chosen_path}...")
+    model = YOLO(chosen_path)
+    if "world" in chosen_path.lower() or hasattr(model, "set_classes"):
+        model.set_classes([TARGET_DESC])
+        YOLO_CLASS_ID = 0  # In YOLO-World, the single custom class is index 0
+        print(f"   🌍 YOLO-World loaded and targeting: ['{TARGET_DESC}'] (Class ID: {YOLO_CLASS_ID})")
+    else:
+        print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
     print("🔌 Connecting to SO-ARM101...")
@@ -2128,7 +2161,8 @@ def main():
             
             grab_pos = solve_ik(arm_x, arm_y, arm_z,
                                 end_pitch_deg=target_pitch,
-                                current_joints=current_j)
+                                current_joints=current_j,
+                                wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
             if grab_pos is None:
                 print("⚠️  IK: target outside workspace — restarting search")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -2140,6 +2174,7 @@ def main():
             print(f"   Lift  → {grab_pos['shoulder_lift.pos']:+.1f}°")
             print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
             print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
+            print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
 
             if do_manual_lunge:
                 # ── Manual Lunge Demonstration ────────────────────────────────────

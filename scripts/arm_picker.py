@@ -39,6 +39,7 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 #   rotating the roll to align with the claw opening.
 # ─────────────────────────────────────────────────────────────────────────────
 """
+import os, sys, yaml
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 import pyrealsense2 as rs

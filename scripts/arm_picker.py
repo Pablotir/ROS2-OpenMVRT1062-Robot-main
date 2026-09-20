@@ -47,6 +47,21 @@ import requests
 
 from ultralytics import YOLO
 
+# ── GUI / Display handling ───────────────────────────────────────────────────
+GUI_AVAILABLE = True
+
+def safe_imshow(winname: str, mat: np.ndarray, wait_ms: int = 1):
+    global GUI_AVAILABLE
+    if not GUI_AVAILABLE:
+        return
+    try:
+        cv2.imshow(winname, mat)
+        cv2.waitKey(wait_ms)
+    except (cv2.error, Exception) as e:
+        err_msg = str(e).splitlines()[0] if str(e) else "Unknown error"
+        print(f"⚠️  Display unavailable ({err_msg}) — switching to headless mode.")
+        GUI_AVAILABLE = False
+
 try:
     from lerobot.robots.so101_follower.so101_follower import SO101Follower as SOFollower
     from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig as SOFollowerRobotConfig
@@ -213,32 +228,29 @@ ALIGN_INIT_MAX_PAN  = 25.0
 ALIGN_INIT_MAX_LIFT = 12.0
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# Calibrated scan posture (from calibration/arm_reference_poses.yaml)
+# Default search posture: arm tilted forward, camera facing table/floor
 _BASE = {
-    "shoulder_pan.pos":   -4.48,
-    "shoulder_lift.pos": -106.02,
-    "elbow_flex.pos":     99.91,
-    "wrist_flex.pos":     33.41,
-    "wrist_roll.pos":   -155.96,
-    "gripper.pos":        73.84,
+    "shoulder_pan.pos":   -1.4,
+    "shoulder_lift.pos": -57.6,
+    "elbow_flex.pos":     -3.3,
+    "wrist_flex.pos":     86.0,
+    "gripper.pos":        60.0,
 }
-# Calibrated stow posture (from calibration/arm_reference_poses.yaml)
+# Default stow posture: compact folded posture with neutral wrist
 _STOW_BASE = {
-    "shoulder_pan.pos":   -4.48,
-    "shoulder_lift.pos": -106.11,
-    "elbow_flex.pos":    100.00,
-    "wrist_flex.pos":     75.96,
-    "wrist_roll.pos":   -156.75,
-    "gripper.pos":        73.77,
+    "shoulder_pan.pos":   -1.6,
+    "shoulder_lift.pos": -104.5,
+    "elbow_flex.pos":     96.5,
+    "wrist_flex.pos":      0.0,
+    "gripper.pos":        60.0,
 }
 
 _ALIGN_READY = {
-    "shoulder_pan.pos":   -4.48,   # overwritten in pipeline to match target pan
+    "shoulder_pan.pos":   -1.4,   # overwritten in pipeline to match target pan
     "shoulder_lift.pos":  86.6,   # arm extended forward horizontally
     "elbow_flex.pos":    -73.5,
     "wrist_flex.pos":     -8.9,
-    "wrist_roll.pos":   -155.96,
-    "gripper.pos":        73.84,
+    "gripper.pos":        60.0,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -653,7 +665,7 @@ def forward_kinematics(q: dict) -> np.ndarray:
 def solve_ik(x_mm: float, y_mm: float, z_mm: float,
              end_pitch_deg: float | None = None,
              current_joints: dict | None = None,
-             wrist_roll_deg: float = -155.96) -> dict | None:
+             wrist_roll_deg: float = 0.0) -> dict | None:
     """
     Closed-form analytical IK for SO-ARM101.
     Target (x_mm, y_mm, z_mm) is in the ARM BASE frame.
@@ -1380,8 +1392,7 @@ def align_arm(robot, cap: RealSenseStream, model,
             cv2.putText(display,
                 f"🎯 ALIGNING — lost ({lost_streak}/{ALIGN_LOST_GRACE})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,100,255), 2)
-            cv2.imshow("Picker Vision", display)
-            cv2.waitKey(1)
+            safe_imshow("Picker Vision", display)
             if lost_streak >= ALIGN_LOST_GRACE:
                 if last_obj_pixel is not None:
                     last_pan_err = last_obj_pixel[0] - frame_cx
@@ -1458,8 +1469,7 @@ def align_arm(robot, cap: RealSenseStream, model,
         cv2.putText(display,
             f"{status} [{src.upper()}]  err=({pan_err:+d},{lift_err:+d})px",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
-        cv2.imshow("Picker Vision", display)
-        cv2.waitKey(1)
+        safe_imshow("Picker Vision", display)
 
     if last_obj_pixel is not None:
         print(f"   ⏳ Alignment hardcap reached ({effective_max} frames). Proceeding with best alignment.")
@@ -1777,6 +1787,13 @@ def main():
         
     do_manual_lunge = (choice == "1")
 
+    global GUI_AVAILABLE
+    if "--headless" in sys.argv or not os.environ.get("DISPLAY"):
+        GUI_AVAILABLE = False
+        print("🖥️  Running in HEADLESS mode (no GUI display).")
+    else:
+        print("🖥️  GUI display enabled. (If X11 fails, run 'xhost +local:root' on Jetson host).")
+
     print("🚀 Initialising RealSense D405 + IK Pick-and-Place Pipeline...")
 
     global T_CAM_WRIST
@@ -1816,12 +1833,52 @@ def main():
     else:
         print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
 
+    # ── Auto-sync persistent calibration if available ─────────────────────────
+    calib_source_paths = [
+        "/root/ros2_ws/calibration/jetson_arm.json",
+        os.path.join(os.path.dirname(__file__), "..", "calibration", "jetson_arm.json"),
+        os.path.join(os.path.dirname(__file__), "calibration", "jetson_arm.json"),
+        "calibration/jetson_arm.json"
+    ]
+    target_calib_dirs = [
+        "/data/models/huggingface/lerobot/calibration/robots/so101_follower",
+        os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots/so101_follower")
+    ]
+    for src in calib_source_paths:
+        if os.path.exists(src) and os.path.getsize(src) > 0:
+            for tdir in target_calib_dirs:
+                try:
+                    os.makedirs(tdir, exist_ok=True)
+                    dst = os.path.join(tdir, f"{ARM_ID}.json")
+                    if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+                        import shutil
+                        shutil.copyfile(src, dst)
+                        print(f"   📋 Synced persistent calibration: {src} -> {dst}")
+                except Exception as e:
+                    print(f"   ⚠️ Could not sync calibration to {tdir}: {e}")
+            break
+
     # ── Robot arm ─────────────────────────────────────────────────────────────
     print("🔌 Connecting to SO-ARM101...")
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
     robot.connect()
     print("   ✅ Arm connected")
+
+    # If LeRobot generated or updated a calibration file, back it up to host volume
+    for tdir in target_calib_dirs:
+        dst = os.path.join(tdir, f"{ARM_ID}.json")
+        if os.path.exists(dst) and os.path.getsize(dst) > 0:
+            try:
+                for src in calib_source_paths:
+                    parent_dir = os.path.dirname(os.path.abspath(src))
+                    if os.path.isdir(parent_dir):
+                        import shutil
+                        shutil.copyfile(dst, src)
+                        break
+            except Exception:
+                pass
+            break
 
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
@@ -1860,7 +1917,8 @@ def main():
             print(f"   Stow error: {e}")
         try:
             cap.stop()
-            cv2.destroyAllWindows()
+            if GUI_AVAILABLE:
+                cv2.destroyAllWindows()
         except Exception:
             pass
     atexit.register(_emergency_stow)
@@ -1897,8 +1955,7 @@ def main():
 
             # ── Throttle YOLO to ~5 fps during search ─────────────────────────
             if time.time() - last_yolo_t < 0.2:
-                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-                cv2.waitKey(1)
+                safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
                 continue
             last_yolo_t = time.time()
 
@@ -1942,8 +1999,7 @@ def main():
                     sweep_cmd["shoulder_pan.pos"] = sweep_pan
                     robot.send_action(sweep_cmd)
                 
-                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-                cv2.waitKey(1)
+                safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
                 continue
 
             # ── YOLO candidate found ──────────────────────────────────────────
@@ -1974,8 +2030,7 @@ def main():
             cv2.putText(display, f"YOLO: {TARGET_DESC}",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             
-            cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-            cv2.waitKey(1)
+            safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
 
             if SKIP_MOONDREAM:
                 print("⏭️  Moondream skipped — grabbing on YOLO detection")

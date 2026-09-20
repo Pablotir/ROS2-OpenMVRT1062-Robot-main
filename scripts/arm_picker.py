@@ -632,6 +632,50 @@ def level_approach(robot, target: dict, step_size=0.8, step_delay=0.03):
         time.sleep(step_delay)
 
 
+def safe_startup_move(robot, target: dict):
+    """
+    Intelligently brings the arm from rest to scan position in gentle stages
+    to prevent gravitational torque overload and eliminate current spikes.
+    Stage 1: Fold elbow & wrist inward to minimize cantilever torque on shoulder.
+    Stage 2: Smoothly raise shoulder_lift to target.
+    Stage 3: Extend elbow, wrist, and pan to final target position.
+    """
+    cur = get_pos(robot)
+    if not cur:
+        print("⚠️  Warning: Could not read current arm positions! Attempting direct smooth move.")
+        smooth_move(robot, target, step_size=0.5, step_delay=0.035)
+        return
+
+    # Check if already in position
+    max_delta = max(abs(target.get(j, cur.get(j, 0.0)) - cur.get(j, 0.0)) for j in target)
+    if max_delta < 5.0:
+        print("   ✅ Arm already near Start Position.")
+        return
+
+    print("   Stage 1: Folding elbow & wrist inward to reduce gravitational torque...")
+    stage1 = dict(cur)
+    if "elbow_flex.pos" in target:
+        stage1["elbow_flex.pos"] = target["elbow_flex.pos"]
+    if "wrist_flex.pos" in target:
+        stage1["wrist_flex.pos"] = target["wrist_flex.pos"]
+    if "gripper.pos" in target:
+        stage1["gripper.pos"] = target["gripper.pos"]
+    smooth_move(robot, stage1, step_size=0.6, step_delay=0.03)
+    time.sleep(0.3)
+
+    print("   Stage 2: Smoothly raising shoulder...")
+    stage2 = dict(stage1)
+    if "shoulder_lift.pos" in target:
+        stage2["shoulder_lift.pos"] = target["shoulder_lift.pos"]
+    smooth_move(robot, stage2, step_size=0.5, step_delay=0.035)
+    time.sleep(0.3)
+
+    print("   Stage 3: Setting final scan posture...")
+    smooth_move(robot, target, step_size=0.6, step_delay=0.03)
+    time.sleep(0.5)
+    print("   ✅ Start Position reached safely.")
+
+
 def _set_torque(robot, enable: bool):
     action_str = "enable" if enable else "disable"
     val = 1 if enable else 0
@@ -1906,10 +1950,14 @@ def main():
         os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots/so101_follower")
     ]
     
-    # Safe hardware baseline fallback if calibration file lacks homing offsets
-    SAFE_HOMING = {
-        "shoulder_pan": 2036, "shoulder_lift": 1996, "elbow_flex": 2060,
-        "wrist_flex": 1966, "wrist_roll": 2130, "gripper": 779
+    # Baseline safe hardware limits (Feetech register homing_offset must be 0)
+    SAFE_LIMITS = {
+        "shoulder_pan":  {"range_min": 866, "range_max": 3187, "homing_offset": 0},
+        "shoulder_lift": {"range_min": 750, "range_max": 3250, "homing_offset": 0},
+        "elbow_flex":    {"range_min": 900, "range_max": 3250, "homing_offset": 0},
+        "wrist_flex":    {"range_min": 764, "range_max": 2815, "homing_offset": 0},
+        "wrist_roll":    {"range_min": 765, "range_max": 3495, "homing_offset": 0},
+        "gripper":       {"range_min": 766, "range_max": 2049, "homing_offset": 0},
     }
 
     for src in calib_source_paths:
@@ -1919,14 +1967,20 @@ def main():
                 with open(src, "r") as f:
                     cdata = json.load(f)
                 
-                # Check if homing_offset was corrupted to 0
+                # Check for wrap-around or non-zero homing offsets
                 needs_repair = False
-                for jname, hval in SAFE_HOMING.items():
-                    if jname in cdata and cdata[jname].get("homing_offset", 0) == 0:
-                        cdata[jname]["homing_offset"] = hval
-                        needs_repair = True
+                for jname, slims in SAFE_LIMITS.items():
+                    if jname in cdata:
+                        if cdata[jname].get("homing_offset", 0) != 0:
+                            cdata[jname]["homing_offset"] = 0
+                            needs_repair = True
+                        if cdata[jname].get("range_min", 0) == 0 and cdata[jname].get("range_max", 4095) == 4095:
+                            cdata[jname]["range_min"] = slims["range_min"]
+                            cdata[jname]["range_max"] = slims["range_max"]
+                            needs_repair = True
+
                 if needs_repair:
-                    print(f"   🔧 Repairing zero homing offsets in {src}...")
+                    print(f"   🔧 Normalizing calibration parameters in {src}...")
                     with open(src, "w") as f:
                         json.dump(cdata, f, indent=4)
 
@@ -1947,7 +2001,22 @@ def main():
     print("🔌 Connecting to SO-ARM101...")
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
-    robot.connect()
+
+    # Auto-confirm LeRobot's calibration ENTER prompt using verified persistent calibration
+    import builtins
+    _orig_input = builtins.input
+    def _auto_calibration_input(prompt=""):
+        prompt_str = str(prompt)
+        if "Press ENTER to use provided calibration file" in prompt_str:
+            print(f"{prompt_str.strip()}\n   ➡️  Auto-confirmed: Loading verified calibration ({ARM_ID}).")
+            return ""
+        return _orig_input(prompt)
+
+    builtins.input = _auto_calibration_input
+    try:
+        robot.connect()
+    finally:
+        builtins.input = _orig_input
     print("   ✅ Arm connected")
 
     # If LeRobot created or updated calibration, mirror it back ONLY if valid
@@ -1958,7 +2027,7 @@ def main():
                 import json, shutil
                 with open(dst, "r") as f:
                     ddata = json.load(f)
-                if ddata.get("shoulder_pan", {}).get("homing_offset", 0) != 0:
+                if ddata.get("shoulder_pan", {}).get("homing_offset", 0) == 0:
                     for src in calib_source_paths:
                         parent_dir = os.path.dirname(os.path.abspath(src))
                         if os.path.isdir(parent_dir):
@@ -2011,10 +2080,10 @@ def main():
     signal.signal(signal.SIGTERM, cleanup_and_exit)
     atexit.register(cleanup_and_exit)
 
-    # ── Move to start with gentle S-curve acceleration ────────────────────────
+    # ── Move to start with staged soft-start ──────────────────────────────────
     print("\n▶ Moving to Start Position gently...")
-    smooth_move(robot, START_POS, step_size=0.6, step_delay=0.03)
-    time.sleep(0.8)
+    safe_startup_move(robot, START_POS)
+    time.sleep(0.5)
 
     last_yolo_t = 0.0
     STATE       = "SEARCHING"

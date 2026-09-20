@@ -627,58 +627,62 @@ def _set_torque(robot, enable: bool):
 def forward_kinematics(q: dict) -> np.ndarray:
     """
     Full 4×4 homogeneous Forward Kinematics: returns T_wrist_base.
-    Matches calibrate_hand_eye.py and validate_calibration.py.
+
+    T_wrist_base transforms a point expressed in the WRIST frame into
+    the arm BASE frame (origin = shoulder pivot, +X forward, +Y left, +Z up).
+
+    q: dict with shoulder_pan/lift/elbow_flex/wrist_flex in degrees.
+
+    Steps:
+      1. Base pan (rotation about Z)
+      2. Sagittal-plane chain (J2 shoulder_lift, J3 elbow_flex, J4 wrist_flex)
+         using cumulative angles from the horizontal reference
+      3. Combined into standard 4×4 [R | t; 0 0 0 1]
     """
-    pan  = math.radians(-q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
+    pan  = math.radians(q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
     lift = q.get("shoulder_lift.pos", 0.0)
     elb  = q.get("elbow_flex.pos",    0.0)
     wst  = q.get("wrist_flex.pos",    0.0)
-    roll = math.radians(-q.get("wrist_roll.pos",   0.0))
 
-    t1 = math.radians(90.0 - lift)
-    t2 = t1 - math.radians(elb + 81.0)
-    t3 = t2 - math.radians(wst + 5.0)
+    # Cumulative sagittal angles (from horizontal, matching FK convention)
+    # SO-ARM101: lift 0 = UP (90° from horizontal). Positive lift = forward tilt.
+    t1 = math.radians(90.0 - lift)          # shoulder absolute angle
+    
+    # Elbow: Straight arm is -81.0°. Increasing elbow folds it forward/down.
+    t2 = t1 - math.radians(elb + 81.0)      # elbow absolute angle
+    
+    # Wrist: Straight wrist is -5.0°. Increasing wrist folds it forward/down.
+    t3 = t2 - math.radians(wst + 5.0)       # wrist absolute angle
 
+    # Wrist pivot position in the sagittal plane
     rho_w = IK_L1 * math.cos(t1) + IK_L2 * math.cos(t2)
     z_w   = IK_L1 * math.sin(t1) + IK_L2 * math.sin(t2)
 
+    # Wrist position in 3D base frame
     wx = rho_w * math.cos(pan)
     wy = rho_w * math.sin(pan)
     wz = z_w
 
-    # Approach direction (Wrist X)
+    # Orientation of the wrist frame in base frame
+    # X-axis of wrist = approach direction (along wrist link)
     ax = math.cos(t3) * math.cos(pan)
     ay = math.cos(t3) * math.sin(pan)
     az = math.sin(t3)
 
-    # Perpendicular direction (Wrist Z)
+    # Z-axis of wrist = perpendicular to sagittal plane (= pan rotation axis)
     zx = -math.sin(pan)
     zy =  math.cos(pan)
     zz = 0.0
 
-    # Wrist Y = Z cross X
+    # Y-axis = Z cross X
     yx = zy * az - zz * ay
     yy = zz * ax - zx * az
     yz = zx * ay - zy * ax
 
-    R_base = np.array([
-        [ax, yx, zx],
-        [ay, yy, zy],
-        [az, yz, zz]
-    ])
-
-    R_roll = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, math.cos(roll), -math.sin(roll)],
-        [0.0, math.sin(roll),  math.cos(roll)]
-    ])
-
-    R_final = R_base @ R_roll
-
     T = np.array([
-        [R_final[0,0], R_final[0,1], R_final[0,2], wx],
-        [R_final[1,0], R_final[1,1], R_final[1,2], wy],
-        [R_final[2,0], R_final[2,1], R_final[2,2], wz],
+        [ax, yx, zx, wx],
+        [ay, yy, zy, wy],
+        [az, yz, zz, wz],
         [0., 0., 0., 1.],
     ])
     return T
@@ -694,7 +698,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     """
     # ── J1 (base pan) ────────────────────────────────────────────────────────
     pan_rad = math.atan2(y_mm, x_mm)
-    pan_deg = -(math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG)
+    pan_deg = math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG
 
     if pan_deg < PAN_MIN_DEG or pan_deg > PAN_MAX_DEG:
         print(f"   ⚠️  IK reject: pan target {pan_deg:.1f}° out of bounds "
@@ -768,7 +772,6 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 "shoulder_lift.pos": m_lift,
                 "elbow_flex.pos":    m_elbow,
                 "wrist_flex.pos":    m_wrist,
-                "wrist_roll.pos":    wrist_roll_deg,
                 "gripper.pos":       60.0,
             })
 
@@ -2254,8 +2257,7 @@ def main():
             
             grab_pos = solve_ik(arm_x, arm_y, arm_z,
                                 end_pitch_deg=target_pitch,
-                                current_joints=current_j,
-                                wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
+                                current_joints=current_j)
             if grab_pos is None:
                 print("⚠️  IK: target outside workspace — restarting search")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -2267,7 +2269,6 @@ def main():
             print(f"   Lift  → {grab_pos['shoulder_lift.pos']:+.1f}°")
             print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
             print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
-            print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
 
             if do_manual_lunge:
                 # ── Manual Lunge Demonstration ────────────────────────────────────

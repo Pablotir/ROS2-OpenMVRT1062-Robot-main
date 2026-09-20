@@ -40,6 +40,21 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 # ─────────────────────────────────────────────────────────────────────────────
 """
 import os, sys, yaml
+
+# ── Ensure Hugging Face and CLIP models persist to host-mounted SSD storage ────
+_hf_dir = os.environ.get("HF_HOME") or "/root/ros2_ws/models/huggingface"
+if not os.path.exists(_hf_dir):
+    _local_hf = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "huggingface"))
+    if os.path.isdir(os.path.dirname(_local_hf)):
+        _hf_dir = _local_hf
+try:
+    os.makedirs(_hf_dir, exist_ok=True)
+except Exception:
+    pass
+os.environ["HF_HOME"] = _hf_dir
+os.environ["TRANSFORMERS_CACHE"] = _hf_dir
+os.environ["TORCH_HOME"] = os.path.join(os.path.dirname(_hf_dir), "torch")
+
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 import pyrealsense2 as rs
@@ -328,14 +343,14 @@ class RealSenseStream:
         self._color      = np.zeros((height, width, 3), dtype=np.uint8)
         self._colorized  = np.zeros((height, width, 3), dtype=np.uint8)
         self._depth_img  = None
-        self._intrinsics = None
         self._running    = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread     = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def _loop(self):
         while self._running:
             try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=5000)
+                frames      = self._pipeline.wait_for_frames(timeout_ms=1000)
                 # D405 RGB and Depth share the same ISP sensor, so they are perfectly aligned natively.
                 # Do NOT use rs.align, as it can corrupt D405 depth frames.
                 color_frame = frames.get_color_frame()
@@ -489,6 +504,11 @@ class RealSenseStream:
 
     def stop(self):
         self._running = False
+        if hasattr(self, '_thread') and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=1.0)
+            except Exception:
+                pass
         try:
             self._pipeline.stop()
         except Exception:
@@ -498,74 +518,115 @@ class RealSenseStream:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Arm helpers
 # ═══════════════════════════════════════════════════════════════════════════════
-def get_pos(robot) -> dict:
-    obs    = robot.get_observation()
+# Absolute software safety bounds (degrees) to prevent physical hard-stop collisions & stall current trips
+JOINT_LIMITS_DEG = {
+    "shoulder_pan.pos":   (-115.0, 115.0),
+    "shoulder_lift.pos":  (-110.0, 110.0),
+    "elbow_flex.pos":     (-100.0, 105.0),
+    "wrist_flex.pos":     (-95.0,  95.0),
+    "wrist_roll.pos":     (-165.0, 165.0),
+    "gripper.pos":        (0.0,    100.0),
+}
+
+def get_pos(robot, max_retries: int = 3) -> dict:
+    """Read current joint positions with retries to avoid partial observation drops."""
     joints = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
               "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
-    return {k: v for k, v in obs.items() if k in joints}
+    for _ in range(max_retries):
+        try:
+            obs = robot.get_observation()
+            pos = {k: float(v) for k, v in obs.items() if k in joints}
+            if len(pos) >= 5:
+                return pos
+        except Exception:
+            time.sleep(0.02)
+    return {}
 
 
-def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
+def smooth_move(robot, target: dict, step_size=0.8, step_delay=0.03,
                 hold_joints=None):
+    """
+    S-curve smooth trajectory to eliminate current spikes and mechanical stress.
+    Automatically clamps joint angles to physical safety bounds.
+    """
     if hold_joints is None:
         hold_joints = []
     cur = get_pos(robot)
+    if not cur:
+        print("⚠️  Warning: Could not read current arm positions! Skipping move.")
+        return
+
+    # Sanitize and clamp target angles against safety bounds
+    safe_target = {}
+    for j, val in target.items():
+        if j in JOINT_LIMITS_DEG:
+            min_lim, max_lim = JOINT_LIMITS_DEG[j]
+            clamped = max(min_lim, min(max_lim, float(val)))
+            if abs(clamped - float(val)) > 0.1:
+                print(f"⚠️  Clamping {j}: {val:.1f}° -> {clamped:.1f}° (safe range: [{min_lim}, {max_lim}])")
+            safe_target[j] = clamped
+        else:
+            safe_target[j] = float(val)
+
     # Freeze hold_joints at their target immediately
     for j in hold_joints:
-        if j in target:
-            cur[j] = target[j]
-    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+        if j in safe_target:
+            cur[j] = safe_target[j]
+
+    # Calculate max joint angular distance (never default missing joints to 0.0)
+    max_delta = max(abs(safe_target[j] - cur.get(j, safe_target[j])) for j in safe_target)
     if max_delta < 0.5:
         return
-    n = max(1, int(max_delta / step_size))
+
+    # Soft S-curve cosine ease-in/ease-out: starts at 0 velocity, accelerates smoothly, decelerates smoothly
+    n = max(15, int(max_delta / step_size))
     for s in range(1, n + 1):
-        t      = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0))
-                  for j in target}
+        t = s / n
+        ease_t = 0.5 * (1.0 - math.cos(math.pi * t))
+        interp = {j: cur.get(j, safe_target[j]) + ease_t * (safe_target[j] - cur.get(j, safe_target[j]))
+                  for j in safe_target}
         robot.send_action(interp)
         time.sleep(step_delay)
 
 
-def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
+def level_approach(robot, target: dict, step_size=0.8, step_delay=0.03):
     """
-    Move all joints simultaneously toward *target* at uniform speed while
-    continuously adjusting wrist_flex so the gripper stays parallel to the
-    floor (end-effector pitch ≈ 0° relative to horizontal).
-
-    At every interpolation step the wrist angle is computed from the
-    current lift+elbow so that:
-        pitch = t1 + t2 + wrist_motor = 0   (horizontal)
-    where t1, t2 are the FK sagittal angles.
-
-    All servos move at the same rate — no staging.
+    Move all joints simultaneously toward *target* at smooth S-curve speed while
+    continuously adjusting wrist_flex so the gripper stays parallel to the floor.
     """
     cur = get_pos(robot)
-    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+    if not cur:
+        print("⚠️  Warning: Could not read current arm positions! Skipping approach.")
+        return
+
+    safe_target = {}
+    for j, val in target.items():
+        if j in JOINT_LIMITS_DEG:
+            min_lim, max_lim = JOINT_LIMITS_DEG[j]
+            safe_target[j] = max(min_lim, min(max_lim, float(val)))
+        else:
+            safe_target[j] = float(val)
+
+    max_delta = max(abs(safe_target[j] - cur.get(j, safe_target[j])) for j in safe_target)
     if max_delta < 0.5:
         return
-    n = max(1, int(max_delta / step_size))
+    n = max(15, int(max_delta / step_size))
 
     for s in range(1, n + 1):
         t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0))
-                  for j in target}
+        ease_t = 0.5 * (1.0 - math.cos(math.pi * t))
+        interp = {j: cur.get(j, safe_target[j]) + ease_t * (safe_target[j] - cur.get(j, safe_target[j]))
+                  for j in safe_target}
 
         # Compute wrist_flex to keep gripper level (pitch = desired pitch)
-        # FK convention: t1_abs = 90 - lift, t2_abs = t1_abs - (elbow + 81.0)
-        # pitch = t2_abs - (wrist + 5.0). For pitch = 0 (horizontal):
-        # wrist = math.degrees(t2_abs) - 5.0
-        # Target may have a non-zero desired pitch, so interpolate to final wrist.
-        lift_now = interp.get("shoulder_lift.pos", 0.0)
-        elb_now  = interp.get("elbow_flex.pos", 0.0)
+        lift_now = interp.get("shoulder_lift.pos", cur.get("shoulder_lift.pos", 0.0))
+        elb_now  = interp.get("elbow_flex.pos", cur.get("elbow_flex.pos", 0.0))
         t1_rad = math.radians(90.0 - lift_now)
         t2_rad = t1_rad - math.radians(elb_now + 81.0)
-        
-        # level_wrist keeps pitch = 0 (horizontal)
         level_wrist = math.degrees(t2_rad) - 5.0
         
-        # Blend: early steps → level;  final step → target wrist value
-        final_wrist = target.get("wrist_flex.pos", level_wrist)
-        interp["wrist_flex.pos"] = level_wrist + t * (final_wrist - level_wrist)
+        final_wrist = safe_target.get("wrist_flex.pos", level_wrist)
+        interp["wrist_flex.pos"] = level_wrist + ease_t * (final_wrist - level_wrist)
 
         robot.send_action(interp)
         time.sleep(step_delay)
@@ -1844,19 +1905,43 @@ def main():
         "/data/models/huggingface/lerobot/calibration/robots/so101_follower",
         os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots/so101_follower")
     ]
+    
+    # Safe hardware baseline fallback if calibration file lacks homing offsets
+    SAFE_HOMING = {
+        "shoulder_pan": 2036, "shoulder_lift": 1996, "elbow_flex": 2060,
+        "wrist_flex": 1966, "wrist_roll": 2130, "gripper": 779
+    }
+
     for src in calib_source_paths:
         if os.path.exists(src) and os.path.getsize(src) > 0:
-            for tdir in target_calib_dirs:
-                try:
-                    os.makedirs(tdir, exist_ok=True)
-                    dst = os.path.join(tdir, f"{ARM_ID}.json")
-                    if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-                        import shutil
+            try:
+                import json, shutil
+                with open(src, "r") as f:
+                    cdata = json.load(f)
+                
+                # Check if homing_offset was corrupted to 0
+                needs_repair = False
+                for jname, hval in SAFE_HOMING.items():
+                    if jname in cdata and cdata[jname].get("homing_offset", 0) == 0:
+                        cdata[jname]["homing_offset"] = hval
+                        needs_repair = True
+                if needs_repair:
+                    print(f"   🔧 Repairing zero homing offsets in {src}...")
+                    with open(src, "w") as f:
+                        json.dump(cdata, f, indent=4)
+
+                # Always deploy valid persistent calibration into LeRobot cache directories
+                for tdir in target_calib_dirs:
+                    try:
+                        os.makedirs(tdir, exist_ok=True)
+                        dst = os.path.join(tdir, f"{ARM_ID}.json")
                         shutil.copyfile(src, dst)
-                        print(f"   📋 Synced persistent calibration: {src} -> {dst}")
-                except Exception as e:
-                    print(f"   ⚠️ Could not sync calibration to {tdir}: {e}")
-            break
+                        print(f"   📋 Synced verified calibration: {src} -> {dst}")
+                    except Exception as e:
+                        print(f"   ⚠️ Could not sync calibration to {tdir}: {e}")
+                break
+            except Exception as e:
+                print(f"   ⚠️ Could not process calibration {src}: {e}")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
     print("🔌 Connecting to SO-ARM101...")
@@ -1865,17 +1950,20 @@ def main():
     robot.connect()
     print("   ✅ Arm connected")
 
-    # If LeRobot generated or updated a calibration file, back it up to host volume
+    # If LeRobot created or updated calibration, mirror it back ONLY if valid
     for tdir in target_calib_dirs:
         dst = os.path.join(tdir, f"{ARM_ID}.json")
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
             try:
-                for src in calib_source_paths:
-                    parent_dir = os.path.dirname(os.path.abspath(src))
-                    if os.path.isdir(parent_dir):
-                        import shutil
-                        shutil.copyfile(dst, src)
-                        break
+                import json, shutil
+                with open(dst, "r") as f:
+                    ddata = json.load(f)
+                if ddata.get("shoulder_pan", {}).get("homing_offset", 0) != 0:
+                    for src in calib_source_paths:
+                        parent_dir = os.path.dirname(os.path.abspath(src))
+                        if os.path.isdir(parent_dir):
+                            shutil.copyfile(dst, src)
+                            break
             except Exception:
                 pass
             break
@@ -1883,45 +1971,55 @@ def main():
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
 
-    def handle_exit(sig, frame):
-        print("\n📍 Stowing arm...")
-        smooth_move(robot, STOW)
-        time.sleep(1)
-        robot.disconnect()
-        exit(0)
-    signal.signal(signal.SIGINT, handle_exit)
-
     # ── RealSense D405 ────────────────────────────────────────────────────────
     print("📷 Connecting to RealSense D405...")
     cap = RealSenseStream()
     time.sleep(2.0)   # let first frames arrive and intrinsics populate
 
-    # ── Move to start ─────────────────────────────────────────────────────────
-    print("\n▶ Moving to Start Position...")
-    smooth_move(robot, START_POS)
-    time.sleep(1.0)
+    # ── Unified Safe Shutdown Handler ─────────────────────────────────────────
+    _cleaned_up = False
+    def cleanup_and_exit(sig=None, frame=None):
+        nonlocal _cleaned_up
+        if _cleaned_up:
+            return
+        _cleaned_up = True
+        print("\n📍 Stowing arm and shutting down safely...")
+        try:
+            smooth_move(robot, STOW, step_size=0.8, step_delay=0.03)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"   Stow notice: {e}")
+        try:
+            robot.disconnect()
+            print("   🔌 Robot disconnected.")
+        except Exception:
+            pass
+        try:
+            if 'cap' in locals() and cap is not None:
+                cap.stop()
+                print("   📷 Camera stopped.")
+        except Exception:
+            pass
+        if GUI_AVAILABLE:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+    atexit.register(cleanup_and_exit)
+
+    # ── Move to start with gentle S-curve acceleration ────────────────────────
+    print("\n▶ Moving to Start Position gently...")
+    smooth_move(robot, START_POS, step_size=0.6, step_delay=0.03)
+    time.sleep(0.8)
 
     last_yolo_t = 0.0
     STATE       = "SEARCHING"
     sweep_dir   = 1.0
     sweep_pan   = START_POS["shoulder_pan.pos"]
-
-    # ── Emergency stow ────────────────────────────────────────────────────────
-    def _emergency_stow():
-        print("\n⚠️  Emergency stow triggered...")
-        try:
-            smooth_move(robot, STOW, step_size=3.0)
-            time.sleep(0.5)
-            robot.disconnect()
-        except Exception as e:
-            print(f"   Stow error: {e}")
-        try:
-            cap.stop()
-            if GUI_AVAILABLE:
-                cv2.destroyAllWindows()
-        except Exception:
-            pass
-    atexit.register(_emergency_stow)
 
     try:
         while True:

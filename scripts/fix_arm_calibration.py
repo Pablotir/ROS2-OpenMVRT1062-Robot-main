@@ -6,8 +6,15 @@ Fixes the wrap-around bug (min=0, max=4095) on shoulder_lift, elbow_flex, and wr
 and syncs the file between LeRobot cache and the persistent host volume (/root/ros2_ws/calibration).
 """
 import os
+import sys
 import json
 import shutil
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 CALIB_CACHE_DIR = "/data/models/huggingface/lerobot/calibration/robots/so101_follower"
 CALIB_CACHE_FILE = os.path.join(CALIB_CACHE_DIR, "jetson_arm.json")
@@ -16,12 +23,12 @@ LOCAL_PERSIST_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration"
 
 # Calibrated physical bounds (Feetech STS3215 12-bit encoder, center ~2048)
 SAFE_BOUNDS = {
-    "shoulder_pan":  {"range_min": 866, "range_max": 3187},
-    "shoulder_lift": {"range_min": 750, "range_max": 3250},
-    "elbow_flex":    {"range_min": 900, "range_max": 3250},
-    "wrist_flex":    {"range_min": 764, "range_max": 2815},
-    "wrist_roll":    {"range_min": 765, "range_max": 3495},
-    "gripper":       {"range_min": 766, "range_max": 2049},
+    "shoulder_pan":  {"range_min": 866, "range_max": 3187, "homing_offset": 2036},
+    "shoulder_lift": {"range_min": 750, "range_max": 3250, "homing_offset": 1996},
+    "elbow_flex":    {"range_min": 900, "range_max": 3250, "homing_offset": 2060},
+    "wrist_flex":    {"range_min": 764, "range_max": 2815, "homing_offset": 1966},
+    "wrist_roll":    {"range_min": 765, "range_max": 3495, "homing_offset": 2130},
+    "gripper":       {"range_min": 766, "range_max": 2049, "homing_offset": 779},
 }
 
 def main():
@@ -60,7 +67,7 @@ def main():
             calib_data[joint] = {
                 "id": mid,
                 "drive_mode": 0,
-                "homing_offset": 0,
+                "homing_offset": SAFE_BOUNDS[joint]["homing_offset"],
                 "range_min": SAFE_BOUNDS[joint]["range_min"],
                 "range_max": SAFE_BOUNDS[joint]["range_max"]
             }
@@ -82,6 +89,11 @@ def main():
             info["range_min"] = SAFE_BOUNDS[joint]["range_min"]
             info["range_max"] = SAFE_BOUNDS[joint]["range_max"]
             print(f"   ↳ Fixed to physical bounds: [{info['range_min']}, {info['range_max']}]")
+            modified = True
+        elif offset == 0 and joint in SAFE_BOUNDS:
+            print(f"{joint:16s} | {rmin:6d} | {rmax:6d} | {offset:8d} | ❌ UNCALIBRATED (offset=0 drives motors to limit!)")
+            info["homing_offset"] = SAFE_BOUNDS[joint]["homing_offset"]
+            print(f"   ↳ Fixed homing_offset to calibrated neutral: {info['homing_offset']}")
             modified = True
         else:
             print(f"{joint:16s} | {rmin:6d} | {rmax:6d} | {offset:8d} | ✅ OK")

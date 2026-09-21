@@ -40,42 +40,12 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 # ─────────────────────────────────────────────────────────────────────────────
 """
 import os, sys, yaml
-
-# ── Ensure Hugging Face and CLIP models persist to host-mounted SSD storage ────
-_hf_dir = os.environ.get("HF_HOME") or "/root/ros2_ws/models/huggingface"
-if not os.path.exists(_hf_dir):
-    _local_hf = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "huggingface"))
-    if os.path.isdir(os.path.dirname(_local_hf)):
-        _hf_dir = _local_hf
-try:
-    os.makedirs(_hf_dir, exist_ok=True)
-except Exception:
-    pass
-os.environ["HF_HOME"] = _hf_dir
-os.environ["TRANSFORMERS_CACHE"] = _hf_dir
-os.environ["TORCH_HOME"] = os.path.join(os.path.dirname(_hf_dir), "torch")
-
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 import pyrealsense2 as rs
 import requests
 
 from ultralytics import YOLO
-
-# ── GUI / Display handling ───────────────────────────────────────────────────
-GUI_AVAILABLE = True
-
-def safe_imshow(winname: str, mat: np.ndarray, wait_ms: int = 1):
-    global GUI_AVAILABLE
-    if not GUI_AVAILABLE:
-        return
-    try:
-        cv2.imshow(winname, mat)
-        cv2.waitKey(wait_ms)
-    except (cv2.error, Exception) as e:
-        err_msg = str(e).splitlines()[0] if str(e) else "Unknown error"
-        print(f"⚠️  Display unavailable ({err_msg}) — switching to headless mode.")
-        GUI_AVAILABLE = False
 
 try:
     from lerobot.robots.so101_follower.so101_follower import SO101Follower as SOFollower
@@ -243,29 +213,32 @@ ALIGN_INIT_MAX_PAN  = 25.0
 ALIGN_INIT_MAX_LIFT = 12.0
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# Default search posture: arm tilted forward, camera facing table/floor
+# Calibrated scan posture (from calibration/arm_reference_poses.yaml)
 _BASE = {
-    "shoulder_pan.pos":   -1.4,
-    "shoulder_lift.pos": -57.6,
-    "elbow_flex.pos":     -3.3,
-    "wrist_flex.pos":     86.0,
-    "gripper.pos":        60.0,
+    "shoulder_pan.pos":   -4.48,
+    "shoulder_lift.pos": -106.02,
+    "elbow_flex.pos":     99.91,
+    "wrist_flex.pos":     33.41,
+    "wrist_roll.pos":   -155.96,
+    "gripper.pos":        73.84,
 }
-# Default stow posture: compact folded posture with neutral wrist
+# Calibrated stow posture (from calibration/arm_reference_poses.yaml)
 _STOW_BASE = {
-    "shoulder_pan.pos":   -1.6,
-    "shoulder_lift.pos": -104.5,
-    "elbow_flex.pos":     96.5,
-    "wrist_flex.pos":      0.0,
-    "gripper.pos":        60.0,
+    "shoulder_pan.pos":   -4.48,
+    "shoulder_lift.pos": -106.11,
+    "elbow_flex.pos":    100.00,
+    "wrist_flex.pos":     75.96,
+    "wrist_roll.pos":   -156.75,
+    "gripper.pos":        73.77,
 }
 
 _ALIGN_READY = {
-    "shoulder_pan.pos":   -1.4,   # overwritten in pipeline to match target pan
+    "shoulder_pan.pos":   -4.48,   # overwritten in pipeline to match target pan
     "shoulder_lift.pos":  86.6,   # arm extended forward horizontally
     "elbow_flex.pos":    -73.5,
     "wrist_flex.pos":     -8.9,
-    "gripper.pos":        60.0,
+    "wrist_roll.pos":   -155.96,
+    "gripper.pos":        73.84,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -343,14 +316,14 @@ class RealSenseStream:
         self._color      = np.zeros((height, width, 3), dtype=np.uint8)
         self._colorized  = np.zeros((height, width, 3), dtype=np.uint8)
         self._depth_img  = None
+        self._intrinsics = None
         self._running    = True
-        self._thread     = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
         while self._running:
             try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=1000)
+                frames      = self._pipeline.wait_for_frames(timeout_ms=5000)
                 # D405 RGB and Depth share the same ISP sensor, so they are perfectly aligned natively.
                 # Do NOT use rs.align, as it can corrupt D405 depth frames.
                 color_frame = frames.get_color_frame()
@@ -504,11 +477,6 @@ class RealSenseStream:
 
     def stop(self):
         self._running = False
-        if hasattr(self, '_thread') and self._thread.is_alive():
-            try:
-                self._thread.join(timeout=1.0)
-            except Exception:
-                pass
         try:
             self._pipeline.stop()
         except Exception:
@@ -591,8 +559,6 @@ def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
         time.sleep(step_delay)
 
 
-
-
 def _set_torque(robot, enable: bool):
     action_str = "enable" if enable else "disable"
     val = 1 if enable else 0
@@ -627,62 +593,58 @@ def _set_torque(robot, enable: bool):
 def forward_kinematics(q: dict) -> np.ndarray:
     """
     Full 4×4 homogeneous Forward Kinematics: returns T_wrist_base.
-
-    T_wrist_base transforms a point expressed in the WRIST frame into
-    the arm BASE frame (origin = shoulder pivot, +X forward, +Y left, +Z up).
-
-    q: dict with shoulder_pan/lift/elbow_flex/wrist_flex in degrees.
-
-    Steps:
-      1. Base pan (rotation about Z)
-      2. Sagittal-plane chain (J2 shoulder_lift, J3 elbow_flex, J4 wrist_flex)
-         using cumulative angles from the horizontal reference
-      3. Combined into standard 4×4 [R | t; 0 0 0 1]
+    Matches calibrate_hand_eye.py and validate_calibration.py.
     """
-    pan  = math.radians(q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
+    pan  = math.radians(-q.get("shoulder_pan.pos",  0.0) - PAN_ZERO_OFFSET_DEG)
     lift = q.get("shoulder_lift.pos", 0.0)
     elb  = q.get("elbow_flex.pos",    0.0)
     wst  = q.get("wrist_flex.pos",    0.0)
+    roll = math.radians(-q.get("wrist_roll.pos",   0.0))
 
-    # Cumulative sagittal angles (from horizontal, matching FK convention)
-    # SO-ARM101: lift 0 = UP (90° from horizontal). Positive lift = forward tilt.
-    t1 = math.radians(90.0 - lift)          # shoulder absolute angle
-    
-    # Elbow: Straight arm is -81.0°. Increasing elbow folds it forward/down.
-    t2 = t1 - math.radians(elb + 81.0)      # elbow absolute angle
-    
-    # Wrist: Straight wrist is -5.0°. Increasing wrist folds it forward/down.
-    t3 = t2 - math.radians(wst + 5.0)       # wrist absolute angle
+    t1 = math.radians(90.0 - lift)
+    t2 = t1 - math.radians(elb + 81.0)
+    t3 = t2 - math.radians(wst + 5.0)
 
-    # Wrist pivot position in the sagittal plane
     rho_w = IK_L1 * math.cos(t1) + IK_L2 * math.cos(t2)
     z_w   = IK_L1 * math.sin(t1) + IK_L2 * math.sin(t2)
 
-    # Wrist position in 3D base frame
     wx = rho_w * math.cos(pan)
     wy = rho_w * math.sin(pan)
     wz = z_w
 
-    # Orientation of the wrist frame in base frame
-    # X-axis of wrist = approach direction (along wrist link)
+    # Approach direction (Wrist X)
     ax = math.cos(t3) * math.cos(pan)
     ay = math.cos(t3) * math.sin(pan)
     az = math.sin(t3)
 
-    # Z-axis of wrist = perpendicular to sagittal plane (= pan rotation axis)
+    # Perpendicular direction (Wrist Z)
     zx = -math.sin(pan)
     zy =  math.cos(pan)
     zz = 0.0
 
-    # Y-axis = Z cross X
+    # Wrist Y = Z cross X
     yx = zy * az - zz * ay
     yy = zz * ax - zx * az
     yz = zx * ay - zy * ax
 
+    R_base = np.array([
+        [ax, yx, zx],
+        [ay, yy, zy],
+        [az, yz, zz]
+    ])
+
+    R_roll = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, math.cos(roll), -math.sin(roll)],
+        [0.0, math.sin(roll),  math.cos(roll)]
+    ])
+
+    R_final = R_base @ R_roll
+
     T = np.array([
-        [ax, yx, zx, wx],
-        [ay, yy, zy, wy],
-        [az, yz, zz, wz],
+        [R_final[0,0], R_final[0,1], R_final[0,2], wx],
+        [R_final[1,0], R_final[1,1], R_final[1,2], wy],
+        [R_final[2,0], R_final[2,1], R_final[2,2], wz],
         [0., 0., 0., 1.],
     ])
     return T
@@ -691,14 +653,14 @@ def forward_kinematics(q: dict) -> np.ndarray:
 def solve_ik(x_mm: float, y_mm: float, z_mm: float,
              end_pitch_deg: float | None = None,
              current_joints: dict | None = None,
-             wrist_roll_deg: float = 0.0) -> dict | None:
+             wrist_roll_deg: float = -155.96) -> dict | None:
     """
     Closed-form analytical IK for SO-ARM101.
     Target (x_mm, y_mm, z_mm) is in the ARM BASE frame.
     """
     # ── J1 (base pan) ────────────────────────────────────────────────────────
     pan_rad = math.atan2(y_mm, x_mm)
-    pan_deg = math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG
+    pan_deg = -(math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG)
 
     if pan_deg < PAN_MIN_DEG or pan_deg > PAN_MAX_DEG:
         print(f"   ⚠️  IK reject: pan target {pan_deg:.1f}° out of bounds "
@@ -772,6 +734,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 "shoulder_lift.pos": m_lift,
                 "elbow_flex.pos":    m_elbow,
                 "wrist_flex.pos":    m_wrist,
+                "wrist_roll.pos":    wrist_roll_deg,
                 "gripper.pos":       60.0,
             })
 
@@ -1417,7 +1380,8 @@ def align_arm(robot, cap: RealSenseStream, model,
             cv2.putText(display,
                 f"🎯 ALIGNING — lost ({lost_streak}/{ALIGN_LOST_GRACE})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,100,255), 2)
-            safe_imshow("Picker Vision", display)
+            cv2.imshow("Picker Vision", display)
+            cv2.waitKey(1)
             if lost_streak >= ALIGN_LOST_GRACE:
                 if last_obj_pixel is not None:
                     last_pan_err = last_obj_pixel[0] - frame_cx
@@ -1494,7 +1458,8 @@ def align_arm(robot, cap: RealSenseStream, model,
         cv2.putText(display,
             f"{status} [{src.upper()}]  err=({pan_err:+d},{lift_err:+d})px",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
-        safe_imshow("Picker Vision", display)
+        cv2.imshow("Picker Vision", display)
+        cv2.waitKey(1)
 
     if last_obj_pixel is not None:
         print(f"   ⏳ Alignment hardcap reached ({effective_max} frames). Proceeding with best alignment.")
@@ -1812,13 +1777,6 @@ def main():
         
     do_manual_lunge = (choice == "1")
 
-    global GUI_AVAILABLE
-    if "--headless" in sys.argv or not os.environ.get("DISPLAY"):
-        GUI_AVAILABLE = False
-        print("🖥️  Running in HEADLESS mode (no GUI display).")
-    else:
-        print("🖥️  GUI display enabled. (If X11 fails, run 'xhost +local:root' on Jetson host).")
-
     print("🚀 Initialising RealSense D405 + IK Pick-and-Place Pipeline...")
 
     global T_CAM_WRIST
@@ -1858,77 +1816,41 @@ def main():
     else:
         print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
 
-    # ── Auto-sync persistent calibration if available ─────────────────────────
-    calib_source_paths = [
-        "/root/ros2_ws/calibration/jetson_arm.json",
-        os.path.join(os.path.dirname(__file__), "..", "calibration", "jetson_arm.json"),
-        os.path.join(os.path.dirname(__file__), "calibration", "jetson_arm.json"),
-        "calibration/jetson_arm.json"
-    ]
-    target_calib_dirs = [
-        "/data/models/huggingface/lerobot/calibration/robots/so101_follower",
-        os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots/so101_follower")
-    ]
-    for src in calib_source_paths:
-        if os.path.exists(src) and os.path.getsize(src) > 0:
-            for tdir in target_calib_dirs:
-                try:
-                    os.makedirs(tdir, exist_ok=True)
-                    dst = os.path.join(tdir, f"{ARM_ID}.json")
-                    if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-                        import shutil
-                        shutil.copyfile(src, dst)
-                        print(f"   📋 Synced persistent calibration: {src} -> {dst}")
-                except Exception as e:
-                    print(f"   ⚠️ Could not sync calibration to {tdir}: {e}")
-            break
+    # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
+    # The first inference triggers CUDA/model warmup (can take 2-5 s).  If this
+    # happens after the arm is already powered and sitting at start pose, the
+    # servos are left unmonitored during a blocking GPU call.  Worse, a Ctrl+C
+    # during warmup fires a signal into live C/CUDA code → fatal heap corruption.
+    # Warm the model NOW while servos are still off the bus.
+    print("   🔥 Warming up YOLO model on GPU (first inference)...")
+    _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
+    try:
+        model(_dummy, verbose=False, conf=0.5)
+    except Exception:
+        pass  # ignore warmup errors — just ensure cuda graph is built
+    print("   ✅ YOLO warmup complete")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
     print("🔌 Connecting to SO-ARM101...")
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
-
-    # Auto-confirm LeRobot's calibration ENTER prompt using verified persistent calibration
-    import builtins
-    _orig_input = builtins.input
-    def _auto_calibration_input(prompt=""):
-        prompt_str = str(prompt)
-        if "Press ENTER to use provided calibration file" in prompt_str:
-            print(f"{prompt_str.strip()}\n   ➡️  Auto-confirmed: Loading verified calibration ({ARM_ID}).")
-            return ""
-        return _orig_input(prompt)
-
-    builtins.input = _auto_calibration_input
-    try:
-        robot.connect()
-    finally:
-        builtins.input = _orig_input
+    robot.connect()
     print("   ✅ Arm connected")
-
-    # If LeRobot generated or updated a calibration file, back it up to host volume
-    for tdir in target_calib_dirs:
-        dst = os.path.join(tdir, f"{ARM_ID}.json")
-        if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            try:
-                for src in calib_source_paths:
-                    parent_dir = os.path.dirname(os.path.abspath(src))
-                    if os.path.isdir(parent_dir):
-                        import shutil
-                        shutil.copyfile(dst, src)
-                        break
-            except Exception:
-                pass
-            break
 
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
 
+    _shutdown_requested = [False]  # mutable flag safe to set from signal handler
+
     def handle_exit(sig, frame):
-        print("\n📍 Stowing arm...")
-        smooth_move(robot, STOW)
-        time.sleep(1)
-        robot.disconnect()
-        exit(0)
+        """SIGINT handler — only sets a flag; never calls into robot/C-ext directly.
+        Calling smooth_move() from a signal handler that fires mid-C-extension
+        (e.g. torch.linalg) corrupts Python's internal state → fatal abort."""
+        if not _shutdown_requested[0]:
+            print("\n📍 Shutdown requested — finishing current step and stowing...")
+            _shutdown_requested[0] = True
+        # Re-raise KeyboardInterrupt so the main try/except loop exits cleanly.
+        raise KeyboardInterrupt
     signal.signal(signal.SIGINT, handle_exit)
 
     # ── RealSense D405 ────────────────────────────────────────────────────────
@@ -1950,15 +1872,20 @@ def main():
     def _emergency_stow():
         print("\n⚠️  Emergency stow triggered...")
         try:
+            # Probe the arm first — if it's dead (power-lost / disconnected)
+            # smooth_move will raise ConnectionError and corrupt state further.
+            get_pos(robot)
             smooth_move(robot, STOW, step_size=3.0)
             time.sleep(0.5)
-            robot.disconnect()
         except Exception as e:
-            print(f"   Stow error: {e}")
+            print(f"   Stow skipped (arm unreachable): {e}")
+        try:
+            robot.disconnect()
+        except Exception:
+            pass
         try:
             cap.stop()
-            if GUI_AVAILABLE:
-                cv2.destroyAllWindows()
+            cv2.destroyAllWindows()
         except Exception:
             pass
     atexit.register(_emergency_stow)
@@ -1995,7 +1922,8 @@ def main():
 
             # ── Throttle YOLO to ~5 fps during search ─────────────────────────
             if time.time() - last_yolo_t < 0.2:
-                safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
+                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
+                cv2.waitKey(1)
                 continue
             last_yolo_t = time.time()
 
@@ -2039,7 +1967,8 @@ def main():
                     sweep_cmd["shoulder_pan.pos"] = sweep_pan
                     robot.send_action(sweep_cmd)
                 
-                safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
+                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
+                cv2.waitKey(1)
                 continue
 
             # ── YOLO candidate found ──────────────────────────────────────────
@@ -2070,7 +1999,8 @@ def main():
             cv2.putText(display, f"YOLO: {TARGET_DESC}",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             
-            safe_imshow("Picker Vision", np.hstack((display, depth_colormap)))
+            cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
+            cv2.waitKey(1)
 
             if SKIP_MOONDREAM:
                 print("⏭️  Moondream skipped — grabbing on YOLO detection")
@@ -2257,7 +2187,8 @@ def main():
             
             grab_pos = solve_ik(arm_x, arm_y, arm_z,
                                 end_pitch_deg=target_pitch,
-                                current_joints=current_j)
+                                current_joints=current_j,
+                                wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
             if grab_pos is None:
                 print("⚠️  IK: target outside workspace — restarting search")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -2269,6 +2200,7 @@ def main():
             print(f"   Lift  → {grab_pos['shoulder_lift.pos']:+.1f}°")
             print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
             print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
+            print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
 
             if do_manual_lunge:
                 # ── Manual Lunge Demonstration ────────────────────────────────────
@@ -2379,12 +2311,18 @@ def main():
                 print("\n🔍 Search loop resumed\n")
 
     except KeyboardInterrupt:
-        print("\n⏹️  Interrupted by user.")
+        print("\n⏹️  Interrupted by user — stowing arm...")
+        try:
+            get_pos(robot)           # probe — raises if arm is dead/power-lost
+            smooth_move(robot, STOW, step_size=3.0, step_delay=0.03)
+            print("   ✅ Arm stowed.")
+        except Exception as e:
+            print(f"   ⚠️  Stow skipped (arm unreachable): {e}")
     except Exception as exc:
         print(f"\n❌  Unhandled exception: {exc}")
         import traceback; traceback.print_exc()
     finally:
-        pass   # atexit _emergency_stow fires here
+        pass   # atexit _emergency_stow fires here as last-resort backstop
 
 
 if __name__ == "__main__":

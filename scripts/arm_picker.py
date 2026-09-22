@@ -47,6 +47,32 @@ import requests
 
 from ultralytics import YOLO
 
+# ── Headless display detection ────────────────────────────────────────────────
+# When running over SSH without X11 forwarding (no DISPLAY), cv2.imshow crashes
+# with "Can't initialize GTK backend". Detect this once at startup and use a
+# file-based fallback instead.
+HEADLESS = (os.environ.get("DISPLAY", "").strip() == "")
+_headless_last_save: dict = {}   # name → last save timestamp (rate-limit to 5fps)
+
+def _show_frame(name: str, img: np.ndarray) -> None:
+    """Safe imshow wrapper: GUI window if display available, else save to /tmp."""
+    if HEADLESS:
+        now = time.time()
+        if now - _headless_last_save.get(name, 0) >= 0.2:   # max 5 fps to disk
+            _headless_last_save[name] = now
+            safe = name.replace(" ", "_")
+            cv2.imwrite(f"/tmp/arm_picker_{safe}.jpg", img)
+    else:
+        cv2.imshow(name, img)
+
+def _destroy_windows() -> None:
+    if not HEADLESS:
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
 try:
     from lerobot.robots.so101_follower.so101_follower import SO101Follower as SOFollower
     from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig as SOFollowerRobotConfig
@@ -491,6 +517,69 @@ def get_pos(robot) -> dict:
     joints = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
               "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
     return {k: v for k, v in obs.items() if k in joints}
+
+
+# STS3215 Hardware_Error_Status bit masks
+_HW_ERR_BITS = {
+    0x01: "Input Voltage Error",
+    0x02: "Motor Overheat",
+    0x04: "Overload Error",     # ← most common: servo stalled against hard stop
+    0x08: "ElectricalShock Error",
+    0x10: "Overheated Error",
+    0x20: "Instruction Error",
+}
+_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex",
+                "wrist_flex", "wrist_roll", "gripper"]
+
+def check_servo_health(robot) -> bool:
+    """
+    Read Hardware_Error_Status from every servo BEFORE issuing any motion.
+    Returns True if all servos are healthy.
+    Returns False (and prints which ones are faulted) if any servo is in an
+    error state — the caller should abort and ask the user to power-cycle.
+
+    STS3215 overload protection clears on power-cycle only.
+    """
+    print("🩺 Checking servo health...")
+    all_ok = True
+    try:
+        # Try the sync_read path first (works on most LeRobot versions)
+        errors = robot.bus.sync_read("Hardware_Error_Status",
+                                     _MOTOR_NAMES)
+        for name, val in zip(_MOTOR_NAMES, errors):
+            val = int(val)
+            if val != 0:
+                flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
+                print(f"   ❌  {name}: Hardware_Error_Status=0x{val:02X}  ({', '.join(flags)})")
+                all_ok = False
+            else:
+                print(f"   ✅  {name}: OK")
+    except Exception:
+        # Fall back to individual reads if sync_read key is different
+        try:
+            for name in _MOTOR_NAMES:
+                try:
+                    val = int(robot.bus.read("Hardware_Error_Status", name))
+                    if val != 0:
+                        flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
+                        print(f"   ❌  {name}: 0x{val:02X}  ({', '.join(flags)})")
+                        all_ok = False
+                    else:
+                        print(f"   ✅  {name}: OK")
+                except Exception as e:
+                    print(f"   ⚠️  {name}: could not read error status ({e})")
+        except Exception:
+            print("   ⚠️  Health check unavailable (API mismatch) — proceeding with caution.")
+            return True   # can't check → don't block startup
+
+    if not all_ok:
+        print("\n   ⛔  One or more servos are in an error/overload state.")
+        print("   ⛔  Power-cycle the arm (unplug and replug the power supply),")
+        print("   ⛔  then re-run arm_picker.py.")
+        print("   ⛔  Do NOT attempt to move the arm while in this state.\n")
+    else:
+        print("   ✅ All servos healthy — safe to move.\n")
+    return all_ok
 
 
 def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
@@ -1380,8 +1469,8 @@ def align_arm(robot, cap: RealSenseStream, model,
             cv2.putText(display,
                 f"🎯 ALIGNING — lost ({lost_streak}/{ALIGN_LOST_GRACE})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,100,255), 2)
-            cv2.imshow("Picker Vision", display)
-            cv2.waitKey(1)
+            _show_frame("Picker Vision", display)
+            if not HEADLESS: cv2.waitKey(1)
             if lost_streak >= ALIGN_LOST_GRACE:
                 if last_obj_pixel is not None:
                     last_pan_err = last_obj_pixel[0] - frame_cx
@@ -1458,8 +1547,8 @@ def align_arm(robot, cap: RealSenseStream, model,
         cv2.putText(display,
             f"{status} [{src.upper()}]  err=({pan_err:+d},{lift_err:+d})px",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
-        cv2.imshow("Picker Vision", display)
-        cv2.waitKey(1)
+        _show_frame("Picker Vision", display)
+        if not HEADLESS: cv2.waitKey(1)
 
     if last_obj_pixel is not None:
         print(f"   ⏳ Alignment hardcap reached ({effective_max} frames). Proceeding with best alignment.")
@@ -1837,6 +1926,20 @@ def main():
     robot.connect()
     print("   ✅ Arm connected")
 
+    # ── Servo health check ────────────────────────────────────────────────────
+    # Read Hardware_Error_Status from every servo before any motion.
+    # If any servo tripped overload/overheat protection it will be in error state
+    # and must be power-cycled before it can move safely.
+    if not check_servo_health(robot):
+        robot.disconnect()
+        return   # abort — user told to power-cycle
+
+    # ── Headless mode notice ──────────────────────────────────────────────────
+    if HEADLESS:
+        print("⚠️  No DISPLAY detected — running headless.")
+        print("   Camera frames saved to /tmp/arm_picker_Picker_Vision.jpg (~5 fps)")
+        print("   View live: watch -n0.2 feh /tmp/arm_picker_Picker_Vision.jpg")
+
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
 
@@ -1859,9 +1962,13 @@ def main():
     time.sleep(2.0)   # let first frames arrive and intrinsics populate
 
     # ── Move to start ─────────────────────────────────────────────────────────
-    print("\n▶ Moving to Start Position...")
-    smooth_move(robot, START_POS)
+    # Use smaller steps + longer delay for the FIRST move — freshly powered
+    # servos can trip overload protection if commanded too aggressively from
+    # an unknown starting position.
+    print("\n▶ Moving to Start Position (slow start)...")
+    smooth_move(robot, START_POS, step_size=1.0, step_delay=0.05)
     time.sleep(1.0)
+
 
     last_yolo_t = 0.0
     STATE       = "SEARCHING"
@@ -1885,7 +1992,7 @@ def main():
             pass
         try:
             cap.stop()
-            cv2.destroyAllWindows()
+            _destroy_windows()
         except Exception:
             pass
     atexit.register(_emergency_stow)
@@ -1922,8 +2029,8 @@ def main():
 
             # ── Throttle YOLO to ~5 fps during search ─────────────────────────
             if time.time() - last_yolo_t < 0.2:
-                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-                cv2.waitKey(1)
+                _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+                if not HEADLESS: cv2.waitKey(1)
                 continue
             last_yolo_t = time.time()
 
@@ -1967,8 +2074,8 @@ def main():
                     sweep_cmd["shoulder_pan.pos"] = sweep_pan
                     robot.send_action(sweep_cmd)
                 
-                cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-                cv2.waitKey(1)
+                _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+                if not HEADLESS: cv2.waitKey(1)
                 continue
 
             # ── YOLO candidate found ──────────────────────────────────────────
@@ -1999,8 +2106,8 @@ def main():
             cv2.putText(display, f"YOLO: {TARGET_DESC}",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             
-            cv2.imshow("Picker Vision", np.hstack((display, depth_colormap)))
-            cv2.waitKey(1)
+            _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+            if not HEADLESS: cv2.waitKey(1)
 
             if SKIP_MOONDREAM:
                 print("⏭️  Moondream skipped — grabbing on YOLO detection")

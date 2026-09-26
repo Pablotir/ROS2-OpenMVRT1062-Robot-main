@@ -242,6 +242,7 @@ def _build_T_cam_wrist() -> np.ndarray:
 T_CAM_WRIST: np.ndarray = None   # set in main() after math module is loaded
 
 # ── Searching Behaviour ───────────────────────────────────────────────────────
+SWEEP_ON_SEARCH    = False  # False = hold steady at START_POS (workspace/table view); True = sweep pan left/right
 SEARCH_SWEEP_RANGE = 80.0   # ° pan left/right from START_POS centre
 SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 
@@ -2318,15 +2319,20 @@ def main():
     sweep_dir   = 1.0
     sweep_pan   = START_POS["shoulder_pan.pos"]
 
+    _arm_is_stowed = [False]
+
     # ── Emergency stow ────────────────────────────────────────────────────────
     def _emergency_stow():
+        if _arm_is_stowed[0]:
+            return
+        _arm_is_stowed[0] = True
         print("\n⚠️  Emergency stow triggered...")
         try:
             # Probe the arm first — if it's dead (power-lost / disconnected)
             # smooth_move will raise ConnectionError and corrupt state further.
             get_pos(robot)
-            smooth_move(robot, STOW, step_size=3.0)
-            time.sleep(0.5)
+            smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
+            time.sleep(0.3)
         except Exception as e:
             print(f"   Stow skipped (arm unreachable): {e}")
         try:
@@ -2339,6 +2345,7 @@ def main():
         except Exception:
             pass
     atexit.register(_emergency_stow)
+
 
     try:
         while True:
@@ -2405,7 +2412,7 @@ def main():
 
             # ── No detection — sweep ──────────────────────────────────────────
             if target_box is None:
-                if STATE == "SEARCHING":
+                if STATE == "SEARCHING" and SWEEP_ON_SEARCH:
                     sweep_pan += sweep_dir * SEARCH_SWEEP_SPEED
                     pan_limit_right = START_POS["shoulder_pan.pos"] + SEARCH_SWEEP_RANGE
                     pan_limit_left  = START_POS["shoulder_pan.pos"] - SEARCH_SWEEP_RANGE
@@ -2420,6 +2427,7 @@ def main():
                 _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
                 if not HEADLESS: cv2.waitKey(1)
                 continue
+
 
             # ── YOLO candidate found ──────────────────────────────────────────
             x1, y1, x2, y2 = map(int, target_box.xyxy[0].tolist())
@@ -2761,18 +2769,33 @@ def main():
                 print("\n🔍 Search loop resumed\n")
 
     except KeyboardInterrupt:
-        print("\n⏹️  Interrupted by user — stowing arm...")
+        print("\n⏹️  Interrupted by user — stowing arm smoothly...")
+        if not _arm_is_stowed[0]:
+            try:
+                get_pos(robot)           # probe — raises if arm is dead/power-lost
+                smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
+                print("   ✅ Arm stowed smoothly.")
+                _arm_is_stowed[0] = True
+            except Exception as e:
+                print(f"   ⚠️  Stow skipped (arm unreachable): {e}")
         try:
-            get_pos(robot)           # probe — raises if arm is dead/power-lost
-            smooth_move(robot, STOW, step_size=3.0, step_delay=0.03)
-            print("   ✅ Arm stowed.")
-        except Exception as e:
-            print(f"   ⚠️  Stow skipped (arm unreachable): {e}")
+            robot.disconnect()
+        except Exception:
+            pass
+        try:
+            cap.stop()
+            _destroy_windows()
+        except Exception:
+            pass
     except Exception as exc:
         print(f"\n❌  Unhandled exception: {exc}")
         import traceback; traceback.print_exc()
     finally:
-        pass   # atexit _emergency_stow fires here as last-resort backstop
+        try:
+            atexit.unregister(_emergency_stow)
+        except Exception:
+            pass
+
 
 
 if __name__ == "__main__":

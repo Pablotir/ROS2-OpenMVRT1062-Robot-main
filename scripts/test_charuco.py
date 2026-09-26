@@ -183,8 +183,9 @@ def main():
                 cv2.putText(display, "Searching for 5x7 ChArUco Board...", (20, 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Save live visual to disk
-            cv2.imwrite("/tmp/charuco_live.jpg", display)
+            # Stream live visual to web browser & save snapshot to disk
+            _show_frame("ChArUco Tracker", display)
+
 
             # Throttle terminal logging to ~1 Hz
             now = time.time()

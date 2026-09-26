@@ -52,13 +52,20 @@ from ultralytics import YOLO
 # When running over SSH without X11 forwarding or with broken/unauthorized DISPLAY,
 # cv2.imshow crashes with "Can't initialize GTK backend".
 HEADLESS = (os.environ.get("DISPLAY", "").strip() == "")
-_headless_last_save: dict = {}   # name → last save timestamp (rate-limit to 5fps)
+_headless_last_save: dict = {}
+# ── Live Web Streamer (browser viewable) ──────────────────────────────────────
+try:
+    from mjpeg_streamer import get_streamer
+    _mjpeg = get_streamer(port=8080)
+except Exception as _e:
+    _mjpeg = None
+
 
 def _init_display_mode() -> None:
     """Test if X11/GTK is actually functional. If not, activate headless mode cleanly."""
     global HEADLESS
     if HEADLESS:
-        print("ℹ️  DISPLAY not set — running in HEADLESS mode (saving frames to /tmp).")
+        print("ℹ️  Running in HEADLESS mode (browser live stream active).")
         return
     try:
         # Test GTK window creation and destruction
@@ -69,11 +76,19 @@ def _init_display_mode() -> None:
     except Exception as e:
         HEADLESS = True
         print(f"⚠️  Display backend test failed ({e}).")
-        print("   Running in HEADLESS mode — camera frames will be saved to /tmp/arm_picker_*.jpg.")
+        print("   Running in HEADLESS mode (browser live stream active).")
 
 def _show_frame(name: str, img: np.ndarray) -> None:
-    """Safe imshow wrapper: GUI window if display available, else save to /tmp."""
-    global HEADLESS
+    """Safe imshow wrapper: streams live to browser, shows GUI if display available, else saves to /tmp."""
+    global HEADLESS, _mjpeg
+    if img is None:
+        return
+
+    # 1. Broadcast live video to any connected web browser
+    if _mjpeg is not None:
+        _mjpeg.update_frame(img)
+
+    # 2. Local GUI window (if working X11 display present)
     if not HEADLESS:
         try:
             cv2.imshow(name, img)
@@ -81,13 +96,15 @@ def _show_frame(name: str, img: np.ndarray) -> None:
             return
         except Exception as e:
             HEADLESS = True
-            print(f"⚠️  Display error ({e}) — switching to HEADLESS mode (saving frames to /tmp).")
+            print(f"⚠️  Display error ({e}) — switched to HEADLESS mode.")
 
+    # 3. Snapshot to disk as backup (rate-limited to 5fps)
     now = time.time()
-    if now - _headless_last_save.get(name, 0) >= 0.2:   # max 5 fps to disk
+    if now - _headless_last_save.get(name, 0) >= 0.2:
         _headless_last_save[name] = now
         safe = name.replace(" ", "_")
         cv2.imwrite(f"/tmp/arm_picker_{safe}.jpg", img)
+
 
 def _destroy_windows() -> None:
     global HEADLESS

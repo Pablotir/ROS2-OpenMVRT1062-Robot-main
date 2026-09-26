@@ -1969,13 +1969,26 @@ def main():
     import json as _json, pathlib as _pathlib, builtins as _builtins
 
     # ── Locate the calibration JSON ──────────────────────────────────────────
+    # LeRobot respects HF_HOME env var (defaults to ~/.cache/huggingface).
+    # On this Jetson HF_HOME=/data/models/huggingface so files land there.
+    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
+                  os.environ.get("TRANSFORMERS_CACHE",
+                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
     _calib_search = [
+        # HF_HOME-aware (correct for this Jetson)
+        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+        # /data path (hardcoded fallback seen in calibration output)
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        # Standard ~/.cache paths
         _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
         _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
         _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
         _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
     ]
     _calib_path = next((p for p in _calib_search if p.exists()), None)
+
 
     if _calib_path is None:
         # ── No JSON found — must run interactive calibration once ────────────

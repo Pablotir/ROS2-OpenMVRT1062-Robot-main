@@ -2001,19 +2001,38 @@ def main():
 
     print(f"   📂 Calibration: {_calib_path}")
 
-    # Check for degenerate calibration (all min==max==2047 from a bad run)
+    # Check for degenerate calibration (range_min == range_max everywhere)
+    # Handles BOTH JSON formats:
+    #   Old LeRobot: {"start_pos": [...], "end_pos": [...]}
+    #   New LeRobot: {"shoulder_pan": {"range_min": N, "range_max": M}, ...}
     with open(_calib_path) as _f:
         _calib_data = _json.load(_f)
-    _start = _calib_data.get("start_pos", [])
-    _end   = _calib_data.get("end_pos",   [])
-    if _start and _end and all(s == e for s, e in zip(_start, _end)):
-        print("   ❌  Calibration file is DEGENERATE (start_pos == end_pos for all joints).")
-        print("   ❌  This was caused by auto-confirming the range-recording step with no arm movement.")
+
+    _is_degenerate = False
+    if "start_pos" in _calib_data:                        # old format
+        _s, _e = _calib_data["start_pos"], _calib_data["end_pos"]
+        _is_degenerate = bool(_s) and all(a == b for a, b in zip(_s, _e))
+    else:                                                  # new per-motor format
+        _ranges = [(v["range_min"], v["range_max"])
+                   for v in _calib_data.values()
+                   if isinstance(v, dict) and "range_min" in v]
+        _is_degenerate = bool(_ranges) and all(mn == mx for mn, mx in _ranges)
+
+    if _is_degenerate:
+        print("   ❌  Calibration file is DEGENERATE (range_min == range_max for all joints).")
+        print("   ❌  This was caused by auto-confirming range-recording with no arm movement.")
         print(f"   ❌  Delete it and re-calibrate:")
         print(f"       rm {_calib_path}")
         print(f"       lerobot-calibrate --robot.type=so101_follower \\")
         print(f"           --robot.port={PORT} --robot.id={ARM_ID}")
         raise RuntimeError("Degenerate calibration — delete it and re-run lerobot-calibrate.")
+
+    # Print a brief summary so we can confirm good values were loaded
+    if "start_pos" not in _calib_data:   # new format
+        for _jname, _jdata in _calib_data.items():
+            if isinstance(_jdata, dict) and "range_min" in _jdata:
+                print(f"   📐 {_jname}: [{_jdata['range_min']} – {_jdata['range_max']}]  offset={_jdata.get('homing_offset', '?')}")
+
 
     # ── Connect without prompts, then register calibration manually ──────────
     try:

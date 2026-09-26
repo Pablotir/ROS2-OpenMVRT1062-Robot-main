@@ -519,7 +519,7 @@ def get_pos(robot) -> dict:
     return {k: v for k, v in obs.items() if k in joints}
 
 
-# STS3215 Hardware_Error_Status bit masks
+# STS3215 Hardware_Error_Status bit masks (address 72, 1 byte)
 _HW_ERR_BITS = {
     0x01: "Input Voltage Error",
     0x02: "Motor Overheat",
@@ -531,55 +531,94 @@ _HW_ERR_BITS = {
 _MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex",
                 "wrist_flex", "wrist_roll", "gripper"]
 
+# Register name variants across LeRobot versions — tried in order
+_ERR_REG_CANDIDATES = [
+    "Hardware_Error_Status",   # most LeRobot versions
+    "hardware_error_status",   # some builds use snake_case
+    "Hw_Error_Status",         # older builds
+    "HW_Error_Status",
+]
+# Load-based fallback: STS3215 Present_Load ≈ ±1023 range; >800 = likely stalled
+_LOAD_REG_CANDIDATES = ["Present_Load", "present_load", "Load"]
+_LOAD_STALL_THRESHOLD = 800
+
 def check_servo_health(robot) -> bool:
     """
-    Read Hardware_Error_Status from every servo BEFORE issuing any motion.
-    Returns True if all servos are healthy.
-    Returns False (and prints which ones are faulted) if any servo is in an
-    error state — the caller should abort and ask the user to power-cycle.
-
+    Read error status from every servo BEFORE issuing any motion.
+    Tries Hardware_Error_Status first (direct overload flag), then falls back
+    to Present_Load as a proxy (high load = stalled/overloaded).
+    Returns True if all servos appear healthy, False if any are faulted.
     STS3215 overload protection clears on power-cycle only.
     """
     print("🩺 Checking servo health...")
-    all_ok = True
-    try:
-        # Try the sync_read path first (works on most LeRobot versions)
-        errors = robot.bus.sync_read("Hardware_Error_Status",
-                                     _MOTOR_NAMES)
-        for name, val in zip(_MOTOR_NAMES, errors):
-            val = int(val)
-            if val != 0:
-                flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
-                print(f"   ❌  {name}: Hardware_Error_Status=0x{val:02X}  ({', '.join(flags)})")
-                all_ok = False
-            else:
-                print(f"   ✅  {name}: OK")
-    except Exception:
-        # Fall back to individual reads if sync_read key is different
-        try:
-            for name in _MOTOR_NAMES:
-                try:
-                    val = int(robot.bus.read("Hardware_Error_Status", name))
-                    if val != 0:
-                        flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
-                        print(f"   ❌  {name}: 0x{val:02X}  ({', '.join(flags)})")
-                        all_ok = False
-                    else:
-                        print(f"   ✅  {name}: OK")
-                except Exception as e:
-                    print(f"   ⚠️  {name}: could not read error status ({e})")
-        except Exception:
-            print("   ⚠️  Health check unavailable (API mismatch) — proceeding with caution.")
-            return True   # can't check → don't block startup
 
-    if not all_ok:
-        print("\n   ⛔  One or more servos are in an error/overload state.")
-        print("   ⛔  Power-cycle the arm (unplug and replug the power supply),")
-        print("   ⛔  then re-run arm_picker.py.")
-        print("   ⛔  Do NOT attempt to move the arm while in this state.\n")
-    else:
-        print("   ✅ All servos healthy — safe to move.\n")
-    return all_ok
+    # ── Step 1: find a working error-status register name ─────────────────
+    err_reg = None
+    for candidate in _ERR_REG_CANDIDATES:
+        try:
+            robot.bus.read(candidate, _MOTOR_NAMES[0])
+            err_reg = candidate
+            break
+        except Exception:
+            continue
+
+    # ── Step 2: if error register found, read all motors ──────────────────
+    if err_reg is not None:
+        all_ok = True
+        for name in _MOTOR_NAMES:
+            try:
+                val = int(robot.bus.read(err_reg, name))
+                if val != 0:
+                    flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
+                    print(f"   ❌  {name}: error=0x{val:02X}  ({', '.join(flags)})")
+                    all_ok = False
+                else:
+                    print(f"   ✅  {name}: OK")
+            except Exception as e:
+                print(f"   ⚠️  {name}: read failed ({e})")
+        if not all_ok:
+            print("\n   ⛔  One or more servos are in an error/overload state.")
+            print("   ⛔  Power-cycle the arm (unplug and replug the power supply),")
+            print("   ⛔  then re-run arm_picker.py.")
+            print("   ⛔  Do NOT attempt to move the arm while in this state.\n")
+        else:
+            print("   ✅ All servos healthy — safe to move.\n")
+        return all_ok
+
+    # ── Step 3: fallback — use Present_Load as a stall proxy ─────────────
+    load_reg = None
+    for candidate in _LOAD_REG_CANDIDATES:
+        try:
+            robot.bus.read(candidate, _MOTOR_NAMES[0])
+            load_reg = candidate
+            break
+        except Exception:
+            continue
+
+    if load_reg is not None:
+        all_ok = True
+        for name in _MOTOR_NAMES:
+            try:
+                val = abs(int(robot.bus.read(load_reg, name)))
+                if val > _LOAD_STALL_THRESHOLD:
+                    print(f"   ❌  {name}: high load ({val}/1023) — may be stalled")
+                    all_ok = False
+                else:
+                    print(f"   ✅  {name}: load={val}/1023")
+            except Exception as e:
+                print(f"   ⚠️  {name}: load read failed ({e})")
+        if not all_ok:
+            print("\n   ⛔  One or more servos show high load — possible overload state.")
+            print("   ⛔  Power-cycle the arm, then re-run arm_picker.py.\n")
+        else:
+            print("   ✅ All servos healthy (load check) — safe to move.\n")
+        return all_ok
+
+    # ── Step 4: nothing worked — warn and proceed ─────────────────────────
+    print("   ⚠️  Health check unavailable (register names not found in control table).")
+    print("   ⚠️  Proceeding — if arm loses power immediately, power-cycle it.\n")
+    return True
+
 
 
 def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
@@ -1923,18 +1962,26 @@ def main():
     print("🔌 Connecting to SO-ARM101...")
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
-    # calibrate=False → skip the interactive "move to middle and press ENTER"
-    # prompt on every startup.  The STS3215 servos are absolute encoders so
-    # they remember their position across power cycles; after the initial
-    # lerobot-calibrate run the offsets are stored in jetson_arm.json and
-    # do not need to be re-established on each connect.
+
+    # Auto-answer LeRobot's two interactive prompts so the user doesn't have
+    # to press ENTER twice on every run:
+    #   1. "Press ENTER to use provided calibration file..."  → ENTER
+    #   2. "Move to middle of range and press ENTER..."       → ENTER
+    # We do this by temporarily replacing builtins.input with a version that
+    # prints the prompt (so it's visible in logs) and returns "" (= ENTER).
+    # The calibration JSON is still loaded normally — only the prompts are skipped.
+    import builtins as _builtins
+    _real_input = _builtins.input
+    def _auto_enter(prompt=""):
+        print(f"  [auto] {prompt.strip()}")
+        return ""          # empty string = pressing ENTER
+    _builtins.input = _auto_enter
     try:
-        robot.connect(calibrate=False)
-    except TypeError:
-        # Older LeRobot versions don't accept the calibrate kwarg — fall back
-        # to the default interactive connect and the user presses ENTER twice.
         robot.connect()
+    finally:
+        _builtins.input = _real_input   # always restore, even if connect() raises
     print("   ✅ Arm connected")
+
 
 
     # ── Servo health check ────────────────────────────────────────────────────

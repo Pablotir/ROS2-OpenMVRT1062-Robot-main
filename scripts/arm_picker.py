@@ -1963,24 +1963,104 @@ def main():
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
 
-    # Auto-answer LeRobot's two interactive prompts so the user doesn't have
-    # to press ENTER twice on every run:
-    #   1. "Press ENTER to use provided calibration file..."  → ENTER
-    #   2. "Move to middle of range and press ENTER..."       → ENTER
-    # We do this by temporarily replacing builtins.input with a version that
-    # prints the prompt (so it's visible in logs) and returns "" (= ENTER).
-    # The calibration JSON is still loaded normally — only the prompts are skipped.
-    import builtins as _builtins
-    _real_input = _builtins.input
-    def _auto_enter(prompt=""):
-        print(f"  [auto] {prompt.strip()}")
-        return ""          # empty string = pressing ENTER
-    _builtins.input = _auto_enter
+    # Strategy: connect(calibrate=False) skips all interactive prompts, then we
+    # manually find the calibration JSON and register it with the motor bus.
+    # This avoids the "move to middle / record ranges" ceremony on every startup.
+    import json as _json, pathlib as _pathlib, builtins as _builtins
+
+    # ── Locate the calibration JSON ──────────────────────────────────────────
+    _calib_search = [
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+    ]
+    _calib_path = next((p for p in _calib_search if p.exists()), None)
+
+    if _calib_path is None:
+        # ── No JSON found — must run interactive calibration once ────────────
+        print("   ⚠️  No calibration file found for 'jetson_arm'.")
+        print("   ⚠️  Run this on the Jetson ONCE to create it:")
+        print(f"       lerobot-calibrate --robot.type=so101_follower \\")
+        print(f"           --robot.port={PORT} --robot.id={ARM_ID}")
+        print("   ⚠️  Then re-run arm_picker.py — no prompts after that.\n")
+        raise RuntimeError("Calibration file missing — run lerobot-calibrate first.")
+
+    print(f"   📂 Calibration: {_calib_path}")
+
+    # Check for degenerate calibration (all min==max==2047 from a bad run)
+    with open(_calib_path) as _f:
+        _calib_data = _json.load(_f)
+    _start = _calib_data.get("start_pos", [])
+    _end   = _calib_data.get("end_pos",   [])
+    if _start and _end and all(s == e for s, e in zip(_start, _end)):
+        print("   ❌  Calibration file is DEGENERATE (start_pos == end_pos for all joints).")
+        print("   ❌  This was caused by auto-confirming the range-recording step with no arm movement.")
+        print(f"   ❌  Delete it and re-calibrate:")
+        print(f"       rm {_calib_path}")
+        print(f"       lerobot-calibrate --robot.type=so101_follower \\")
+        print(f"           --robot.port={PORT} --robot.id={ARM_ID}")
+        raise RuntimeError("Degenerate calibration — delete it and re-run lerobot-calibrate.")
+
+    # ── Connect without prompts, then register calibration manually ──────────
     try:
-        robot.connect()
-    finally:
-        _builtins.input = _real_input   # always restore, even if connect() raises
+        robot.connect(calibrate=False)
+    except TypeError:
+        # Very old LeRobot: calibrate kwarg doesn't exist; fall back to mocked input
+        _real_input = _builtins.input
+        def _auto_use_file(prompt=""):
+            # Only auto-answer the "use existing file" prompt (contains 'ENTER')
+            # For anything else (range recording etc.) restore real input so
+            # the user is prompted normally instead of creating bad calibration.
+            if "enter" in prompt.lower() and "range" not in prompt.lower():
+                print(f"  [auto] {prompt.strip()}")
+                return ""
+            _builtins.input = _real_input
+            return _real_input(prompt)
+        _builtins.input = _auto_use_file
+        try:
+            robot.connect()
+        finally:
+            _builtins.input = _real_input
+
+    # ── Register the calibration data with the motor bus ────────────────────
+    _registered = False
+    for _method in ("set_calibration", "load_calibration", "_set_calibration"):
+        if hasattr(robot.bus, _method):
+            try:
+                getattr(robot.bus, _method)(_calib_data)
+                _registered = True
+                print(f"   ✅ Calibration registered via robot.bus.{_method}()")
+                break
+            except Exception as _e:
+                print(f"   ⚠️  {_method}() failed: {_e}")
+    if not _registered:
+        for _attr in ("calibration", "_calibration"):
+            try:
+                setattr(robot.bus, _attr, _calib_data)
+                _registered = True
+                print(f"   ✅ Calibration registered via robot.bus.{_attr}")
+                break
+            except Exception:
+                pass
+    if not _registered:
+        # Last resort: try calling the robot's own internal calibration loader
+        for _meth in ("_load_calibration", "_apply_calibration", "_calibrate"):
+            if hasattr(robot, _meth):
+                try:
+                    getattr(robot, _meth)()
+                    _registered = True
+                    print(f"   ✅ Calibration loaded via robot.{_meth}()")
+                    break
+                except Exception:
+                    pass
+    if not _registered:
+        print("   ⚠️  Could not register calibration automatically.")
+        print("   ⚠️  Paste this on the Jetson to inspect the bus API:")
+        print("       python3 -c \"from lerobot.robots.so101_follower.so101_follower import *; r=SO101Follower(SO101FollowerConfig(port='/dev/arm_controller',id='jetson_arm',use_degrees=True)); print([m for m in dir(r.bus) if 'calib' in m.lower()])\"")
+
     print("   ✅ Arm connected")
+
 
 
 

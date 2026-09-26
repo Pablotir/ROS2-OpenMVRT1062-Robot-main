@@ -48,24 +48,48 @@ import requests
 from ultralytics import YOLO
 
 # ── Headless display detection ────────────────────────────────────────────────
-# When running over SSH without X11 forwarding (no DISPLAY), cv2.imshow crashes
-# with "Can't initialize GTK backend". Detect this once at startup and use a
-# file-based fallback instead.
+# When running over SSH without X11 forwarding or with broken/unauthorized DISPLAY,
+# cv2.imshow crashes with "Can't initialize GTK backend".
 HEADLESS = (os.environ.get("DISPLAY", "").strip() == "")
 _headless_last_save: dict = {}   # name → last save timestamp (rate-limit to 5fps)
 
+def _init_display_mode() -> None:
+    """Test if X11/GTK is actually functional. If not, activate headless mode cleanly."""
+    global HEADLESS
+    if HEADLESS:
+        print("ℹ️  DISPLAY not set — running in HEADLESS mode (saving frames to /tmp).")
+        return
+    try:
+        # Test GTK window creation and destruction
+        _test_win = "__display_test__"
+        cv2.namedWindow(_test_win, cv2.WINDOW_AUTOSIZE)
+        cv2.destroyWindow(_test_win)
+        print("🖥️  Graphical display verified — GUI windows enabled.")
+    except Exception as e:
+        HEADLESS = True
+        print(f"⚠️  Display backend test failed ({e}).")
+        print("   Running in HEADLESS mode — camera frames will be saved to /tmp/arm_picker_*.jpg.")
+
 def _show_frame(name: str, img: np.ndarray) -> None:
     """Safe imshow wrapper: GUI window if display available, else save to /tmp."""
-    if HEADLESS:
-        now = time.time()
-        if now - _headless_last_save.get(name, 0) >= 0.2:   # max 5 fps to disk
-            _headless_last_save[name] = now
-            safe = name.replace(" ", "_")
-            cv2.imwrite(f"/tmp/arm_picker_{safe}.jpg", img)
-    else:
-        cv2.imshow(name, img)
+    global HEADLESS
+    if not HEADLESS:
+        try:
+            cv2.imshow(name, img)
+            cv2.waitKey(1)
+            return
+        except Exception as e:
+            HEADLESS = True
+            print(f"⚠️  Display error ({e}) — switching to HEADLESS mode (saving frames to /tmp).")
+
+    now = time.time()
+    if now - _headless_last_save.get(name, 0) >= 0.2:   # max 5 fps to disk
+        _headless_last_save[name] = now
+        safe = name.replace(" ", "_")
+        cv2.imwrite(f"/tmp/arm_picker_{safe}.jpg", img)
 
 def _destroy_windows() -> None:
+    global HEADLESS
     if not HEADLESS:
         try:
             cv2.destroyAllWindows()
@@ -239,7 +263,7 @@ ALIGN_INIT_MAX_PAN  = 25.0
 ALIGN_INIT_MAX_LIFT = 12.0
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# Calibrated scan posture (from calibration/arm_reference_poses.yaml)
+# Default fallback scan posture (overwritten by arm_reference_poses.yaml if present)
 _BASE = {
     "shoulder_pan.pos":   -4.48,
     "shoulder_lift.pos": -106.02,
@@ -248,7 +272,7 @@ _BASE = {
     "wrist_roll.pos":   -155.96,
     "gripper.pos":        73.84,
 }
-# Calibrated stow posture (from calibration/arm_reference_poses.yaml)
+# Default fallback stow posture (overwritten by arm_reference_poses.yaml if present)
 _STOW_BASE = {
     "shoulder_pan.pos":   -4.48,
     "shoulder_lift.pos": -106.11,
@@ -257,6 +281,41 @@ _STOW_BASE = {
     "wrist_roll.pos":   -156.75,
     "gripper.pos":        73.77,
 }
+
+def _load_reference_poses():
+    """Load calibrated scan_base and stow_base postures from YAML if available."""
+    search_paths = [
+        "/root/ros2_ws/calibration/arm_reference_poses.yaml",
+        os.path.join(os.path.dirname(__file__), "../calibration/arm_reference_poses.yaml"),
+        os.path.join(os.path.dirname(__file__), "calibration/arm_reference_poses.yaml"),
+        os.path.join(os.path.dirname(__file__), "arm_reference_poses.yaml"),
+        "arm_reference_poses.yaml",
+    ]
+    for p in search_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r") as f:
+                    data = yaml.safe_load(f)
+                if not data:
+                    continue
+                scan = data.get("scan_base", {}).get("joints")
+                stow = data.get("stow_base", {}).get("joints")
+                if scan:
+                    for k, v in scan.items():
+                        _BASE[k] = round(float(v), 2)
+                    print(f"📖 Loaded scan_base posture from: {p}")
+                if stow:
+                    for k, v in stow.items():
+                        _STOW_BASE[k] = round(float(v), 2)
+                    print(f"📖 Loaded stow_base posture from: {p}")
+                return p
+            except Exception as e:
+                print(f"⚠️ Failed reading {p}: {e}")
+    return None
+
+# Load at import time if file exists
+_load_reference_poses()
+
 
 _ALIGN_READY = {
     "shoulder_pan.pos":   -4.48,   # overwritten in pipeline to match target pan
@@ -776,6 +835,262 @@ def forward_kinematics(q: dict) -> np.ndarray:
         [0., 0., 0., 1.],
     ])
     return T
+
+
+def save_reference_poses(scan_joints=None, stow_joints=None, filepath=None):
+    """Save scan_base and stow_base to arm_reference_poses.yaml and update in-memory dicts."""
+    if filepath is None:
+        target_dir = "/root/ros2_ws/calibration"
+        if not os.path.exists(target_dir):
+            target_dir = os.path.join(os.path.dirname(__file__), "../calibration")
+        if not os.path.exists(target_dir):
+            target_dir = os.path.join(os.path.dirname(__file__), "calibration")
+        if not os.path.exists(target_dir):
+            target_dir = os.path.dirname(__file__)
+        filepath = os.path.join(target_dir, "arm_reference_poses.yaml")
+
+    data = {}
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            data = {}
+
+    if scan_joints:
+        try:
+            T_wb = forward_kinematics(scan_joints)
+            wx, wy, wz = float(T_wb[0, 3]), float(T_wb[1, 3]), float(T_wb[2, 3])
+            rho = float(math.sqrt(wx**2 + wy**2 + wz**2))
+        except Exception:
+            wx, wy, wz, rho = 0.0, 0.0, 0.0, 0.0
+        data["scan_base"] = {
+            "joints": {k: float(v) for k, v in scan_joints.items()},
+            "fk_xyz_mm": [round(wx, 2), round(wy, 2), round(wz, 2)],
+            "reach_rho_mm": round(rho, 2),
+            "recorded_at": datetime.now().isoformat(),
+        }
+        for k, v in scan_joints.items():
+            _BASE[k] = round(float(v), 2)
+
+    if stow_joints:
+        try:
+            T_wb = forward_kinematics(stow_joints)
+            wx, wy, wz = float(T_wb[0, 3]), float(T_wb[1, 3]), float(T_wb[2, 3])
+            rho = float(math.sqrt(wx**2 + wy**2 + wz**2))
+        except Exception:
+            wx, wy, wz, rho = 0.0, 0.0, 0.0, 0.0
+        data["stow_base"] = {
+            "joints": {k: float(v) for k, v in stow_joints.items()},
+            "fk_xyz_mm": [round(wx, 2), round(wy, 2), round(wz, 2)],
+            "reach_rho_mm": round(rho, 2),
+            "recorded_at": datetime.now().isoformat(),
+        }
+        for k, v in stow_joints.items():
+            _STOW_BASE[k] = round(float(v), 2)
+
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    with open(filepath, "w") as f:
+        yaml.dump(data, f, sort_keys=False, default_flow_style=False)
+    print(f"\n💾 Saved reference poses successfully to:\n   {filepath}")
+    return filepath
+
+
+def connect_robot():
+    """
+    Connect to SO-ARM101 using calibrated JSON, registering typed calibration
+    attributes with the motor bus, and verifying servo health.
+    """
+    print("🔌 Connecting to SO-ARM101...")
+    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
+    robot  = SOFollower(config)
+
+    # Locate calibration JSON
+    import json as _json, pathlib as _pathlib, builtins as _builtins
+    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
+                  os.environ.get("TRANSFORMERS_CACHE",
+                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
+    _calib_search = [
+        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+    ]
+    _calib_path = next((p for p in _calib_search if p.exists()), None)
+
+    if _calib_path is None:
+        print(f"   ⚠️  No calibration file found for '{ARM_ID}'.")
+        print("   ⚠️  Run lerobot-calibrate first.")
+        raise RuntimeError(f"Calibration file missing for {ARM_ID}.")
+
+    with open(_calib_path) as _f:
+        _calib_data = _json.load(_f)
+
+    # Check degenerate
+    if "start_pos" in _calib_data:
+        _s, _e = _calib_data["start_pos"], _calib_data["end_pos"]
+        _is_degenerate = bool(_s) and all(a == b for a, b in zip(_s, _e))
+    else:
+        _ranges = [(v["range_min"], v["range_max"])
+                   for v in _calib_data.values()
+                   if isinstance(v, dict) and "range_min" in v]
+        _is_degenerate = bool(_ranges) and all(mn == mx for mn, mx in _ranges)
+
+    if _is_degenerate:
+        raise RuntimeError("Degenerate calibration file — all ranges are identical. Delete and re-calibrate.")
+
+    # Connect without interactive prompt
+    try:
+        robot.connect(calibrate=False)
+    except TypeError:
+        _real_input = _builtins.input
+        def _auto_use_file(prompt=""):
+            if "enter" in prompt.lower() and "range" not in prompt.lower():
+                return ""
+            _builtins.input = _real_input
+            return _real_input(prompt)
+        _builtins.input = _auto_use_file
+        try:
+            robot.connect()
+        finally:
+            _builtins.input = _real_input
+
+    # Build typed calibration objects for LeRobot _normalize attribute access
+    from types import SimpleNamespace as _NS
+    _MC = None
+    for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
+                    "lerobot.common.robot_devices.motors.feetech"):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_mc_mod)
+            for _cname in ("MotorCalibration", "CalibrationData", "Calibration"):
+                if hasattr(_mod, _cname):
+                    _MC = getattr(_mod, _cname)
+                    break
+            if _MC:
+                break
+        except Exception:
+            pass
+
+    def _make_motor_calib(d: dict):
+        if _MC is not None:
+            try:
+                import dataclasses as _dc
+                if _dc.is_dataclass(_MC):
+                    _fields = {f.name for f in _dc.fields(_MC)}
+                    return _MC(**{k: v for k, v in d.items() if k in _fields})
+                return _MC(**d)
+            except Exception:
+                pass
+        return _NS(**d)
+
+    _typed_calib = {
+        _motor: _make_motor_calib(_jdata)
+        for _motor, _jdata in _calib_data.items()
+        if isinstance(_jdata, dict)
+    }
+
+    _registered = False
+    for _method in ("set_calibration", "load_calibration", "_set_calibration"):
+        if hasattr(robot.bus, _method):
+            for _payload in (_typed_calib, _calib_data):
+                try:
+                    getattr(robot.bus, _method)(_payload)
+                    _registered = True
+                    break
+                except Exception:
+                    pass
+            if _registered:
+                break
+    if not _registered:
+        for _attr in ("calibration", "_calibration"):
+            try:
+                setattr(robot.bus, _attr, _typed_calib)
+                _registered = True
+                break
+            except Exception:
+                pass
+
+    print("   ✅ Arm connected and calibration registered")
+
+    # Servo health check
+    if not check_servo_health(robot):
+        robot.disconnect()
+        raise RuntimeError("Servo health check failed — power cycle arm.")
+
+    return robot
+
+
+def teach_postures(robot=None):
+    """
+    Interactive teaching mode:
+    1. Cuts torque immediately so arm can be freely guided by hand.
+    2. Streams live joint angles.
+    3. User captures Scan and Stow postures.
+    4. Saves to arm_reference_poses.yaml and updates in-memory _BASE / _STOW_BASE.
+    """
+    owns_robot = False
+    if robot is None:
+        robot = connect_robot()
+        owns_robot = True
+
+    try:
+        print("\n" + "═"*65)
+        print(" 🎓 INTERACTIVE TEACHING MODE: RECORD REFERENCE POSTURES")
+        print("═"*65)
+        print(" ⚠️  DISABLING MOTOR TORQUE NOW — support the arm by hand!")
+        time.sleep(0.5)
+        _set_torque(robot, False)
+        print(" 🔓 Torque DISABLED. You can freely guide the arm by hand.\n")
+
+        print("---------------------------------------------------------------")
+        print(" STEP 1: Set NEUTRAL SCAN / START Posture")
+        print(" Guide the arm into your desired neutral scanning position:")
+        print("   - Shoulder pan centered facing forward (~0°)")
+        print("   - Shoulder lift & elbow set so camera views workspace")
+        print("   - Wrist tilted ~45° down toward target area")
+        print("   - Gripper open/ready")
+        print("---------------------------------------------------------------")
+        input(" 👉 Hold arm in SCAN posture, then press ENTER to capture... ")
+        scan_pos = get_pos(robot)
+        print("\n ✅ Captured SCAN posture:")
+        for k, v in sorted(scan_pos.items()):
+            print(f"    {k:20s}: {v:+6.2f}°")
+
+        print("\n---------------------------------------------------------------")
+        print(" STEP 2: Set STOW / PARK Posture")
+        print(" Guide the arm into your desired resting/stow position:")
+        print("   - Folded back safely, close to base, gripper compact")
+        print("---------------------------------------------------------------")
+        input(" 👉 Hold arm in STOW posture, then press ENTER to capture... ")
+        stow_pos = get_pos(robot)
+        print("\n ✅ Captured STOW posture:")
+        for k, v in sorted(stow_pos.items()):
+            print(f"    {k:20s}: {v:+6.2f}°")
+
+        filepath = save_reference_poses(scan_pos, stow_pos)
+
+        print("\n 📋 Python dict snippet for arm_picker.py:")
+        print("_BASE = {")
+        for k, v in sorted(scan_pos.items()):
+            print(f'    "{k}": {round(v, 2):7.2f},')
+        print("}")
+        print("_STOW_BASE = {")
+        for k, v in sorted(stow_pos.items()):
+            print(f'    "{k}": {round(v, 2):7.2f},')
+        print("}")
+        print("═"*65)
+        print(" ✅ Postures successfully calibrated and active in memory!\n")
+
+    finally:
+        print("🔌 Restoring motor torque...")
+        _set_torque(robot, True)
+        if owns_robot:
+            robot.disconnect()
 
 
 def solve_ik(x_mm: float, y_mm: float, z_mm: float,
@@ -1777,18 +2092,14 @@ def run_manual_calibration(robot):
     minimum/maximum joint angles and maximum extension reached.
     """
     print("\n" + "═"*65)
-    print(" 🛠️  MANUAL MOVEMENT & RANGE-OF-MOTION CALIBRATION MODE")
+    print(" 🛠️  MANUAL MOVEMENT & RANGE-OF-MOTION EXPLORATION MODE")
     print("═"*65)
-    print(" ▶ First moving to the Default Scan Posture...")
-    smooth_move(robot, _BASE, step_size=2.0, step_delay=0.03)
-    time.sleep(1.0)
-    
-    print("\n Disabling motor torque... You can now move the arm manually by hand.")
-    print(" Practice the perfect lunge from this starting position!")
-    print(" Hold the arm exactly where you want the lunge to end, then press Ctrl+C in terminal.")
-    print("═"*65 + "\n")
-
+    print(" ⚠️  Disabling motor torque NOW — please support the arm with your hand!")
+    time.sleep(0.5)
     _set_torque(robot, False)
+    print(" 🔓 Motor torque DISABLED. You can now move the arm manually by hand.")
+    print(" Move joints to explore reach, or hold at a target pose and press Ctrl+C to finish.")
+    print("═"*65 + "\n")
 
     stats = {
         "shoulder_pan":  {"min": 999.0, "max": -999.0},
@@ -1856,41 +2167,38 @@ def main():
     print(" Select Mode:")
     print("   [1] Vision Alignment + Manual Lunge Demonstration")
     print("   [2] View Theoretical Arm Workspace Limits & Edge Boundaries")
-    print("   [3] Manual Arm Movement & Range-of-Motion Calibration (Torque OFF)")
+    print("   [3] Record / Teach Reference Postures (Scan & Stow) [Torque OFF]")
     print("   [4] Move to Exact Calibrated Image Postures (Raw Joints)")
     print("   [5] Test Full Automatic Pick-and-Place (Vision + IK Lunge)")
     print("   [6] Exit")
     print("═"*65)
-    choice = input("Enter choice (1-5): ").strip()
+    choice = input("Enter choice (1-6): ").strip()
 
     if choice == "2":
         show_workspace_limits()
         do_move = input("Do you want to physically move the arm to these boundary edges now? (y/n): ").strip().lower()
         if do_move.startswith("y"):
-            print("🔌 Connecting to SO-ARM101...")
-            config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-            robot  = SOFollower(config)
-            robot.connect()
+            robot = connect_robot()
             try:
                 demonstrate_workspace_boundaries(robot)
             finally:
                 robot.disconnect()
         return
     elif choice == "3":
-        print("🔌 Connecting to SO-ARM101...")
-        config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-        robot  = SOFollower(config)
-        robot.connect()
+        robot = connect_robot()
         try:
-            run_manual_calibration(robot)
+            print("\n [1] Teach / Record Reference Postures (Scan & Stow) [Recommended]")
+            print(" [2] Free-move Workspace & Reach Exploration")
+            sub = input("Choose (1 or 2) [default 1]: ").strip()
+            if sub == "2":
+                run_manual_calibration(robot)
+            else:
+                teach_postures(robot)
         finally:
             robot.disconnect()
         return
     elif choice == "4":
-        print("🔌 Connecting to SO-ARM101...")
-        config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-        robot  = SOFollower(config)
-        robot.connect()
+        robot = connect_robot()
         try:
             demonstrate_raw_image_positions(robot)
         finally:
@@ -1904,6 +2212,9 @@ def main():
         return
         
     do_manual_lunge = (choice == "1")
+
+    # ── Verify graphical display or switch to headless cleanly ────────────────
+    _init_display_mode()
 
     print("🚀 Initialising RealSense D405 + IK Pick-and-Place Pipeline...")
 
@@ -1959,188 +2270,19 @@ def main():
     print("   ✅ YOLO warmup complete")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
-    print("🔌 Connecting to SO-ARM101...")
-    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-    robot  = SOFollower(config)
-
-    # Strategy: connect(calibrate=False) skips all interactive prompts, then we
-    # manually find the calibration JSON and register it with the motor bus.
-    # This avoids the "move to middle / record ranges" ceremony on every startup.
-    import json as _json, pathlib as _pathlib, builtins as _builtins
-
-    # ── Locate the calibration JSON ──────────────────────────────────────────
-    # LeRobot respects HF_HOME env var (defaults to ~/.cache/huggingface).
-    # On this Jetson HF_HOME=/data/models/huggingface so files land there.
-    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
-                  os.environ.get("TRANSFORMERS_CACHE",
-                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
-    _calib_search = [
-        # HF_HOME-aware (correct for this Jetson)
-        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-        # /data path (hardcoded fallback seen in calibration output)
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        # Standard ~/.cache paths
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-    ]
-    _calib_path = next((p for p in _calib_search if p.exists()), None)
-
-
-    if _calib_path is None:
-        # ── No JSON found — must run interactive calibration once ────────────
-        print("   ⚠️  No calibration file found for 'jetson_arm'.")
-        print("   ⚠️  Run this on the Jetson ONCE to create it:")
-        print(f"       lerobot-calibrate --robot.type=so101_follower \\")
-        print(f"           --robot.port={PORT} --robot.id={ARM_ID}")
-        print("   ⚠️  Then re-run arm_picker.py — no prompts after that.\n")
-        raise RuntimeError("Calibration file missing — run lerobot-calibrate first.")
-
-    print(f"   📂 Calibration: {_calib_path}")
-
-    # Check for degenerate calibration (range_min == range_max everywhere)
-    # Handles BOTH JSON formats:
-    #   Old LeRobot: {"start_pos": [...], "end_pos": [...]}
-    #   New LeRobot: {"shoulder_pan": {"range_min": N, "range_max": M}, ...}
-    with open(_calib_path) as _f:
-        _calib_data = _json.load(_f)
-
-    _is_degenerate = False
-    if "start_pos" in _calib_data:                        # old format
-        _s, _e = _calib_data["start_pos"], _calib_data["end_pos"]
-        _is_degenerate = bool(_s) and all(a == b for a, b in zip(_s, _e))
-    else:                                                  # new per-motor format
-        _ranges = [(v["range_min"], v["range_max"])
-                   for v in _calib_data.values()
-                   if isinstance(v, dict) and "range_min" in v]
-        _is_degenerate = bool(_ranges) and all(mn == mx for mn, mx in _ranges)
-
-    if _is_degenerate:
-        print("   ❌  Calibration file is DEGENERATE (range_min == range_max for all joints).")
-        print("   ❌  This was caused by auto-confirming range-recording with no arm movement.")
-        print(f"   ❌  Delete it and re-calibrate:")
-        print(f"       rm {_calib_path}")
-        print(f"       lerobot-calibrate --robot.type=so101_follower \\")
-        print(f"           --robot.port={PORT} --robot.id={ARM_ID}")
-        raise RuntimeError("Degenerate calibration — delete it and re-run lerobot-calibrate.")
-
-    # Print a brief summary so we can confirm good values were loaded
-    if "start_pos" not in _calib_data:   # new format
-        for _jname, _jdata in _calib_data.items():
-            if isinstance(_jdata, dict) and "range_min" in _jdata:
-                print(f"   📐 {_jname}: [{_jdata['range_min']} – {_jdata['range_max']}]  offset={_jdata.get('homing_offset', '?')}")
-
-
-    # ── Connect without prompts, then register calibration manually ──────────
     try:
-        robot.connect(calibrate=False)
-    except TypeError:
-        # Very old LeRobot: calibrate kwarg doesn't exist; fall back to mocked input
-        _real_input = _builtins.input
-        def _auto_use_file(prompt=""):
-            # Only auto-answer the "use existing file" prompt (contains 'ENTER')
-            # For anything else (range recording etc.) restore real input so
-            # the user is prompted normally instead of creating bad calibration.
-            if "enter" in prompt.lower() and "range" not in prompt.lower():
-                print(f"  [auto] {prompt.strip()}")
-                return ""
-            _builtins.input = _real_input
-            return _real_input(prompt)
-        _builtins.input = _auto_use_file
-        try:
-            robot.connect()
-        finally:
-            _builtins.input = _real_input
+        robot = connect_robot()
+    except Exception as e:
+        print(f"❌ Arm connection / health check failed: {e}")
+        return
 
-    # ── Build typed calibration objects ─────────────────────────────────────
-    # LeRobot's _normalize() accesses calibration[motor].range_min as an
-    # ATTRIBUTE, not a dict key.  Convert each per-motor dict → object.
-    from types import SimpleNamespace as _NS
-
-    # Try to use the real LeRobot MotorCalibration dataclass (best match)
-    _MC = None
-    for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
-                    "lerobot.common.robot_devices.motors.feetech"):
-        try:
-            import importlib as _il
-            _mod = _il.import_module(_mc_mod)
-            for _cname in ("MotorCalibration", "CalibrationData", "Calibration"):
-                if hasattr(_mod, _cname):
-                    _MC = getattr(_mod, _cname)
-                    break
-            if _MC:
-                break
-        except Exception:
-            pass
-
-    def _make_motor_calib(d: dict):
-        if _MC is not None:
-            try:
-                import dataclasses as _dc
-                if _dc.is_dataclass(_MC):
-                    _fields = {f.name for f in _dc.fields(_MC)}
-                    return _MC(**{k: v for k, v in d.items() if k in _fields})
-                return _MC(**d)
-            except Exception:
-                pass
-        return _NS(**d)   # fallback: attribute access via SimpleNamespace
-
-    _typed_calib = {
-        _motor: _make_motor_calib(_jdata)
-        for _motor, _jdata in _calib_data.items()
-        if isinstance(_jdata, dict)
-    }
-
-    # ── Register the typed calibration with the motor bus ────────────────────
-    _registered = False
-    for _method in ("set_calibration", "load_calibration", "_set_calibration"):
-        if hasattr(robot.bus, _method):
-            for _payload in (_typed_calib, _calib_data):
-                try:
-                    getattr(robot.bus, _method)(_payload)
-                    _registered = True
-                    print(f"   ✅ Calibration registered via robot.bus.{_method}()")
-                    break
-                except Exception:
-                    pass
-            if _registered:
-                break
-    if not _registered:
-        for _attr in ("calibration", "_calibration"):
-            try:
-                setattr(robot.bus, _attr, _typed_calib)
-                _registered = True
-                print(f"   ✅ Calibration registered via robot.bus.{_attr} (typed)")
-                break
-            except Exception:
-                pass
-    if not _registered:
-        print("   ⚠️  Could not register calibration — arm will likely crash on first read.")
-
-    print("   ✅ Arm connected")
-
-
-
-
-    # ── Servo health check ────────────────────────────────────────────────────
-    # Read Hardware_Error_Status from every servo before any motion.
-    # If any servo tripped overload/overheat protection it will be in error state
-    # and must be power-cycled before it can move safely.
-    if not check_servo_health(robot):
-        robot.disconnect()
-        return   # abort — user told to power-cycle
-
-    # ── Headless mode notice ──────────────────────────────────────────────────
-    if HEADLESS:
-        print("⚠️  No DISPLAY detected — running headless.")
-        print("   Camera frames saved to /tmp/arm_picker_Picker_Vision.jpg (~5 fps)")
-        print("   View live: watch -n0.2 feh /tmp/arm_picker_Picker_Vision.jpg")
-
+    # Refresh reference postures (in case taught recently)
+    _load_reference_poses()
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
+    print(f"📍 Start Position : Pan={START_POS.get('shoulder_pan.pos',0):+.1f}° Lift={START_POS.get('shoulder_lift.pos',0):+.1f}° Elb={START_POS.get('elbow_flex.pos',0):+.1f}°")
+    print(f"📍 Stow Position  : Pan={STOW.get('shoulder_pan.pos',0):+.1f}° Lift={STOW.get('shoulder_lift.pos',0):+.1f}° Elb={STOW.get('elbow_flex.pos',0):+.1f}°")
+
 
     _shutdown_requested = [False]  # mutable flag safe to set from signal handler
 

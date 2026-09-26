@@ -48,47 +48,131 @@ import requests
 
 from ultralytics import YOLO
 
-# ── Headless display detection ────────────────────────────────────────────────
-# When running over SSH without X11 forwarding or with broken/unauthorized DISPLAY,
-# cv2.imshow crashes with "Can't initialize GTK backend".
-HEADLESS = (os.environ.get("DISPLAY", "").strip() == "")
+# ── Display, Native GUI Popup & Web Video Stream ─────────────────────────────
+HEADLESS = False
 _headless_last_save: dict = {}
-# ── Live Web Streamer (browser viewable) ──────────────────────────────────────
-try:
-    from mjpeg_streamer import get_streamer
-    _mjpeg = get_streamer(port=8080)
-except Exception as _e:
-    _mjpeg = None
+
+def _setup_x11_auth() -> None:
+    """Ensure root or SSH sessions have access to the local desktop user's X11 session."""
+    if "DISPLAY" not in os.environ or not os.environ["DISPLAY"].strip():
+        os.environ["DISPLAY"] = ":0"
+    
+    cur_auth = os.environ.get("XAUTHORITY", "")
+    if not cur_auth or not os.path.exists(cur_auth):
+        candidates = [
+            "/home/pablo/.Xauthority",
+            "/home/jetson/.Xauthority",
+            "/root/.Xauthority",
+            "/run/user/1000/gdm/Xauthority",
+            "/run/user/1000/Xauthority",
+        ]
+        import glob
+        candidates.extend(glob.glob("/home/*/.Xauthority"))
+        for p in candidates:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                os.environ["XAUTHORITY"] = p
+                break
+
+
+class _MJPEGStreamer:
+    """Background web server streaming low-latency live video to any browser at port 8080."""
+    def __init__(self, port=8080):
+        self.port = port
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.started = False
+        try:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+            self.started = True
+        except Exception:
+            pass
+
+    def update(self, frame):
+        if not self.started:
+            return
+        with self.lock:
+            self.latest_frame = frame
+
+    def _run(self):
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        server_self = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # suppress HTTP request logs
+
+            def do_GET(self):
+                if self.path in ("/", "/index.html"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    html = (
+                        "<!DOCTYPE html><html><head><title>SO-ARM101 Live Camera Feed</title>"
+                        "<style>body{background:#181818;color:#eee;text-align:center;font-family:sans-serif;margin:0;padding:20px;}"
+                        "img{max-width:96vw;max-height:85vh;border:2px solid #555;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);}"
+                        "</style></head><body>"
+                        "<h2>🤖 SO-ARM101 Real-Time Live Feed</h2>"
+                        "<p style='color:#aaa;font-size:14px;'>Native framerate camera stream</p>"
+                        "<img src='/stream' alt='Live Video Stream' />"
+                        "</body></html>"
+                    )
+                    self.wfile.write(html.encode("utf-8"))
+                elif self.path == "/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    while server_self.running:
+                        with server_self.lock:
+                            f = server_self.latest_frame
+                        if f is not None:
+                            ret, jpeg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            if ret:
+                                try:
+                                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
+                                except (BrokenPipeError, ConnectionResetError):
+                                    break
+                        time.sleep(0.030)  # max ~33 fps
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        try:
+            httpd = HTTPServer(("0.0.0.0", self.port), Handler)
+            httpd.serve_forever()
+        except Exception:
+            pass
+
+_web_streamer = _MJPEGStreamer(port=8080)
 
 
 def _init_display_mode() -> None:
-    """Test if X11/GTK is actually functional. If not, activate headless mode cleanly."""
+    """Verify GUI display and launch native popup window + browser live stream."""
     global HEADLESS
-    if HEADLESS:
-        print("ℹ️  Running in HEADLESS mode (browser live stream active).")
-        return
+    _setup_x11_auth()
     try:
-        # Test GTK window creation and destruction
         _test_win = "__display_test__"
         cv2.namedWindow(_test_win, cv2.WINDOW_AUTOSIZE)
         cv2.destroyWindow(_test_win)
-        print("🖥️  Graphical display verified — GUI windows enabled.")
+        HEADLESS = False
+        print("🖥️  Native GUI Display verified — live popup window will open!")
     except Exception as e:
         HEADLESS = True
-        print(f"⚠️  Display backend test failed ({e}).")
-        print("   Running in HEADLESS mode (browser live stream active).")
+        print(f"⚠️  Native window unavailable ({e}).")
+        print("   Frames saved to /tmp/arm_picker_*.jpg.")
+    
+    print("🌐 Live Browser Video Feed: http://localhost:8080/ (or http://<jetson-ip>:8080/)")
+
 
 def _show_frame(name: str, img: np.ndarray) -> None:
-    """Safe imshow wrapper: streams live to browser, shows GUI if display available, else saves to /tmp."""
-    global HEADLESS, _mjpeg
-    if img is None:
-        return
+    """Show live native popup window, stream to web browser, and save fallback to /tmp."""
+    global HEADLESS
 
-    # 1. Broadcast live video to any connected web browser
-    if _mjpeg is not None:
-        _mjpeg.update_frame(img)
+    # Always feed browser streamer
+    if _web_streamer is not None:
+        _web_streamer.update(img)
 
-    # 2. Local GUI window (if working X11 display present)
     if not HEADLESS:
         try:
             cv2.imshow(name, img)
@@ -98,7 +182,6 @@ def _show_frame(name: str, img: np.ndarray) -> None:
             HEADLESS = True
             print(f"⚠️  Display error ({e}) — switched to HEADLESS mode.")
 
-    # 3. Snapshot to disk as backup (rate-limited to 5fps)
     now = time.time()
     if now - _headless_last_save.get(name, 0) >= 0.2:
         _headless_last_save[name] = now
@@ -113,6 +196,7 @@ def _destroy_windows() -> None:
             cv2.destroyAllWindows()
         except Exception:
             pass
+
 
 
 try:
@@ -2364,6 +2448,9 @@ def main():
     atexit.register(_emergency_stow)
 
 
+    _last_fps_t = [time.time()]
+    _fps_smoothed = [15.0]
+
     try:
         while True:
             color, has_depth, depth_colormap = cap.read()
@@ -2389,6 +2476,16 @@ def main():
                 depth_color = (0, 200, 0) if d_mm > D405_MIN_RANGE_MM else (0, 0, 255)
                 cv2.putText(display, f"depth: {d_mm:.0f}mm",
                             (w - 160, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, depth_color, 2)
+
+            # ── Live FPS calculation and overlay ──────────────────────────────
+            t_now = time.time()
+            dt = t_now - _last_fps_t[0]
+            _last_fps_t[0] = t_now
+            if dt > 0:
+                _fps_smoothed[0] = 0.9 * _fps_smoothed[0] + 0.1 * (1.0 / dt)
+            cv2.putText(display, f"FPS: {_fps_smoothed[0]:.1f}",
+                        (w - 160, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
 
             if STATE == "SEARCHING":
                 cv2.putText(display, f"STATE: {STATE} | YOLO: {TARGET_DESC}",

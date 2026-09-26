@@ -72,6 +72,8 @@ def main():
     print("📐 Loaded T_cam_wrist matrix:")
     print(np.array2string(T_cam_wrist, precision=3, suppress_small=True))
 
+    _init_display_mode()
+
     board, dictionary, detector = setup_charuco()
 
     print("\n📷 Starting RealSense D405...")
@@ -87,12 +89,15 @@ def main():
 
     print("\n" + "─"*65)
     print(" 🎯 POINT CAMERA AT YOUR 5x7 CHARUCO BOARD")
-    print(" Live visual saved to: /tmp/charuco_live.jpg")
+    print(" 🖥️  Live feed displayed in native popup window!")
+    print(" 🌐 Live browser stream: http://localhost:8080/ (or http://<jetson-ip>:8080/)")
     print(" Press Ctrl+C in terminal to finish and stow arm.")
     print("─"*65 + "\n")
 
     last_print = 0.0
     frame_count = 0
+    _last_fps_t = time.time()
+    _fps_smooth = 15.0
 
     try:
         while True:
@@ -104,6 +109,15 @@ def main():
             frame_count += 1
             display = color.copy()
             h, w = color.shape[:2]
+
+            # ── Live FPS calculation and overlay ──────────────────────────────
+            t_now = time.time()
+            dt = t_now - _last_fps_t
+            _last_fps_t = t_now
+            if dt > 0:
+                _fps_smooth = 0.9 * _fps_smooth + 0.1 * (1.0 / dt)
+            cv2.putText(display, f"FPS: {_fps_smooth:.1f}", (w - 140, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
 
             # Detect ChArUco
             corners, ids = None, None
@@ -183,8 +197,8 @@ def main():
                 cv2.putText(display, "Searching for 5x7 ChArUco Board...", (20, 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Stream live visual to web browser & save snapshot to disk
-            _show_frame("ChArUco Tracker", display)
+            # Show live popup window and feed web stream
+            _show_frame("ChArUco Hand-Eye Verification", display)
 
 
             # Throttle terminal logging to ~1 Hz
@@ -213,9 +227,11 @@ def main():
         try:
             robot.disconnect()
             cap.stop()
+            _destroy_windows()
         except Exception:
             pass
         print("═"*65 + "\n")
+
 
 
 if __name__ == "__main__":

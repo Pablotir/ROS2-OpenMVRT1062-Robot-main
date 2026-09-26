@@ -2055,41 +2055,70 @@ def main():
         finally:
             _builtins.input = _real_input
 
-    # ── Register the calibration data with the motor bus ────────────────────
+    # ── Build typed calibration objects ─────────────────────────────────────
+    # LeRobot's _normalize() accesses calibration[motor].range_min as an
+    # ATTRIBUTE, not a dict key.  Convert each per-motor dict → object.
+    from types import SimpleNamespace as _NS
+
+    # Try to use the real LeRobot MotorCalibration dataclass (best match)
+    _MC = None
+    for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
+                    "lerobot.common.robot_devices.motors.feetech"):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_mc_mod)
+            for _cname in ("MotorCalibration", "CalibrationData", "Calibration"):
+                if hasattr(_mod, _cname):
+                    _MC = getattr(_mod, _cname)
+                    break
+            if _MC:
+                break
+        except Exception:
+            pass
+
+    def _make_motor_calib(d: dict):
+        if _MC is not None:
+            try:
+                import dataclasses as _dc
+                if _dc.is_dataclass(_MC):
+                    _fields = {f.name for f in _dc.fields(_MC)}
+                    return _MC(**{k: v for k, v in d.items() if k in _fields})
+                return _MC(**d)
+            except Exception:
+                pass
+        return _NS(**d)   # fallback: attribute access via SimpleNamespace
+
+    _typed_calib = {
+        _motor: _make_motor_calib(_jdata)
+        for _motor, _jdata in _calib_data.items()
+        if isinstance(_jdata, dict)
+    }
+
+    # ── Register the typed calibration with the motor bus ────────────────────
     _registered = False
     for _method in ("set_calibration", "load_calibration", "_set_calibration"):
         if hasattr(robot.bus, _method):
-            try:
-                getattr(robot.bus, _method)(_calib_data)
-                _registered = True
-                print(f"   ✅ Calibration registered via robot.bus.{_method}()")
+            for _payload in (_typed_calib, _calib_data):
+                try:
+                    getattr(robot.bus, _method)(_payload)
+                    _registered = True
+                    print(f"   ✅ Calibration registered via robot.bus.{_method}()")
+                    break
+                except Exception:
+                    pass
+            if _registered:
                 break
-            except Exception as _e:
-                print(f"   ⚠️  {_method}() failed: {_e}")
     if not _registered:
         for _attr in ("calibration", "_calibration"):
             try:
-                setattr(robot.bus, _attr, _calib_data)
+                setattr(robot.bus, _attr, _typed_calib)
                 _registered = True
-                print(f"   ✅ Calibration registered via robot.bus.{_attr}")
+                print(f"   ✅ Calibration registered via robot.bus.{_attr} (typed)")
                 break
             except Exception:
                 pass
     if not _registered:
-        # Last resort: try calling the robot's own internal calibration loader
-        for _meth in ("_load_calibration", "_apply_calibration", "_calibrate"):
-            if hasattr(robot, _meth):
-                try:
-                    getattr(robot, _meth)()
-                    _registered = True
-                    print(f"   ✅ Calibration loaded via robot.{_meth}()")
-                    break
-                except Exception:
-                    pass
-    if not _registered:
-        print("   ⚠️  Could not register calibration automatically.")
-        print("   ⚠️  Paste this on the Jetson to inspect the bus API:")
-        print("       python3 -c \"from lerobot.robots.so101_follower.so101_follower import *; r=SO101Follower(SO101FollowerConfig(port='/dev/arm_controller',id='jetson_arm',use_degrees=True)); print([m for m in dir(r.bus) if 'calib' in m.lower()])\"")
+        print("   ⚠️  Could not register calibration — arm will likely crash on first read.")
 
     print("   ✅ Arm connected")
 

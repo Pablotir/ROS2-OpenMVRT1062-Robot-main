@@ -1923,8 +1923,19 @@ def main():
     print("🔌 Connecting to SO-ARM101...")
     config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
     robot  = SOFollower(config)
-    robot.connect()
+    # calibrate=False → skip the interactive "move to middle and press ENTER"
+    # prompt on every startup.  The STS3215 servos are absolute encoders so
+    # they remember their position across power cycles; after the initial
+    # lerobot-calibrate run the offsets are stored in jetson_arm.json and
+    # do not need to be re-established on each connect.
+    try:
+        robot.connect(calibrate=False)
+    except TypeError:
+        # Older LeRobot versions don't accept the calibrate kwarg — fall back
+        # to the default interactive connect and the user presses ENTER twice.
+        robot.connect()
     print("   ✅ Arm connected")
+
 
     # ── Servo health check ────────────────────────────────────────────────────
     # Read Hardware_Error_Status from every servo before any motion.

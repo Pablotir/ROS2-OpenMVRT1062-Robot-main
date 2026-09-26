@@ -1,28 +1,18 @@
-stow_base:
-  joints:
-    shoulder_pan.pos: -4.483516483516484
-    shoulder_lift.pos: -106.10989010989012
-    elbow_flex.pos: 100.0
-    wrist_flex.pos: 75.95604395604396
-    wrist_roll.pos: -156.74725274725276
-    gripper.pos: 73.77260981912144
-  fk_xyz_mm:
-  - 22.262159615787784
-  - 0.04525949784239672
-  - 3.9320276573506305
-  reach_rho_mm: 22.262205622555854
-  recorded_at: '2026-08-28T15:27:20.165345'
 scan_base:
   joints:
-    shoulder_pan.pos: -4.483516483516484
-    shoulder_lift.pos: -106.02197802197803
-    elbow_flex.pos: 99.91208791208791
-    wrist_flex.pos: 33.40659340659341
-    wrist_roll.pos: -155.95604395604394
-    gripper.pos: 73.83720930232558
-  fk_xyz_mm:
-  - 22.213328114859113
-  - 0.045160222244293696
-  - 4.101587021222368
-  reach_rho_mm: 22.213374020712465
-  recorded_at: '2026-08-28T15:27:45.874461'
+    shoulder_pan.pos: -14.95
+    shoulder_lift.pos: -104.22
+    elbow_flex.pos: 98.29
+    wrist_flex.pos: 18.02
+    wrist_roll.pos: -68.62
+    gripper.pos: 72.60
+  recorded_at: '2026-09-26T22:40:00'
+stow_base:
+  joints:
+    shoulder_pan.pos: -15.03
+    shoulder_lift.pos: -100.00
+    elbow_flex.pos: 98.20
+    wrist_flex.pos: 76.84
+    wrist_roll.pos: -68.62
+    gripper.pos: 72.60
+  recorded_at: '2026-09-26T22:40:00'

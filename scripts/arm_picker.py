@@ -40,6 +40,7 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 # ─────────────────────────────────────────────────────────────────────────────
 """
 import os, sys, yaml
+from datetime import datetime
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 import pyrealsense2 as rs
@@ -263,24 +264,25 @@ ALIGN_INIT_MAX_PAN  = 25.0
 ALIGN_INIT_MAX_LIFT = 12.0
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# Default fallback scan posture (overwritten by arm_reference_poses.yaml if present)
+# Default fallback scan posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
 _BASE = {
-    "shoulder_pan.pos":   -4.48,
-    "shoulder_lift.pos": -106.02,
-    "elbow_flex.pos":     99.91,
-    "wrist_flex.pos":     33.41,
-    "wrist_roll.pos":   -155.96,
-    "gripper.pos":        73.84,
+    "shoulder_pan.pos":   -14.95,
+    "shoulder_lift.pos": -104.22,
+    "elbow_flex.pos":      98.29,
+    "wrist_flex.pos":      18.02,
+    "wrist_roll.pos":     -68.62,
+    "gripper.pos":         72.60,
 }
-# Default fallback stow posture (overwritten by arm_reference_poses.yaml if present)
+# Default fallback stow posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
 _STOW_BASE = {
-    "shoulder_pan.pos":   -4.48,
-    "shoulder_lift.pos": -106.11,
-    "elbow_flex.pos":    100.00,
-    "wrist_flex.pos":     75.96,
-    "wrist_roll.pos":   -156.75,
-    "gripper.pos":        73.77,
+    "shoulder_pan.pos":   -15.03,
+    "shoulder_lift.pos": -100.00,
+    "elbow_flex.pos":      98.20,
+    "wrist_flex.pos":      76.84,
+    "wrist_roll.pos":     -68.62,
+    "gripper.pos":         72.60,
 }
+
 
 def _load_reference_poses():
     """Load calibrated scan_base and stow_base postures from YAML if available."""

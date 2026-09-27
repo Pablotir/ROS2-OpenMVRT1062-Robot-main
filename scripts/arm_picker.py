@@ -225,6 +225,12 @@ MAX_GRAB_DEPTH_MM = 600.0
 # 0 = gripper tip exactly at object surface. Increase to reach deeper.
 GRASP_PENETRATION_MM = 20.0
 
+# Lateral gripper offset (mm) perpendicular to approach trajectory.
+# Positive (+ve) = shifts claw to the LEFT (aligns left claw with object edge, preventing tip poke)
+# Negative (-ve) = shifts claw to the RIGHT
+GRAB_LATERAL_OFFSET_MM = 18.0
+
+
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
     """
     Fast R3 bounding-box pre-check using empirically measured workspace limits.
@@ -2765,7 +2771,17 @@ def main():
                 continue
 
             arm_x, arm_y, arm_z = target
-            print(f"   🦾 Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
+            print(f"   🦾 Raw Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
+
+            # ── Apply lateral claw offset (perpendicular to approach vector) ──
+            if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
+                pan_t = math.atan2(arm_y, arm_x)
+                # Shift perpendicular to approach line: left is (-sin, +cos)
+                arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
+                arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
+                print(f"   📐 Applied lateral offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw edge shift)")
+                print(f"   🦾 Offset Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
+
 
             # ── R3 workspace bounds pre-check (empirical calibrated limits) ──────
             if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
@@ -2864,10 +2880,12 @@ def main():
                 print("\n🔍 Search loop resumed\n")
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
-                print("\n🦾 APPROACHING (level gripper)...")
+                print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
+                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)
+
     
                 print("✊ GRIPPING (Adaptive Maximum Speed)...")
                 grab_pos["gripper.pos"] = 0.7

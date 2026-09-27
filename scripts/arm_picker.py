@@ -48,15 +48,18 @@ import requests
 
 from ultralytics import YOLO
 
-# ── Display, Native GUI Popup & Web Video Stream ─────────────────────────────
+# ── Native Jetson Monitor Display Setup ───────────────────────────────────────
 HEADLESS = False
-_headless_last_save: dict = {}
 
-def _setup_x11_auth() -> None:
-    """Ensure root or SSH sessions have access to the local desktop user's X11 session."""
-    if "DISPLAY" not in os.environ or not os.environ["DISPLAY"].strip():
-        os.environ["DISPLAY"] = ":0"
-    
+def _setup_native_display():
+    """
+    Ensure the script has full permission to open native popup windows directly
+    on the Jetson's monitor, handling root X11 permissions automatically.
+    """
+    global HEADLESS
+    import glob, subprocess
+
+    # 1. Authorize root using the desktop user's .Xauthority cookie
     cur_auth = os.environ.get("XAUTHORITY", "")
     if not cur_auth or not os.path.exists(cur_auth):
         candidates = [
@@ -66,136 +69,82 @@ def _setup_x11_auth() -> None:
             "/run/user/1000/gdm/Xauthority",
             "/run/user/1000/Xauthority",
         ]
-        import glob
         candidates.extend(glob.glob("/home/*/.Xauthority"))
         for p in candidates:
             if os.path.exists(p) and os.path.getsize(p) > 0:
                 os.environ["XAUTHORITY"] = p
                 break
 
+    # 2. Probe working DISPLAY (:0, :1, etc.)
+    display_candidates = []
+    if os.environ.get("DISPLAY"):
+        display_candidates.append(os.environ["DISPLAY"])
+    display_candidates.extend([":0", ":1", ":0.0", ":1.0"])
 
-class _MJPEGStreamer:
-    """Background web server streaming low-latency live video to any browser at port 8080."""
-    def __init__(self, port=8080):
-        self.port = port
-        self.latest_frame = None
-        self.lock = threading.Lock()
-        self.running = True
-        self.started = False
+    seen = set()
+    unique_displays = [d for d in display_candidates if not (d in seen or seen.add(d))]
+
+    for disp in unique_displays:
+        os.environ["DISPLAY"] = disp
         try:
-            self.thread = threading.Thread(target=self._run, daemon=True)
-            self.thread.start()
-            self.started = True
+            subprocess.run(["xhost", "+local:root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
         except Exception:
-            pass
-
-    def update(self, frame):
-        if not self.started:
-            return
-        with self.lock:
-            self.latest_frame = frame
-
-    def _run(self):
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        server_self = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
-                pass  # suppress HTTP request logs
-
-            def do_GET(self):
-                if self.path in ("/", "/index.html"):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html")
-                    self.end_headers()
-                    html = (
-                        "<!DOCTYPE html><html><head><title>SO-ARM101 Live Camera Feed</title>"
-                        "<style>body{background:#181818;color:#eee;text-align:center;font-family:sans-serif;margin:0;padding:20px;}"
-                        "img{max-width:96vw;max-height:85vh;border:2px solid #555;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.6);}"
-                        "</style></head><body>"
-                        "<h2>🤖 SO-ARM101 Real-Time Live Feed</h2>"
-                        "<p style='color:#aaa;font-size:14px;'>Native framerate camera stream</p>"
-                        "<img src='/stream' alt='Live Video Stream' />"
-                        "</body></html>"
-                    )
-                    self.wfile.write(html.encode("utf-8"))
-                elif self.path == "/stream":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                    self.end_headers()
-                    while server_self.running:
-                        with server_self.lock:
-                            f = server_self.latest_frame
-                        if f is not None:
-                            ret, jpeg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                            if ret:
-                                try:
-                                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
-                                except (BrokenPipeError, ConnectionResetError):
-                                    break
-                        time.sleep(0.030)  # max ~33 fps
-                else:
-                    self.send_response(404)
-                    self.end_headers()
+            try:
+                subprocess.run(["xhost", "+"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+            except Exception:
+                pass
 
         try:
-            httpd = HTTPServer(("0.0.0.0", self.port), Handler)
-            httpd.serve_forever()
+            test_win = "__display_probe__"
+            cv2.namedWindow(test_win, cv2.WINDOW_AUTOSIZE)
+            probe_frame = np.zeros((10, 10, 3), dtype=np.uint8)
+            cv2.imshow(test_win, probe_frame)
+            cv2.waitKey(1)
+            cv2.destroyWindow(test_win)
+            cv2.waitKey(1)
+            HEADLESS = False
+            print(f"🖥️  Jetson screen connected! Native live popup window enabled on DISPLAY={disp}.")
+            return True
         except Exception:
-            pass
+            continue
 
-_web_streamer = _MJPEGStreamer(port=8080)
-
+    HEADLESS = True
+    print("\n" + "═"*65)
+    print(" ⚠️  COULD NOT OPEN NATIVE WINDOW ON THE JETSON SCREEN.")
+    print(" 👉 In a terminal on your Jetson desktop, run this ONCE:")
+    print("        xhost +")
+    print("    Then re-run this script.")
+    print("═"*65 + "\n")
+    return False
 
 def _init_display_mode() -> None:
-    """Verify GUI display and launch native popup window + browser live stream."""
-    global HEADLESS
-    _setup_x11_auth()
-    try:
-        _test_win = "__display_test__"
-        cv2.namedWindow(_test_win, cv2.WINDOW_AUTOSIZE)
-        cv2.destroyWindow(_test_win)
-        HEADLESS = False
-        print("🖥️  Native GUI Display verified — live popup window will open!")
-    except Exception as e:
-        HEADLESS = True
-        print(f"⚠️  Native window unavailable ({e}).")
-        print("   Frames saved to /tmp/arm_picker_*.jpg.")
-    
-    print("🌐 Live Browser Video Feed: http://localhost:8080/ (or http://<jetson-ip>:8080/)")
+    _setup_native_display()
 
+_windows_created = set()
 
 def _show_frame(name: str, img: np.ndarray) -> None:
-    """Show live native popup window, stream to web browser, and save fallback to /tmp."""
+    """Display the live feed in a native popup window directly on the Jetson monitor."""
     global HEADLESS
-
-    # Always feed browser streamer
-    if _web_streamer is not None:
-        _web_streamer.update(img)
-
-    if not HEADLESS:
-        try:
-            cv2.imshow(name, img)
-            cv2.waitKey(1)
-            return
-        except Exception as e:
-            HEADLESS = True
-            print(f"⚠️  Display error ({e}) — switched to HEADLESS mode.")
-
-    now = time.time()
-    if now - _headless_last_save.get(name, 0) >= 0.2:
-        _headless_last_save[name] = now
-        safe = name.replace(" ", "_")
-        cv2.imwrite(f"/tmp/arm_picker_{safe}.jpg", img)
-
+    if HEADLESS:
+        return
+    try:
+        if name not in _windows_created:
+            cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+            h, w = img.shape[:2]
+            cv2.resizeWindow(name, min(w, 1280), min(h, 720))
+            _windows_created.add(name)
+        cv2.imshow(name, img)
+        cv2.waitKey(1)
+    except Exception as e:
+        print(f"⚠️  Window display error: {e}")
 
 def _destroy_windows() -> None:
-    global HEADLESS
-    if not HEADLESS:
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+    try:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+    except Exception:
+        pass
+
 
 
 

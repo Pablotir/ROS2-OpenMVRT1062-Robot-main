@@ -90,8 +90,7 @@ def main():
 
     print("\n" + "─"*65)
     print(" 🎯 POINT CAMERA AT YOUR 5x7 CHARUCO BOARD")
-    print(" 🖥️  Live feed displayed in native popup window!")
-    print(" 🌐 Live browser stream: http://localhost:8080/ (or http://<jetson-ip>:8080/)")
+    print(" 🖥️  Live feed displayed directly on Jetson monitor!")
     print(" Press Ctrl+C in terminal to finish and stow arm.")
     print("─"*65 + "\n")
 

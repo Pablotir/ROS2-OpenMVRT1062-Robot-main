@@ -2872,8 +2872,10 @@ def main():
                                     load = arm_obj.bus.read("Present_Load", ["gripper"])[0]
                         except Exception:
                             pass
-    
-                    if abs(load) > 150:
+
+                    # Mask direction bit 10 (0x400 = 1024) to get true load magnitude (0-1023)
+                    load_mag = abs(int(load)) & 0x03FF
+                    if load_mag > 150:
                         try:
                             current_g = get_pos(robot).get("gripper.pos", 20.0)
                             current_g = max(current_g - 15.0, 0.7)
@@ -2881,7 +2883,7 @@ def main():
                             current_g = 20.0
                         grab_pos["gripper.pos"] = current_g
                         robot.send_action(grab_pos)
-                        print(f"   🛑 Resistance felt (Load={abs(load)})! Braked at {current_g:.1f}°")
+                        print(f"   🛑 Resistance felt (Load={load_mag}/1023)! Braked at {current_g:.1f}°")
                         braked = True
                         break
     

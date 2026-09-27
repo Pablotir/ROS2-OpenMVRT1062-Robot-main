@@ -145,6 +145,14 @@ def _destroy_windows() -> None:
     except Exception:
         pass
 
+def _make_vis(img: np.ndarray, depth_map=None) -> np.ndarray:
+    """Helper to safely concatenate depth colormap if present and valid."""
+    if depth_map is not None and isinstance(depth_map, np.ndarray) and depth_map.ndim == 3:
+        if depth_map.shape[:2] == img.shape[:2]:
+            return np.hstack((img, depth_map))
+    return img
+
+
 
 
 
@@ -2534,7 +2542,7 @@ def main():
 
             # ── Throttle YOLO to ~5 fps during search ─────────────────────────
             if time.time() - last_yolo_t < 0.2:
-                _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+                _show_frame("Picker Vision", _make_vis(display, depth_colormap))
                 if not HEADLESS: cv2.waitKey(1)
                 continue
             last_yolo_t = time.time()
@@ -2579,7 +2587,7 @@ def main():
                     sweep_cmd["shoulder_pan.pos"] = sweep_pan
                     robot.send_action(sweep_cmd)
                 
-                _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+                _show_frame("Picker Vision", _make_vis(display, depth_colormap))
                 if not HEADLESS: cv2.waitKey(1)
                 continue
 
@@ -2612,7 +2620,7 @@ def main():
             cv2.putText(display, f"YOLO: {TARGET_DESC}",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             
-            _show_frame("Picker Vision", np.hstack((display, depth_colormap)))
+            _show_frame("Picker Vision", _make_vis(display, depth_colormap))
             if not HEADLESS: cv2.waitKey(1)
 
             if SKIP_MOONDREAM:
@@ -2939,19 +2947,33 @@ def main():
             robot.disconnect()
         except Exception:
             pass
-        try:
-            cap.stop()
-            _destroy_windows()
-        except Exception:
-            pass
     except Exception as exc:
         print(f"\n❌  Unhandled exception: {exc}")
         import traceback; traceback.print_exc()
+        if not _arm_is_stowed[0]:
+            try:
+                smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
+                _arm_is_stowed[0] = True
+            except Exception:
+                pass
+        try:
+            robot.disconnect()
+        except Exception:
+            pass
     finally:
         try:
             atexit.unregister(_emergency_stow)
         except Exception:
             pass
+        try:
+            cap.stop()
+        except Exception:
+            pass
+        try:
+            _destroy_windows()
+        except Exception:
+            pass
+
 
 
 

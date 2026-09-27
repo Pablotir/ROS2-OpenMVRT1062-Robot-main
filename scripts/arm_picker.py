@@ -177,36 +177,27 @@ TARGET_DESC      = "red ball"
 YOLO_CLASS_ID    = 32     # 32 = sports ball in standard COCO segmentation models
 SKIP_MOONDREAM   = True   # Set False to re-enable Moondream semantic verification
 
-# ── Arm Geometry (SO-ARM101 — User Measured Constants) ───────────────────────
+# ── Arm Geometry (SO-ARM101 — Physical Kinematic Constants) ───────────────────
 IK_L1 = 115.0   # shoulder pivot  → elbow pivot  (11.5 cm)
-IK_L2 = 137.5   # elbow pivot     → wrist pivot   (13.75 cm)
-IK_L3 = 90.0    # wrist pivot     → gripper tip   (9.0 cm)
-# Note: Maximum total physical reach of arm from base = 115 + 137.5 + 90 = 342.5 mm
+IK_L2 = 137.5   # elbow pivot     → wrist flex pivot (13.75 cm)
+IK_L3 = 153.0   # wrist flex pivot → gripper fingertips (15.3 cm, matching teach_postures.py)
+# Note: Maximum total physical reach of arm from base = 115 + 137.5 + 153 = 405.5 mm
 
 # Pan alignment calibration (measured: -4.6° corresponds to straight ahead X-axis)
 PAN_ZERO_OFFSET_DEG = -4.6
 PAN_MIN_DEG         = -113.8   # Far left user-preferred limit
 PAN_MAX_DEG         =  113.8   # Far right user-preferred limit
 
-# ── Empirical R3 Workspace Bounds (SO-ARM101 — calibrated from physical images) ──
-# These are the outer convex envelope limits measured in the ARM BASE frame
+# ── Empirical R3 Workspace Bounds (SO-ARM101 — Physical Reach Envelope) ───────
+# Outer convex envelope limits measured in the ARM BASE frame
 # (origin = shoulder pivot, +X forward, +Y left, +Z up).
-# Any target from the depth camera outside these bounds will never be reachable.
-#
-#   X: min = arm folds back to robot body edge (~-115mm)
-#      max = furthest forward horizontal reach (~+260mm floor-level)
-#   Y: min = far right limit (mirrored from left, ~-211mm)
-#      max = far left limit  (~+211mm)
-#   Z: min = below shoulder pivot at floor reach (~-202mm)
-#      max = straight up overhead (~+251mm)
-#   Horizontal rho (sqrt(X^2+Y^2)): max at floor grab level (~260mm)
-WS_X_MIN_MM  = -140.0   # behind the robot (folded-in elbow can go slightly negative, added 20mm tolerance)
-WS_X_MAX_MM  =  285.0   # max forward reach (floor-level, added 20mm tolerance)
-WS_Y_MAX_MM  =  235.0   # max lateral left  (added 24mm tolerance)
-WS_Y_MIN_MM  = -235.0   # max lateral right (mirrored)
-WS_Z_MIN_MM  = -225.0   # lowest reachable height below shoulder pivot (added 20mm tolerance for floor grab)
-WS_Z_MAX_MM  =  275.0   # highest point straight up (added 20mm tolerance)
-WS_RHO_MAX_MM =  285.0  # max horizontal extension from shoulder pivot
+WS_X_MIN_MM  = -140.0   # behind the robot
+WS_X_MAX_MM  =  390.0   # max forward reach (calibrated limit with 153mm gripper assembly)
+WS_Y_MAX_MM  =  280.0   # max lateral left
+WS_Y_MIN_MM  = -280.0   # max lateral right
+WS_Z_MIN_MM  = -250.0   # lowest reachable height below shoulder pivot
+WS_Z_MAX_MM  =  300.0   # highest point straight up
+WS_RHO_MAX_MM =  390.0  # max horizontal extension from shoulder pivot (405mm theoretical minus margin)
 
 # ── RealSense D405 — Eye-in-Hand Calibration (T_cam_wrist) ──────────────────
 # Static 4×4 homogeneous transform: how the D405 is physically bolted to the wrist.
@@ -1273,14 +1264,15 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     else:
         preferred_pitch = end_pitch_deg
 
-    # ── Search for a reachable pitch ─────────────────────────────────────────
+    # ── Search for a reachable pitch (starts at preferred, searches steeper if needed) ──
     pitch_candidates = [preferred_pitch]
-    if end_pitch_deg is None:
-        step = -5.0
-        p = preferred_pitch + step
-        while p >= -90.0:
-            pitch_candidates.append(p)
-            p += step
+    step = -5.0
+    p = preferred_pitch + step
+    min_p = -90.0 if end_pitch_deg is None else -60.0
+    while p >= min_p:
+        pitch_candidates.append(p)
+        p += step
+
 
     best_solution = None
     best_cost = float('inf')
@@ -2776,52 +2768,67 @@ def main():
             print(f"   🦾 Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
 
             # ── R3 workspace bounds pre-check (empirical calibrated limits) ──────
-            if not workspace_in_bounds(arm_x, arm_y, arm_z):
+            if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                 rho = math.sqrt(arm_x**2 + arm_y**2)
-                print(f"   ⚠️  Target outside calibrated R3 workspace envelope — skipping")
-                print(f"         X={arm_x:+.0f}mm (limit {WS_X_MIN_MM:.0f}–{WS_X_MAX_MM:.0f})  "
-                      f"Y={arm_y:+.0f}mm (limit {WS_Y_MIN_MM:.0f}–{WS_Y_MAX_MM:.0f})  "
-                      f"Z={arm_z:+.0f}mm (limit {WS_Z_MIN_MM:.0f}–{WS_Z_MAX_MM:.0f})  "
-                      f"Rho={rho:.0f}mm (limit ≤{WS_RHO_MAX_MM:.0f})")
+                diff_mm = rho - WS_RHO_MAX_MM
+                print(f"\n" + "═"*65)
+                print(f"   ⚠️  TARGET OUT OF PHYSICAL REACH!")
+                print(f"       Distance from shoulder base: Rho = {rho:.0f} mm")
+                print(f"       Max reachable envelope     : Rho ≤ {WS_RHO_MAX_MM:.0f} mm")
+                if diff_mm > 0:
+                    print(f"       Target is ~{diff_mm:.0f} mm ({diff_mm/10:.1f} cm) TOO FAR AWAY from arm base.")
+                    print(f"   👉 Please MOVE THE {TARGET_DESC.upper()} ~{max(5, int(diff_mm/10 + 2))} cm CLOSER to the robot base!")
+                else:
+                    print(f"       Target coordinate out of bounds (X={arm_x:+.0f}, Y={arm_y:+.0f}, Z={arm_z:+.0f}mm).")
+                print("═"*65 + "\n")
+
+                try:
+                    alert_img = display.copy()
+                    cv2.putText(alert_img, f"OUT OF REACH: Rho={rho:.0f}mm > {WS_RHO_MAX_MM:.0f}mm",
+                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if diff_mm > 0:
+                        cv2.putText(alert_img, f"MOVE {TARGET_DESC.upper()} ~{max(5, int(diff_mm/10 + 2))}cm CLOSER!",
+                                    (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    _show_frame("Picker Vision", _make_vis(alert_img, depth_colormap))
+                    if not HEADLESS: cv2.waitKey(1)
+                except Exception:
+                    pass
+
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
+                time.sleep(2.5)  # Pause to avoid rapid thrashing and allow repositioning
                 STATE = "SEARCHING"
                 continue
 
+
             # ── Solve IK — auto-pitch, pick closest elbow config ──────────────
-            # end_pitch_deg=None → auto-compute from geometry (arm approaches
-            # along shoulder→target axis, no rigid straightening).
-            # current_joints → picks elbow-up or elbow-down whichever
-            # minimises weighted joint travel from current pose.
-            #
-            # Pitch limits from calibration data:
-            #   Image 2 (floor touch):  lift=104.2, elb=-38.5, wst=-9.3
-            #     → t1=rad(90-104.2)=-14.2° t2=t1+(-38.5)=-52.7° → pitch≈-52.7°
-            #   Image 3 (edge of frame): lift=81.4, elb=67.6, wst=-61.3
-            #     → t1=8.6° t2=76.2° → pitch+wrist≈14.9°
-            # Clamp between -60° (steep from calibration) and -5° (near level).
             current_j = get_pos(robot)
             rho_t = math.sqrt(arm_x**2 + arm_y**2)
             
-            # User constraint: Keep wrist parallel to ground but tilted 5° down
+            # Start at preferred -5° pitch, automatically adapt if reaching far
             target_pitch = -5.0
-            print(f"   📐 Calculating IK: Target=[{arm_x:+.0f}, {arm_y:+.0f}, {arm_z:+.0f}]mm | Pitch={target_pitch}° | Distance={rho_t:.0f}mm")
+            print(f"   📐 Calculating IK: Target=[{arm_x:+.0f}, {arm_y:+.0f}, {arm_z:+.0f}]mm | Preferred Pitch={target_pitch}° | Distance={rho_t:.0f}mm")
             
             grab_pos = solve_ik(arm_x, arm_y, arm_z,
                                 end_pitch_deg=target_pitch,
                                 current_joints=current_j,
                                 wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
             if grab_pos is None:
-                print("⚠️  IK: target outside workspace — restarting search")
-                smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
-                STATE = "SEARCHING"
-                continue
+                if do_manual_lunge:
+                    print("⚠️  Analytical IK found no rigid solution at this pose, but proceeding to Manual Lunge Demonstration...")
+                else:
+                    print("⚠️  IK: target outside reachable joint configuration — restarting search")
+                    smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
+                    STATE = "SEARCHING"
+                    continue
 
-            print(f"\n📐 IK SOLUTION:")
-            print(f"   Pan   → {grab_pos['shoulder_pan.pos']:+.1f}°")
-            print(f"   Lift  → {grab_pos['shoulder_lift.pos']:+.1f}°")
-            print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
-            print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
-            print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
+            if grab_pos is not None:
+                print(f"\n📐 IK SOLUTION:")
+                print(f"   Pan   → {grab_pos['shoulder_pan.pos']:+.1f}°")
+                print(f"   Lift  → {grab_pos['shoulder_lift.pos']:+.1f}°")
+                print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
+                print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
+                print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
+
 
             if do_manual_lunge:
                 # ── Manual Lunge Demonstration ────────────────────────────────────

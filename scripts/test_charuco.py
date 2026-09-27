@@ -77,8 +77,8 @@ def main():
 
     board, dictionary, detector = setup_charuco()
 
-    print("\n📷 Starting RealSense D405...")
-    cap = RealSenseStream(width=848, height=480, fps=15)
+    print("\n📷 Starting RealSense D405 (uncapped / max hardware FPS)...")
+    cap = RealSenseStream(width=848, height=480, fps=0)
     time.sleep(1.5)
 
     robot = connect_robot()
@@ -97,13 +97,12 @@ def main():
     last_print = 0.0
     frame_count = 0
     _last_fps_t = time.time()
-    _fps_smooth = 15.0
+    _fps_smooth = 60.0
 
     try:
         while True:
-            color, has_depth, depth_colormap = cap.read()
+            color, has_depth, _ = cap.read(wait_new=True, timeout=0.05)
             if color is None:
-                time.sleep(0.01)
                 continue
 
             frame_count += 1
@@ -213,7 +212,6 @@ def main():
                     corners_seen = len(ids) if ids is not None else 0
                     print(f"⏳ Searching... (saw {corners_seen}/6 minimum corners). Ensure board is in camera view.")
 
-            time.sleep(0.02)
 
     except KeyboardInterrupt:
         print("\n\n⏹️  Stopping test...")

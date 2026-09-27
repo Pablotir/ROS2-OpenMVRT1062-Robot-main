@@ -394,24 +394,24 @@ class RealSenseStream:
         cap.stop()
     """
 
-    def __init__(self, width=848, height=480, fps=30):
+    def __init__(self, width=848, height=480, fps=0):
         self._pipeline   = rs.pipeline()
         self._profile    = None
         self._bgr_convert = False
 
-        # Try formats in order of preference for D405 on Linux/Jetson.
-        # Each attempt is explicit so we can see exactly what fails.
-        # The D405 on Jetson Linux MUST use YUYV. If we request BGR8,
-        # the driver accepts it but silently delivers completely black frames.
-        # We use 15fps to keep the CPU decode cost low.
-        candidates = [
-            (width, height, rs.format.yuyv, 15,  "YUYV 848x480 15fps"),
-            (640,   480,    rs.format.yuyv, 15,  "YUYV 640x480 15fps"),
-            (width, height, rs.format.rgb8, 15,  "RGB8 848x480 15fps"),
-            (640,   480,    rs.format.rgb8, 15,  "RGB8 640x480 15fps"),
-            (width, height, rs.format.bgr8, 15,  "BGR8 848x480 15fps"),
-            (640,   480,    rs.format.bgr8, 15,  "BGR8 640x480 15fps"),
-        ]
+        # If fps <= 0 or None: uncapped mode (probes 90fps, then 60fps, then 30fps)
+        if not fps or fps <= 0:
+            target_fps_list = [90, 60, 30, 15]
+        else:
+            target_fps_list = [fps, 90, 60, 30, 15]
+        # Preserve order without duplicates
+        target_fps_list = list(dict.fromkeys(target_fps_list))
+
+        candidates = []
+        for f in target_fps_list:
+            candidates.append((width, height, rs.format.yuyv, f, f"YUYV {width}x{height} {f}fps"))
+            candidates.append((640,   480,    rs.format.yuyv, f, f"YUYV 640x480 {f}fps"))
+
         for (w, h, fmt, f, label) in candidates:
             try:
                 cfg = rs.config()
@@ -423,7 +423,6 @@ class RealSenseStream:
                 width, height = w, h
                 break
             except Exception as e:
-                print(f"   ⚠️  {label} failed: {e}")
                 self._pipeline.stop() if self._profile else None
                 self._pipeline = rs.pipeline()  # reset pipeline
 
@@ -437,25 +436,29 @@ class RealSenseStream:
             except Exception as e:
                 raise RuntimeError(f"❌ Could not open RealSense in any format: {e}")
 
-        # Query actual color format the hardware selected
+        # Query actual color format and FPS the hardware selected
         color_stream = self._profile.get_stream(rs.stream.color)
         self._color_format = color_stream.format()
-        print(f"   🔍 Actual color format: {self._color_format}")
+        try:
+            self._actual_fps = color_stream.fps()
+            print(f"   🔍 Actual hardware stream: {self._color_format} @ {self._actual_fps} FPS (Hardware Max)")
+        except Exception:
+            print(f"   🔍 Actual color format: {self._color_format}")
 
-        self._colorizer  = rs.colorizer()
-        self._colorizer.set_option(rs.option.color_scheme, 0) # Jet colormap
-        self._colorizer.set_option(rs.option.histogram_equalization_enabled, 1)
+        self._colorizer  = None  # initialized lazily only if colorized depth is requested
         
         # Get depth scale for manual calculations
         depth_sensor = self._profile.get_device().first_depth_sensor()
         self._depth_scale = depth_sensor.get_depth_scale()
         
-        self._lock       = threading.Lock()
-        self._color      = np.zeros((height, width, 3), dtype=np.uint8)
-        self._colorized  = np.zeros((height, width, 3), dtype=np.uint8)
-        self._depth_img  = None
-        self._intrinsics = None
-        self._running    = True
+        self._lock            = threading.Lock()
+        self._color           = np.zeros((height, width, 3), dtype=np.uint8)
+        self._depth_img       = None
+        self._depth_frame_raw = None
+        self._intrinsics      = None
+        self._frame_count     = 0
+        self._new_frame_event = threading.Event()
+        self._running         = True
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
@@ -463,12 +466,11 @@ class RealSenseStream:
             try:
                 frames      = self._pipeline.wait_for_frames(timeout_ms=5000)
                 # D405 RGB and Depth share the same ISP sensor, so they are perfectly aligned natively.
-                # Do NOT use rs.align, as it can corrupt D405 depth frames.
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
                 if not color_frame or not depth_frame:
                     print("⚠️  RealSense: got frames but color/depth missing — check USB cable")
-                    time.sleep(0.2)
+                    time.sleep(0.1)
                     continue
                 color = np.asanyarray(color_frame.get_data())
                 # Convert to BGR uint8 using the actual hardware format
@@ -492,44 +494,54 @@ class RealSenseStream:
                         color = color.reshape(color_frame.height, color_frame.width, 2)
                     color = cv2.cvtColor(color, cv2.COLOR_YUV2BGR_UYVY)
                 elif fmt == rs.format.z16:
-                    # Depth-as-color fallback: map 16-bit to 8-bit grey then BGR
                     color = (color >> 8).astype(np.uint8)
                     color = cv2.cvtColor(color, cv2.COLOR_GRAY2BGR)
                 else:
-                    # Unknown format — try to squeeze to BGR best-effort
-                    print(f"   ⚠️  Unknown fmt {fmt}, shape {color.shape}, dtype {color.dtype}")
                     if color.ndim == 2:
                         color = cv2.cvtColor(color.astype(np.uint8), cv2.COLOR_GRAY2BGR)
                     elif color.shape[2] == 4:
                         color = cv2.cvtColor(color, cv2.COLOR_BGRA2BGR)
                     elif color.shape[2] == 3 and self._bgr_convert:
                         color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-                # ALWAYS enforce uint8 BGR — Canny and YOLO require it
+                # ALWAYS enforce uint8 BGR
                 color = np.ascontiguousarray(color, dtype=np.uint8)
                 
                 # Extract raw depth array
                 depth_img = np.asanyarray(depth_frame.get_data()).copy()
                 
-                # Use official Intel RealSense colorizer (gives RGB, OpenCV needs BGR)
-                colorized = np.asanyarray(self._colorizer.colorize(depth_frame).get_data())
-                colorized = cv2.cvtColor(colorized, cv2.COLOR_RGB2BGR)
-                
                 with self._lock:
                     self._color = color
-                    self._colorized = colorized
                     self._depth_img = depth_img
+                    self._depth_frame_raw = depth_frame
                     self._intrinsics = color_frame.profile.as_video_stream_profile().intrinsics
+                    self._frame_count += 1
+                self._new_frame_event.set()
             except Exception as e:
                 print(f"⚠️  RealSense frame error: {e}")
-                import traceback; traceback.print_exc()
-                time.sleep(0.3)
+                time.sleep(0.05)
 
-    def read(self):
-        """Return (color_bgr_copy, has_depth, colorized_depth)."""
+    def read(self, wait_new=False, timeout=0.05):
+        """Return (color_bgr_copy, has_depth, depth_colormap)."""
+        if wait_new:
+            self._new_frame_event.wait(timeout=timeout)
+            self._new_frame_event.clear()
         with self._lock:
             if self._depth_img is None:
                 return self._color.copy(), False, None
-            return self._color.copy(), True, self._colorized.copy()
+            return self._color.copy(), True, None
+
+    def get_colorized_depth(self):
+        """Generate colorized depth map lazily on demand to avoid CPU overhead at high FPS."""
+        with self._lock:
+            depth_frame = self._depth_frame_raw
+        if depth_frame is None:
+            return None
+        if self._colorizer is None:
+            self._colorizer = rs.colorizer()
+            self._colorizer.set_option(rs.option.color_scheme, 0)
+            self._colorizer.set_option(rs.option.histogram_equalization_enabled, 1)
+        colorized = np.asanyarray(self._colorizer.colorize(depth_frame).get_data())
+        return cv2.cvtColor(colorized, cv2.COLOR_RGB2BGR)
 
     def get_xyz(self, px: int, py: int, search_w=40, search_h=40):
         """
@@ -711,12 +723,18 @@ def check_servo_health(robot) -> bool:
         all_ok = True
         for name in _MOTOR_NAMES:
             try:
-                val = abs(int(robot.bus.read(load_reg, name)))
-                if val > _LOAD_STALL_THRESHOLD:
-                    print(f"   ❌  {name}: high load ({val}/1023) — may be stalled")
+                raw_val = abs(int(robot.bus.read(load_reg, name)))
+                # Feetech STS3215 Present_Load register specification:
+                # Bit 10 (0x400 = 1024) is the DIRECTION bit (0: CCW, 1: CW)
+                # Bits 0-9 (0..1023) are the load magnitude (0% - 100% of max stall)
+                # Without masking 0x3FF, a tiny 2% load in direction 1 reads as 1044,
+                # causing false-positive stall alarms!
+                load_mag = raw_val & 0x03FF
+                if load_mag > _LOAD_STALL_THRESHOLD:
+                    print(f"   ❌  {name}: high load ({load_mag}/1023) — may be stalled (raw={raw_val})")
                     all_ok = False
                 else:
-                    print(f"   ✅  {name}: load={val}/1023")
+                    print(f"   ✅  {name}: load={load_mag}/1023")
             except Exception as e:
                 print(f"   ⚠️  {name}: load read failed ({e})")
         if not all_ok:
@@ -725,6 +743,7 @@ def check_servo_health(robot) -> bool:
         else:
             print("   ✅ All servos healthy (load check) — safe to move.\n")
         return all_ok
+
 
     # ── Step 4: nothing worked — warn and proceed ─────────────────────────
     print("   ⚠️  Health check unavailable (register names not found in control table).")

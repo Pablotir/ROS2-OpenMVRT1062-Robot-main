@@ -107,12 +107,13 @@ def check_servo_health(robot) -> bool:
             robot.bus.read(reg, motor_names[0])
             all_ok = True
             for name in motor_names:
-                load = abs(int(robot.bus.read(reg, name)))
-                if load > 800:
-                    print(f"   ❌ {name}: high load ({load}/1023) — possibly stalled")
+                raw_load = abs(int(robot.bus.read(reg, name)))
+                load_mag = raw_load & 0x03FF
+                if load_mag > 800:
+                    print(f"   ❌ {name}: high load ({load_mag}/1023) — possibly stalled (raw={raw_load})")
                     all_ok = False
                 else:
-                    print(f"   ✅ {name}: load={load}/1023")
+                    print(f"   ✅ {name}: load={load_mag}/1023")
             return all_ok
         except Exception:
             continue

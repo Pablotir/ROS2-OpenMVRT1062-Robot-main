@@ -222,8 +222,9 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 600.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# 0 = gripper tip exactly at object surface. Increase to reach deeper.
-GRASP_PENETRATION_MM = 20.0
+# 0 = gripper tip exactly at object surface. 45mm centers object in claw pads.
+GRASP_PENETRATION_MM = 45.0
+
 
 # Lateral gripper offset (mm) perpendicular to approach trajectory.
 # Positive (+ve) = shifts claw to the LEFT (aligns left claw with object edge, preventing tip poke)
@@ -1401,7 +1402,8 @@ def surface_proximity_depth(cap, obj_px: int, obj_py: int,
 
 
 def depth_to_arm_target(xyz_cam: tuple[float, float, float],
-                         robot) -> tuple[float, float, float] | None:
+                         robot,
+                         penetration_mm: float | None = None) -> tuple[float, float, float] | None:
     """
     STEP 3 — Base Coordinate Transform (Camera → Wrist → Base).
 
@@ -1415,8 +1417,8 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
       T_wrist_base = live FK matrix from current servo angles
       P_base       = target position in arm base frame → fed to IK solver
 
-    The approach depth is baked into P_cam by subtracting GRASP_PENETRATION_MM
-    from the measured z so the gripper tip lands on/in the object surface.
+    The approach depth is baked into P_cam using penetration_mm (defaults to GRASP_PENETRATION_MM)
+    so the object is centered deep between the claw pads.
 
     Returns (x_mm, y_mm, z_mm) in base frame (origin = shoulder pivot), or
     None if the object is inside the D405 70 mm minimum-range blind zone.
@@ -1430,10 +1432,12 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
         return None
 
     # Bake grasp approach penetration into the camera-space z coordinate.
-    approach_z = z_cam + GRASP_PENETRATION_MM
+    pen = penetration_mm if penetration_mm is not None else GRASP_PENETRATION_MM
+    approach_z = z_cam + pen
     if approach_z < D405_MIN_RANGE_MM:
         approach_z = D405_MIN_RANGE_MM
         print(f"   ⚠️  Approach clamped to D405 min range")
+
 
     # Build P_cam as a homogeneous 4-vector (mm) in camera optical coordinates
     P_cam = np.array([x_cam, y_cam, approach_z, 1.0])
@@ -2762,80 +2766,55 @@ def main():
                 STATE = "SEARCHING"
                 continue
 
-            # ── Convert to arm base frame ──────────────────────────────────────
-            target = depth_to_arm_target(xyz, robot)
-            if target is None:
-                print("⚠️  Cannot reach target — restarting search")
-                smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
-                STATE = "SEARCHING"
-                continue
-
-            arm_x, arm_y, arm_z = target
-            print(f"   🦾 Raw Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
-
-            # ── Apply lateral claw offset (perpendicular to approach vector) ──
-            if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
-                pan_t = math.atan2(arm_y, arm_x)
-                # Shift perpendicular to approach line: left is (-sin, +cos)
-                arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
-                arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
-                print(f"   📐 Applied lateral offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw edge shift)")
-                print(f"   🦾 Offset Arm-base target: x={arm_x:+.0f}mm  y={arm_y:+.0f}mm  z={arm_z:+.0f}mm")
-
-
-            # ── R3 workspace bounds pre-check (empirical calibrated limits) ──────
-            if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
-                rho = math.sqrt(arm_x**2 + arm_y**2)
-                diff_mm = rho - WS_RHO_MAX_MM
-                print(f"\n" + "═"*65)
-                print(f"   ⚠️  TARGET OUT OF PHYSICAL REACH!")
-                print(f"       Distance from shoulder base: Rho = {rho:.0f} mm")
-                print(f"       Max reachable envelope     : Rho ≤ {WS_RHO_MAX_MM:.0f} mm")
-                if diff_mm > 0:
-                    print(f"       Target is ~{diff_mm:.0f} mm ({diff_mm/10:.1f} cm) TOO FAR AWAY from arm base.")
-                    print(f"   👉 Please MOVE THE {TARGET_DESC.upper()} ~{max(5, int(diff_mm/10 + 2))} cm CLOSER to the robot base!")
-                else:
-                    print(f"       Target coordinate out of bounds (X={arm_x:+.0f}, Y={arm_y:+.0f}, Z={arm_z:+.0f}mm).")
-                print("═"*65 + "\n")
-
-                try:
-                    alert_img = display.copy()
-                    cv2.putText(alert_img, f"OUT OF REACH: Rho={rho:.0f}mm > {WS_RHO_MAX_MM:.0f}mm",
-                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    if diff_mm > 0:
-                        cv2.putText(alert_img, f"MOVE {TARGET_DESC.upper()} ~{max(5, int(diff_mm/10 + 2))}cm CLOSER!",
-                                    (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    _show_frame("Picker Vision", _make_vis(alert_img, depth_colormap))
-                    if not HEADLESS: cv2.waitKey(1)
-                except Exception:
-                    pass
-
-                smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
-                time.sleep(2.5)  # Pause to avoid rapid thrashing and allow repositioning
-                STATE = "SEARCHING"
-                continue
-
-
-            # ── Solve IK — auto-pitch, pick closest elbow config ──────────────
+            # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
+            # Try deepest grasp first (45mm for full claw center grasp), adapting if near reach limit.
+            penetration_candidates = [45.0, 38.0, 30.0, 22.0]
+            grab_pos = None
+            final_target = None
             current_j = get_pos(robot)
-            rho_t = math.sqrt(arm_x**2 + arm_y**2)
-            
-            # Start at preferred -5° pitch, automatically adapt if reaching far
-            target_pitch = -5.0
-            print(f"   📐 Calculating IK: Target=[{arm_x:+.0f}, {arm_y:+.0f}, {arm_z:+.0f}]mm | Preferred Pitch={target_pitch}° | Distance={rho_t:.0f}mm")
-            
-            grab_pos = solve_ik(arm_x, arm_y, arm_z,
-                                end_pitch_deg=target_pitch,
-                                current_joints=current_j,
-                                wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
+            target_pitch = -5.0  # Preferred parallel-to-ground pitch
+
+            for pen_mm in penetration_candidates:
+                target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
+                if target is None:
+                    continue
+
+                arm_x, arm_y, arm_z = target
+
+                # ── Apply lateral claw offset (perpendicular to approach vector) ──
+                if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
+                    pan_t = math.atan2(arm_y, arm_x)
+                    arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
+                    arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
+
+                if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
+                    continue
+
+                sol = solve_ik(arm_x, arm_y, arm_z,
+                               end_pitch_deg=target_pitch,
+                               current_joints=current_j,
+                               wrist_roll_deg=START_POS.get("wrist_roll.pos", -155.96))
+                if sol is not None:
+                    grab_pos = sol
+                    final_target = (arm_x, arm_y, arm_z, pen_mm)
+                    break
+
             if grab_pos is None:
                 if do_manual_lunge:
                     print("⚠️  Analytical IK found no rigid solution at this pose, but proceeding to Manual Lunge Demonstration...")
                 else:
-                    print("⚠️  IK: target outside reachable joint configuration — restarting search")
+                    print("⚠️  IK: target outside reachable joint configuration at all penetration depths — restarting search")
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
+                    time.sleep(2.0)
                     STATE = "SEARCHING"
                     continue
+
+            if final_target is not None:
+                arm_x, arm_y, arm_z, pen_used = final_target
+                rho_t = math.sqrt(arm_x**2 + arm_y**2)
+                grasp_type = "DEEP FULL-CLAW GRASP" if pen_used >= 38.0 else "ADAPTED CLAW GRASP"
+                print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
+                print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch}°")
 
             if grab_pos is not None:
                 print(f"\n📐 IK SOLUTION:")
@@ -2844,6 +2823,7 @@ def main():
                 print(f"   Elbow → {grab_pos['elbow_flex.pos']:+.1f}°")
                 print(f"   Wrist → {grab_pos['wrist_flex.pos']:+.1f}°")
                 print(f"   Roll  → {grab_pos.get('wrist_roll.pos', -155.96):+.1f}°")
+
 
 
             if do_manual_lunge:

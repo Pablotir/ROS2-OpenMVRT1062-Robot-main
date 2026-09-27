@@ -77,29 +77,32 @@ def main():
 
     board, dictionary, detector = setup_charuco()
 
-    print("\n📷 Starting RealSense D405 (uncapped / max hardware FPS)...")
-    cap = RealSenseStream(width=848, height=480, fps=0)
-    time.sleep(1.5)
-
-    robot = connect_robot()
-
-    # Move to start position smoothly
-    print("\n▶ Moving to Scan Position...")
-    smooth_move(robot, START_POS, step_size=1.0, step_delay=0.03)
-    time.sleep(0.5)
-
-    print("\n" + "─"*65)
-    print(" 🎯 POINT CAMERA AT YOUR 5x7 CHARUCO BOARD")
-    print(" 🖥️  Live feed displayed directly on Jetson monitor!")
-    print(" Press Ctrl+C in terminal to finish and stow arm.")
-    print("─"*65 + "\n")
-
-    last_print = 0.0
-    frame_count = 0
-    _last_fps_t = time.time()
-    _fps_smooth = 60.0
+    robot = None
+    cap = None
 
     try:
+        robot = connect_robot()
+
+        # Move to start position smoothly
+        print("\n▶ Moving to Scan Position...")
+        smooth_move(robot, START_POS, step_size=1.0, step_delay=0.03)
+        time.sleep(0.5)
+
+        print("\n📷 Starting RealSense D405 (uncapped / max hardware FPS)...")
+        cap = RealSenseStream(width=848, height=480, fps=0)
+        time.sleep(1.0)
+
+        print("\n" + "─"*65)
+        print(" 🎯 POINT CAMERA AT YOUR 5x7 CHARUCO BOARD")
+        print(" 🖥️  Live feed displayed directly on Jetson monitor!")
+        print(" Press Ctrl+C in terminal to finish and stow arm.")
+        print("─"*65 + "\n")
+
+        last_print = 0.0
+        frame_count = 0
+        _last_fps_t = time.time()
+        _fps_smooth = 60.0
+
         while True:
             color, has_depth, _ = cap.read(wait_new=True, timeout=0.05)
             if color is None:
@@ -217,14 +220,22 @@ def main():
         print("\n\n⏹️  Stopping test...")
     finally:
         print("▶ Stowing arm smoothly...")
+        if robot is not None:
+            try:
+                smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
+                print("   ✅ Arm stowed.")
+            except Exception as e:
+                print(f"   ⚠️ Stow failed: {e}")
+            try:
+                robot.disconnect()
+            except Exception:
+                pass
+        if cap is not None:
+            try:
+                cap.stop()
+            except Exception:
+                pass
         try:
-            smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
-            print("   ✅ Arm stowed.")
-        except Exception as e:
-            print(f"   ⚠️ Stow failed: {e}")
-        try:
-            robot.disconnect()
-            cap.stop()
             _destroy_windows()
         except Exception:
             pass

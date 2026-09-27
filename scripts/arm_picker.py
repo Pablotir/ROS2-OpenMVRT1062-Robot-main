@@ -517,6 +517,8 @@ class RealSenseStream:
                     self._frame_count += 1
                 self._new_frame_event.set()
             except Exception as e:
+                if not self._running:
+                    break
                 print(f"⚠️  RealSense frame error: {e}")
                 time.sleep(0.05)
 
@@ -1015,21 +1017,68 @@ def connect_robot():
     if _is_degenerate:
         raise RuntimeError("Degenerate calibration file — all ranges are identical. Delete and re-calibrate.")
 
-    # Connect without interactive prompt
-    try:
-        robot.connect(calibrate=False)
-    except TypeError:
-        _real_input = _builtins.input
-        def _auto_use_file(prompt=""):
-            if "enter" in prompt.lower() and "range" not in prompt.lower():
-                return ""
-            _builtins.input = _real_input
-            return _real_input(prompt)
-        _builtins.input = _auto_use_file
+    # Configure retry count on motor bus to make half-duplex UART robust against jitter
+    if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
+        robot.bus.default_num_retry = 3
+
+    # Connect with automatic retries and port reset
+    connected = False
+    last_err = None
+    for attempt in range(1, 4):
         try:
-            robot.connect()
-        finally:
-            _builtins.input = _real_input
+            try:
+                robot.connect(calibrate=False)
+            except TypeError:
+                _real_input = _builtins.input
+                def _auto_use_file(prompt=""):
+                    if "enter" in prompt.lower() and "range" not in prompt.lower():
+                        return ""
+                    _builtins.input = _real_input
+                    return _real_input(prompt)
+                _builtins.input = _auto_use_file
+                try:
+                    robot.connect()
+                finally:
+                    _builtins.input = _real_input
+            connected = True
+            break
+        except ConnectionError as ce:
+            last_err = ce
+            print(f"   ⚠️  Connection attempt {attempt}/3 failed: {ce}")
+            if hasattr(robot, "bus"):
+                try:
+                    if hasattr(robot.bus, "port_handler") and robot.bus.port_handler:
+                        robot.bus.port_handler.clearPort()
+                except Exception:
+                    pass
+                try:
+                    robot.bus.disconnect()
+                except Exception:
+                    pass
+            time.sleep(0.6)
+        except Exception as e:
+            last_err = e
+            print(f"   ⚠️  Connection attempt {attempt}/3 error: {e}")
+            if hasattr(robot, "bus"):
+                try:
+                    robot.bus.disconnect()
+                except Exception:
+                    pass
+            time.sleep(0.6)
+
+    if not connected:
+        print("\n" + "═"*65)
+        print(" ⛔ ROBOT CONNECTION FAILED (Servo Communication / Overload Error)")
+        print(f" ⚠️  Error details: {last_err}")
+        print(" 🔧 Quick Recovery Steps:")
+        print("    1. POWER CYCLE ARM: Unplug the arm power supply (barrel jack),")
+        print("       wait 5 seconds, and plug it back in. STS3215 internal overload")
+        print("       protection only clears on a power cycle!")
+        print("    2. SUPPORT ARM: Gently support the arm by hand so Motor 2")
+        print("       (shoulder_lift) is not strained against gravity during startup.")
+        print("    3. USB CHECK: Ensure the arm controller USB cable is firmly plugged in.")
+        print("═"*65 + "\n")
+        raise RuntimeError(f"Could not connect to arm: {last_err}")
 
     # Build typed calibration objects for LeRobot _normalize attribute access
     from types import SimpleNamespace as _NS

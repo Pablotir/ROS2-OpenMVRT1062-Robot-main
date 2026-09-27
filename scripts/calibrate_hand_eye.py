@@ -6,16 +6,18 @@ Calculates the exact 4x4 spatial transformation matrix (T_cam_wrist) between the
 wrist-mounted RealSense D405 camera and the robot arm's end-effector.
 
 Workflow:
-1. Connects to the SO-ARM101 using calibrated zero offsets and servo health checks.
-2. Starts the RealSense D405 at maximum hardware framerate (30/60/90 FPS).
+1. Connects to the SO-ARM101 and moves smoothly to Scan Position (scan_base).
+2. Starts the RealSense D405 at maximum hardware framerate (90 FPS uncapped).
 3. Opens the live video window directly on the Jetson desktop.
 4. Press 't' to cut motor torque and enter Free-Move Mode.
 5. Move the arm to 10–15 different poses (different angles, tilts, and heights)
    where the 5x7 ChArUco board is visible with green coordinate axes.
 6. Press [Enter] to capture each valid pose.
-7. Press 'c' to solve with 5 distinct Hand-Eye algorithms (Tsai, Park, Horaud,
+7. Press 'r' at any time to have the arm automatically return to Scan Position!
+8. Press 'c' to solve with 5 distinct Hand-Eye algorithms (Tsai, Park, Horaud,
    Daniilidis, Andreff), pick the one with lowest 3D error, and automatically
    save hand_eye_calibration.yaml!
+9. Stows arm safely upon quitting.
 """
 
 import os
@@ -26,6 +28,7 @@ import yaml
 import json
 import pathlib
 import select
+import threading
 from datetime import datetime
 import cv2
 import numpy as np
@@ -33,7 +36,8 @@ import pyrealsense2 as rs
 
 # Import arm helpers, kinematics, camera stream, and display manager from arm_picker
 from arm_picker import (
-    connect_robot, get_pos, _set_torque, forward_kinematics,
+    connect_robot, get_pos, _set_torque, smooth_move, forward_kinematics,
+    _load_reference_poses, _BASE, _STOW_BASE,
     RealSenseStream, _init_display_mode, _show_frame, _destroy_windows
 )
 
@@ -41,6 +45,38 @@ BOARD_COLS = 5
 BOARD_ROWS = 7
 SQUARE_SIZE_MM = 35.0
 MARKER_SIZE_MM = 25.0
+
+
+class JointTracker:
+    """
+    Decoupled background joint reader.
+    Polls the serial bus at ~30 Hz in a background thread so the video
+    display loop is never blocked by UART read latency and runs at full 90 FPS.
+    """
+    def __init__(self, robot):
+        self.robot = robot
+        self.joints = get_pos(robot)
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while self.running:
+            try:
+                j = get_pos(self.robot)
+                with self.lock:
+                    self.joints = j
+            except Exception:
+                pass
+            time.sleep(0.03)
+
+    def get(self):
+        with self.lock:
+            return dict(self.joints)
+
+    def stop(self):
+        self.running = False
 
 
 def setup_charuco():
@@ -135,6 +171,8 @@ def check_terminal_input():
                     return 13  # Enter key
                 elif line.lower() == "t":
                     return ord('t')
+                elif line.lower() == "r":
+                    return ord('r')
                 elif line.lower() == "c":
                     return ord('c')
                 elif line.lower() == "q":
@@ -152,19 +190,32 @@ def main():
     print(" Controls (usable in popup window OR terminal):")
     print("   [t]      Toggle motor TORQUE ON / OFF (Free-Move Mode)")
     print("   [Enter]  Capture pose for calibration (when green axes visible)")
+    print("   [r]      Reset / return arm to Scan Position (scan_base)")
     print("   [c]      Compute Multi-Algorithm Calibration")
-    print("   [q]      Quit")
+    print("   [q]      Quit and safe stow arm")
     print("═"*65 + "\n")
 
     _init_display_mode()
     board, dictionary, detector = setup_charuco()
 
+    _load_reference_poses()
+    START_POS = dict(_BASE)
+    STOW = dict(_STOW_BASE)
+
     robot = None
     cap = None
+    joint_tracker = None
     torque_enabled = True
 
     try:
         robot = connect_robot()
+
+        print("\n▶ Moving to Scan Position (scan_base)...")
+        smooth_move(robot, START_POS, step_size=1.0, step_delay=0.03)
+        time.sleep(0.5)
+
+        # Start background joint tracker so video loop hits 90 FPS
+        joint_tracker = JointTracker(robot)
 
         print("\n📷 Starting RealSense D405 (uncapped / max hardware FPS)...")
         cap = RealSenseStream(width=848, height=480, fps=0)
@@ -190,7 +241,12 @@ def main():
         pose_count = 0
 
         _last_fps_t = time.time()
-        _fps_smooth = 60.0
+        _fps_smooth = 90.0
+
+        print("\n" + "─"*65)
+        print(" 🎯 POINT CAMERA AT YOUR 5x7 CHARUCO BOARD")
+        print(" Press 't' to cut torque, move arm to 10-15 angles, press [Enter] to capture.")
+        print("─"*65 + "\n")
 
         while True:
             color_img, _, _ = cap.read(wait_new=True, timeout=0.05)
@@ -207,8 +263,8 @@ def main():
             if dt > 0:
                 _fps_smooth = 0.9 * _fps_smooth + 0.1 * (1.0 / dt)
 
-            # Get current arm forward kinematics
-            joints = get_pos(robot)
+            # Instantaneous joint lookup from tracker (no UART blocking)
+            joints = joint_tracker.get()
             T_base_wrist = forward_kinematics(joints)
             x_mm = T_base_wrist[0, 3]
             y_mm = T_base_wrist[1, 3]
@@ -250,8 +306,8 @@ def main():
             status_str = f"Board: {'DETECTED (Ready to capture)' if can_capture else 'SEARCHING (Align board in view)'}"
             cv2.putText(display_img, status_str, (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
 
-            torque_str = f"Torque: {'ON' if torque_enabled else 'OFF (Free-move)'} [t] | Capture [Enter] | Calibrate [c] | Quit [q]"
-            cv2.putText(display_img, torque_str, (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 200, 100), 1)
+            torque_str = f"Torque: {'ON' if torque_enabled else 'OFF (Free-move)'} [t] | Capture [Enter] | Reset [r] | Calib [c] | Quit [q]"
+            cv2.putText(display_img, torque_str, (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 100), 1)
 
             _show_frame("SO-ARM101 ChArUco Calibration", display_img)
 
@@ -269,8 +325,20 @@ def main():
                 _set_torque(robot, torque_enabled)
                 print(f"\n🔧 Motor Torque {'ENABLED' if torque_enabled else 'DISABLED (Free-move mode active: move arm by hand!)'}")
 
+            elif key == ord('r'):
+                print("\n▶ Returning arm to Scan Position (scan_base)...")
+                _set_torque(robot, True)
+                torque_enabled = True
+                smooth_move(robot, START_POS, step_size=1.0, step_delay=0.03)
+                time.sleep(0.3)
+                print("   ✅ Returned to Scan Position. Press 't' to disable torque when ready to move arm.")
+
             elif key in [13, 10, ord(' ')] and can_capture:  # Enter or Space
-                T_base_wrist_m = T_base_wrist.copy()
+                # Synchronous exact joint read at moment of capture
+                exact_joints = get_pos(robot)
+                exact_fk = forward_kinematics(exact_joints)
+
+                T_base_wrist_m = exact_fk.copy()
                 T_base_wrist_m[:3, 3] /= 1000.0  # to meters
 
                 R_gb = T_base_wrist_m[:3, :3]
@@ -286,7 +354,7 @@ def main():
 
                 pose_count += 1
                 cam_dist_mm = float(np.linalg.norm(t_tc) * 1000.0)
-                print(f"📸 Captured pose #{pose_count:2d} | Wrist: X={x_mm:5.1f} Y={y_mm:5.1f} Z={z_mm:5.1f}mm | Cam Dist: {cam_dist_mm:4.0f}mm")
+                print(f"📸 Captured pose #{pose_count:2d} | Wrist: X={exact_fk[0,3]:5.1f} Y={exact_fk[1,3]:5.1f} Z={exact_fk[2,3]:5.1f}mm | Cam Dist: {cam_dist_mm:4.0f}mm")
 
                 if pose_count < 10:
                     print(f"   👉 Move arm to another angle/tilt and capture again ({10 - pose_count} more recommended)")
@@ -358,14 +426,12 @@ def main():
                     pathlib.Path(__file__).parent.parent / "calibration" / "hand_eye_calibration.yaml",
                 ]
 
-                saved_any = False
                 for sp in save_paths:
                     try:
                         sp.parent.mkdir(parents=True, exist_ok=True)
                         with open(sp, "w") as f:
                             yaml.dump(calib_payload, f, sort_keys=False)
                         print(f"   💾 Saved calibration to: {sp}")
-                        saved_any = True
                     except Exception:
                         pass
 
@@ -377,15 +443,23 @@ def main():
     except KeyboardInterrupt:
         print("\n⏹️  Stopping calibration...")
     finally:
-        if cap is not None:
-            try:
-                cap.stop()
-            except Exception:
-                pass
+        print("\n▶ Stowing arm smoothly...")
+        if joint_tracker is not None:
+            joint_tracker.stop()
         if robot is not None:
             try:
                 _set_torque(robot, True)
+                smooth_move(robot, STOW, step_size=0.8, step_delay=0.025)
+                print("   ✅ Arm safely stowed.")
+            except Exception as e:
+                print(f"   ⚠️ Stow failed: {e}")
+            try:
                 robot.disconnect()
+            except Exception:
+                pass
+        if cap is not None:
+            try:
+                cap.stop()
             except Exception:
                 pass
         try:

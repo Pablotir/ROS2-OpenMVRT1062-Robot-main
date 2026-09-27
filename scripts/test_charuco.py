@@ -34,7 +34,8 @@ import pyrealsense2 as rs
 from arm_picker import (
     connect_robot, get_pos, smooth_move, _set_torque,
     forward_kinematics, _build_T_cam_wrist, _load_reference_poses,
-    _BASE, _STOW_BASE, HEADLESS, RealSenseStream, _show_frame, _destroy_windows
+    _BASE, _STOW_BASE, HEADLESS, RealSenseStream, _show_frame, _destroy_windows,
+    _init_display_mode
 )
 
 BOARD_COLS = 5

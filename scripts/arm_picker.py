@@ -222,8 +222,8 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 600.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# 0 = gripper tip exactly at object surface. 45mm centers object in claw pads.
-GRASP_PENETRATION_MM = 45.0
+# 0 = gripper tip at surface. 35mm centers object in claw pads with ~2mm clearance from the servo face.
+GRASP_PENETRATION_MM = 35.0
 
 
 # Lateral gripper offset (mm) perpendicular to approach trajectory.
@@ -2767,8 +2767,14 @@ def main():
                 continue
 
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Try deepest grasp first (45mm for full claw center grasp), adapting if near reach limit.
-            penetration_candidates = [45.0, 38.0, 30.0, 22.0]
+            # Starts at GRASP_PENETRATION_MM (35mm: center claw grasp with ~2mm clearance from the back servo),
+            # adapting to shallower penetration if near the arm's physical reach boundary.
+            penetration_candidates = [
+                GRASP_PENETRATION_MM,
+                GRASP_PENETRATION_MM - 3.0,
+                GRASP_PENETRATION_MM - 7.0,
+                22.0,
+            ]
             grab_pos = None
             final_target = None
             current_j = get_pos(robot)
@@ -2812,7 +2818,7 @@ def main():
             if final_target is not None:
                 arm_x, arm_y, arm_z, pen_used = final_target
                 rho_t = math.sqrt(arm_x**2 + arm_y**2)
-                grasp_type = "DEEP FULL-CLAW GRASP" if pen_used >= 38.0 else "ADAPTED CLAW GRASP"
+                grasp_type = "CENTER-PAD GRASP (~2mm servo clearance)" if pen_used >= 28.0 else "ADAPTED SHALLOW GRASP"
                 print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
                 print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch}°")
 

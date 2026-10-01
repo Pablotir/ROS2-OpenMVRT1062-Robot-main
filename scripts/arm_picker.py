@@ -1309,7 +1309,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     if end_pitch_deg is not None:
         # User specified a preferred grasp angle (e.g. 0.0° parallel to ground).
         # Test exact preferred pitch first, then tightly bounded small deviations.
-        for offset in [2.5, -2.5, 5.0, -5.0, 7.5, -7.5, 10.0, -10.0]:
+        for offset in [2.5, -2.5, 5.0, -5.0, 7.5, -7.5, 10.0, -10.0, -15.0, 15.0, -20.0, -25.0, -30.0]:
             cand = round(preferred_pitch + offset, 1)
             if -60.0 <= cand <= 30.0:
                 pitch_candidates.append(cand)
@@ -1890,36 +1890,88 @@ def canny_centre(frame: np.ndarray, x1, y1, x2, y2):
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
-def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle") -> tuple[int, int]:
+def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle", frame: np.ndarray | None = None) -> tuple[int, int]:
     """
     Computes optimal grasp point (x_px, y_px) on the object.
     
     For bottles, flasks, and tall containers:
-      - Uses 2D principal component / axis line fitting (cv2.fitLine) on the segmentation mask.
-      - Finds the major axis orientation vector pointing toward the top of the bottle.
-      - Targets the upper neck / cap area (~75% along the major axis from the base toward the top),
-        rather than the geometric centroid (which is heavily biased toward the fat lower base and table).
+      - When segmentation mask is available: Uses 2D principal axis line fitting (cv2.fitLine)
+        and targets the upper neck / cap area (~85% along the major axis from base toward top).
+      - When segmentation mask is None (e.g. YOLO-World detection models):
+        * Upright bottle: Targets the cap/neck in the top 12% of the bounding box, refined with
+          local Canny edge analysis in the top crop if frame is provided.
+        * Horizontal bottle lying down: Identifies the narrower end (cap) or centers horizontally.
+        * Tilted bottle: Detects which upper quadrant contains the cap.
       - Works whether the bottle is upright, elevated, or tilted at an angle!
     
     For other objects (balls, boxes, etc.):
-      - Defaults to the stable 2D centroid / center of mass.
+      - Defaults to the centroid / Canny edge center.
     """
     x1, y1, x2, y2 = bbox
+    w_box = max(10, x2 - x1)
+    h_box = max(10, y2 - y1)
     default_cx, default_cy = (x1 + x2) // 2, (y1 + y2) // 2
+    is_bottle_like = any(w in target_desc.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
+
     if seg_mask is None or np.sum(seg_mask == 255) < 30:
-        if "bottle" in target_desc.lower():
-            # Upper quarter of bounding box
-            return default_cx, int(y1 + 0.25 * (y2 - y1))
+        if is_bottle_like:
+            if h_box >= 1.05 * w_box:
+                # Upright or mostly vertical bottle: target cap/neck
+                top_h = max(10, int(h_box * 0.22))
+                cap_y_default = y1 + max(6, int(h_box * 0.12))
+                cap_x_default = default_cx
+                if frame is not None and frame.size > 0:
+                    crop = frame[y1 : min(frame.shape[0], y1 + top_h), x1 : min(frame.shape[1], x2)]
+                    if crop.size > 0:
+                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        edges = cv2.Canny(gray, 40, 120)
+                        M = cv2.moments(edges)
+                        if M["m00"] > 0:
+                            cand_cx = x1 + int(M["m10"] / M["m00"])
+                            cand_cy = y1 + int(M["m01"] / M["m00"])
+                            if y1 <= cand_cy <= y1 + top_h:
+                                return cand_cx, cand_cy
+                return cap_x_default, cap_y_default
+            elif w_box >= 1.3 * h_box:
+                # Horizontal bottle lying down on table
+                if frame is not None and frame.size > 0:
+                    left_w = max(5, int(w_box * 0.25))
+                    left_crop = frame[y1:y2, x1 : x1 + left_w]
+                    right_crop = frame[y1:y2, max(0, x2 - left_w) : x2]
+                    l_edges = np.sum(cv2.Canny(cv2.cvtColor(left_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if left_crop.size else 0
+                    r_edges = np.sum(cv2.Canny(cv2.cvtColor(right_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if right_crop.size else 0
+                    if l_edges < r_edges and l_edges > 0:
+                        return x1 + max(8, int(w_box * 0.12)), default_cy
+                    elif r_edges < l_edges and r_edges > 0:
+                        return x2 - max(8, int(w_box * 0.12)), default_cy
+                return default_cx, default_cy
+            else:
+                # Tilted bottle (~45 degrees)
+                if frame is not None and frame.size > 0:
+                    top_h = max(5, int(h_box * 0.35))
+                    mid_w = x1 + w_box // 2
+                    top_left = frame[y1 : y1 + top_h, x1 : mid_w]
+                    top_right = frame[y1 : y1 + top_h, mid_w : x2]
+                    tl_edges = np.sum(cv2.Canny(cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_left.size else 0
+                    tr_edges = np.sum(cv2.Canny(cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_right.size else 0
+                    if tl_edges > tr_edges * 1.3:
+                        return x1 + int(w_box * 0.25), y1 + int(h_box * 0.15)
+                    elif tr_edges > tl_edges * 1.3:
+                        return x2 - int(w_box * 0.25), y1 + int(h_box * 0.15)
+                return default_cx, y1 + int(h_box * 0.15)
+        # Non-bottle objects
+        if frame is not None:
+            return canny_centre(frame, x1, y1, x2, y2)
         return default_cx, default_cy
 
     contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        if "bottle" in target_desc.lower():
-            return default_cx, int(y1 + 0.25 * (y2 - y1))
+        if is_bottle_like:
+            return default_cx, y1 + max(6, int(h_box * 0.12))
         return default_cx, default_cy
     c = max(contours, key=cv2.contourArea)
 
-    if "bottle" in target_desc.lower() or "cup" in target_desc.lower() or "can" in target_desc.lower():
+    if is_bottle_like:
         try:
             line = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
             vx, vy, x0, y0 = float(line[0][0]), float(line[1][0]), float(line[2][0]), float(line[3][0])
@@ -1931,8 +1983,8 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
             proj = (pts[:, 0] - x0) * vx + (pts[:, 1] - y0) * vy
             t_min, t_max = float(np.min(proj)), float(np.max(proj))
 
-            # Bottle neck/cap is at 75% along major axis from base (t_min) toward top (t_max)
-            t_target = t_min + 0.75 * (t_max - t_min)
+            # Bottle neck/cap is at ~85% along major axis from base (t_min) toward top (t_max)
+            t_target = t_min + 0.85 * (t_max - t_min)
             opt_x = int(round(x0 + t_target * vx))
             opt_y = int(round(y0 + t_target * vy))
 
@@ -1991,7 +2043,7 @@ class ObjectTracker:
                              [0, 20, 20], [180, 255, 255]).astype(np.uint8)
         fh, fw     = frame.shape[:2]
         self.last_box    = (x1, y1, x2, y2)
-        self.last_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        self.last_center = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=frame)
         self.last_area   = ((x2 - x1) / fw) * ((y2 - y1) / fh)
         self.locked      = True
         print(f"   🔒 Tracker locked: HSV [{self.lower}]–[{self.upper}]")
@@ -2010,7 +2062,7 @@ class ObjectTracker:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(fw, x2), min(fh, y2)
-            cx, cy  = canny_centre(frame, x1, y1, x2, y2)
+            cx, cy  = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=frame)
             area    = ((x2 - x1) / fw) * ((y2 - y1) / fh)
             self.last_box = (x1, y1, x2, y2)
             self.last_center = (cx, cy)
@@ -2039,6 +2091,9 @@ class ObjectTracker:
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
         bx, by, bw, bh = cv2.boundingRect(largest)
+        if any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"]):
+            if bh >= 1.05 * bw:
+                cy = by + max(8, int(bh * 0.12))
         area = (bw / fw) * (bh / fh)
         overlay = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
         frame[:] = cv2.addWeighted(frame, 0.8, overlay, 0.2, 0)
@@ -2738,9 +2793,9 @@ def main():
                 polygon  = results[0].masks.xy[target_box_idx].astype(np.int32)
                 seg_mask = np.zeros(color.shape[:2], dtype=np.uint8)
                 cv2.fillPoly(seg_mask, [polygon], 255)
-                obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1, y1, x2, y2), TARGET_DESC)
+                obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1, y1, x2, y2), TARGET_DESC, frame=color)
             else:
-                obj_px, obj_py = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC)
+                obj_px, obj_py = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=color)
 
             cv2.rectangle(display, (x1, y1), (x2, y2), (0,255,255), 2)
             cv2.circle(display, (obj_px, obj_py), 6, (0,255,0), -1)
@@ -2773,7 +2828,7 @@ def main():
             # Run visual servoing FIRST while the arm is still in the retracted
             # scan pose.  This centres the ball in the camera frame and gives us
             # the exact confirmed pan angle before the arm lunges forward.
-            print("🎯 Aligning arm to ball centre (scan pose)...")
+            print(f"🎯 Aligning arm to {TARGET_DESC} (scan pose)...")
             tracker = ObjectTracker()
             tracker.lock_on(color, x1, y1, x2, y2)
             aligned, final_pixel = align_arm(robot, cap, model, tracker)
@@ -2818,19 +2873,27 @@ def main():
                             min_dist = dist
                             best_idx = idx
             
-            if best_idx >= 0 and results_aligned[0].masks is not None:
-                polygon  = results_aligned[0].masks.xy[best_idx].astype(np.int32)
-                cand_mask = np.zeros(color_aligned.shape[:2], dtype=np.uint8)
-                cv2.fillPoly(cand_mask, [polygon], 255)
-                n_px = int(np.sum(cand_mask == 255))
-                MAX_MASK_PIXELS = int(h_a * w_a * 0.15)
-                if n_px > MAX_MASK_PIXELS:
-                    print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit)"
-                          f" — likely floor/BG detection, using aligned centroid only")
-                else:
-                    seg_mask = cand_mask
-                    obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1_a, y1_a, x2_a, y2_a), TARGET_DESC)
-                    print(f"   🎭 Valid fresh mask ({n_px}px) optimal grasp point=({obj_px},{obj_py}) (Neck/Cap target)")
+            if best_idx >= 0:
+                box_aligned = results_aligned[0].boxes[best_idx]
+                x1_a, y1_a, x2_a, y2_a = map(int, box_aligned.xyxy[0].tolist())
+                x1_a, y1_a = max(0, x1_a), max(0, y1_a)
+                x2_a, y2_a = min(w_a, x2_a), min(h_a, y2_a)
+
+                cand_mask = None
+                if results_aligned[0].masks is not None and best_idx < len(results_aligned[0].masks.xy):
+                    polygon  = results_aligned[0].masks.xy[best_idx].astype(np.int32)
+                    m = np.zeros(color_aligned.shape[:2], dtype=np.uint8)
+                    cv2.fillPoly(m, [polygon], 255)
+                    n_px = int(np.sum(m == 255))
+                    MAX_MASK_PIXELS = int(h_a * w_a * 0.15)
+                    if n_px <= MAX_MASK_PIXELS:
+                        cand_mask = m
+                        seg_mask = cand_mask
+                    else:
+                        print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit) — using bounding-box cap target")
+
+                obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1_a, y1_a, x2_a, y2_a), TARGET_DESC, frame=color_aligned)
+                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py}) (Cap/Top grasp)")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -2852,21 +2915,27 @@ def main():
                 if result is not None:
                     cx_px, cy_px, z_mm = result
                     # Full deproject using the optimal grasp point
-                    s = cap.get_xyz(int(cx_px), int(cy_px), search_w=7, search_h=7)
+                    s = cap.get_xyz(int(cx_px), int(cy_px), search_w=10, search_h=10)
                     if s is not None:
                         xyz = s
-                        print(f"   🎭 Mask depth (neck/top): point=({int(cx_px)},{int(cy_px)})  "
+                        print(f"   🎭 Mask depth (cap/top): point=({int(cx_px)},{int(cy_px)})  "
                               f"z={z_mm:.0f}mm  (from {np.sum(seg_mask==255)} mask pixels)")
 
             if xyz is None:
-                # Fallback: average bbox-patch samples
-                box_w, box_h = max(10, x2 - x1), max(10, y2 - y1)
+                # Tightly centered depth samples at the grasp point (cap/neck)
+                # DO NOT use large search_w/search_h that averages with table/background!
                 xyz_samples  = []
                 for _ in range(5):
-                    s = cap.get_xyz(obj_px, obj_py, search_w=box_w//2, search_h=box_h//2)
+                    s = cap.get_xyz(obj_px, obj_py, search_w=14, search_h=14)
                     if s is not None:
                         xyz_samples.append(s)
                     time.sleep(0.02)
+                if not xyz_samples:
+                    for _ in range(3):
+                        s = cap.get_xyz(obj_px, obj_py, search_w=24, search_h=24)
+                        if s is not None:
+                            xyz_samples.append(s)
+                        time.sleep(0.02)
                 if not xyz_samples:
                     print("⚠️  No depth data — object may be in D405 blind zone")
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -2914,6 +2983,16 @@ def main():
                     pan_t = math.atan2(arm_y, arm_x)
                     arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
                     arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
+
+                # ── Grasp Elevation Guard for Bottles ─────────────────────────
+                # Prevents grasping near the table surface/base if depth was sampled too low.
+                # Table is at z ≈ -130mm; an upright bottle's graspable neck is at least -80mm.
+                is_bottle_like = any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
+                if is_bottle_like:
+                    min_bottle_z = -80.0
+                    if arm_z < min_bottle_z:
+                        print(f"   📐 Bottle grasp elevation guard: raising target Z from {arm_z:+.0f}mm to {min_bottle_z:+.0f}mm (cap/neck height)")
+                        arm_z = min_bottle_z
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue

@@ -222,8 +222,12 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 600.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# 0 = gripper tip at surface. 35mm centers object in claw pads with ~2mm clearance from the servo face.
-GRASP_PENETRATION_MM = 35.0
+# 0 = gripper tip at surface. 27mm centers object in claw pads with ~10mm clearance from the servo face.
+GRASP_PENETRATION_MM = 27.0
+
+# Preferred gripper approach pitch (degrees relative to horizontal table).
+# 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
+PREFERRED_GRAB_PITCH_DEG = 0.0
 
 
 # Lateral gripper offset (mm) perpendicular to approach trajectory.
@@ -465,12 +469,15 @@ class RealSenseStream:
         self._frame_count     = 0
         self._new_frame_event = threading.Event()
         self._running         = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread          = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def _loop(self):
         while self._running:
             try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=5000)
+                frames      = self._pipeline.wait_for_frames(timeout_ms=250)
+                if not self._running:
+                    break
                 # D405 RGB and Depth share the same ISP sensor, so they are perfectly aligned natively.
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
@@ -634,9 +641,18 @@ class RealSenseStream:
         return float(cx_px), float(cy_px), z_mm
 
     def stop(self):
+        if not self._running:
+            return
         self._running = False
         try:
-            self._pipeline.stop()
+            if hasattr(self, "_thread") and self._thread is not None and self._thread.is_alive():
+                self._thread.join(timeout=0.6)
+        except Exception:
+            pass
+        try:
+            if self._pipeline is not None:
+                self._pipeline.stop()
+                self._pipeline = None
         except Exception:
             pass
 
@@ -1271,14 +1287,22 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     else:
         preferred_pitch = end_pitch_deg
 
-    # ── Search for a reachable pitch (starts at preferred, searches steeper if needed) ──
+    # ── Search for a reachable pitch ─────────────────────────────────────────
     pitch_candidates = [preferred_pitch]
-    step = -5.0
-    p = preferred_pitch + step
-    min_p = -90.0 if end_pitch_deg is None else -60.0
-    while p >= min_p:
-        pitch_candidates.append(p)
-        p += step
+    if end_pitch_deg is not None:
+        # User specified a preferred grasp angle (e.g. 0.0° parallel to ground).
+        # Test exact preferred pitch first, then tightly bounded small deviations.
+        for offset in [2.5, -2.5, 5.0, -5.0, 7.5, -7.5, 10.0, -10.0]:
+            cand = round(preferred_pitch + offset, 1)
+            if -60.0 <= cand <= 30.0:
+                pitch_candidates.append(cand)
+    else:
+        # Auto-pitch: search progressively steeper downwards
+        step = -5.0
+        p = preferred_pitch + step
+        while p >= -90.0:
+            pitch_candidates.append(p)
+            p += step
 
 
     best_solution = None
@@ -2767,18 +2791,18 @@ def main():
                 continue
 
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Starts at GRASP_PENETRATION_MM (35mm: center claw grasp with ~2mm clearance from the back servo),
+            # Starts at GRASP_PENETRATION_MM (27mm: center claw grasp with ~10mm clearance from the back servo),
             # adapting to shallower penetration if near the arm's physical reach boundary.
             penetration_candidates = [
                 GRASP_PENETRATION_MM,
                 GRASP_PENETRATION_MM - 3.0,
                 GRASP_PENETRATION_MM - 7.0,
-                22.0,
+                18.0,
             ]
             grab_pos = None
             final_target = None
             current_j = get_pos(robot)
-            target_pitch = -5.0  # Preferred parallel-to-ground pitch
+            target_pitch = PREFERRED_GRAB_PITCH_DEG  # Preferred parallel-to-ground pitch (0.0° = horizontal)
 
             for pen_mm in penetration_candidates:
                 target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
@@ -2818,9 +2842,9 @@ def main():
             if final_target is not None:
                 arm_x, arm_y, arm_z, pen_used = final_target
                 rho_t = math.sqrt(arm_x**2 + arm_y**2)
-                grasp_type = "CENTER-PAD GRASP (~2mm servo clearance)" if pen_used >= 28.0 else "ADAPTED SHALLOW GRASP"
+                grasp_type = "PARALLEL GRASP (~10mm servo clearance)" if pen_used >= 20.0 else "ADAPTED SHALLOW GRASP"
                 print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
-                print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch}°")
+                print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch:.1f}°")
 
             if grab_pos is not None:
                 print(f"\n📐 IK SOLUTION:")

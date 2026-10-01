@@ -316,12 +316,12 @@ ALIGN_LOST_GRACE   = 25    # consecutive not-found frames before abort
 
 ALIGN_PAN_OFFSET   = 0     # px: optical center (lateral claw offset handles claw clearance at grab time)
 
-ALIGN_PAN_K        = 0.06  # responsive pan tracking
-ALIGN_WRIST_K      = 0.08  # responsive wrist tilt tracking (fast, direct optical pitch)
-ALIGN_LIFT_K       = 0.03  # gentle shoulder elevation assistance
-ALIGN_MAX_PAN_DEG  = 4.0   # max pan speed (°/frame)
-ALIGN_MAX_WRIST_DEG = 4.0  # max wrist tilt speed (°/frame)
-ALIGN_MAX_LIFT_DEG = 2.0   # max shoulder lift speed (°/frame)
+ALIGN_PAN_K        = 0.08  # responsive pan tracking
+ALIGN_WRIST_K      = 0.10  # responsive wrist tilt tracking (fast, direct optical pitch)
+ALIGN_LIFT_K       = 0.04  # responsive shoulder elevation assistance
+ALIGN_MAX_PAN_DEG  = 5.0   # max pan speed (°/frame)
+ALIGN_MAX_WRIST_DEG = 5.0  # max wrist tilt speed (°/frame)
+ALIGN_MAX_LIFT_DEG = 2.5   # max shoulder lift speed (°/frame)
 
 ALIGN_INIT_PAN_K    = 0.20
 ALIGN_INIT_LIFT_K   = 0.15
@@ -658,7 +658,7 @@ class RealSenseStream:
         # Deproject target pixel using the median mask depth
         point = rs.rs2_deproject_pixel_to_point(
             intr, [float(cx_px), float(cy_px)], z_m)
-        return float(cx_px), float(cy_px), z_mm
+        return float(point[0] * 1000.0), float(point[1] * 1000.0), float(z_mm)
 
     def stop(self):
         if not self._running:
@@ -1447,7 +1447,8 @@ def surface_proximity_depth(cap, obj_px: int, obj_py: int,
 
 def depth_to_arm_target(xyz_cam: tuple[float, float, float],
                          robot,
-                         penetration_mm: float | None = None) -> tuple[float, float, float] | None:
+                         penetration_mm: float | None = None,
+                         verbose: bool = True) -> tuple[float, float, float] | None:
     """
     STEP 3 — Base Coordinate Transform (Camera → Wrist → Base).
 
@@ -1471,8 +1472,9 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
 
     # Guard: D405 cannot see objects closer than 70 mm
     if z_cam < D405_MIN_RANGE_MM + 10.0:
-        print(f"   ⚠️  Object inside D405 blind zone ({z_cam:.0f} mm < "
-              f"{D405_MIN_RANGE_MM} mm) — skipping")
+        if verbose:
+            print(f"   ⚠️  Object inside D405 blind zone ({z_cam:.0f} mm < "
+                  f"{D405_MIN_RANGE_MM} mm) — skipping")
         return None
 
     # Bake grasp approach penetration into the camera-space z coordinate.
@@ -1480,8 +1482,8 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
     approach_z = z_cam + pen
     if approach_z < D405_MIN_RANGE_MM:
         approach_z = D405_MIN_RANGE_MM
-        print(f"   ⚠️  Approach clamped to D405 min range")
-
+        if verbose:
+            print(f"   ⚠️  Approach clamped to D405 min range")
 
     # Build P_cam as a homogeneous 4-vector (mm) in camera optical coordinates
     P_cam = np.array([x_cam, y_cam, approach_z, 1.0])
@@ -1496,9 +1498,10 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
     P_base      = T_wrist_base @ P_wrist
 
     x_base, y_base, z_base = P_base[0], P_base[1], P_base[2]
-    print(f"   🔗 P_cam=({x_cam:+.0f},{y_cam:+.0f},{z_cam:.0f})mm → "
-          f"P_wrist=({P_wrist[0]:+.0f},{P_wrist[1]:+.0f},{P_wrist[2]:.0f})mm → "
-          f"P_base=({x_base:+.0f},{y_base:+.0f},{z_base:.0f})mm")
+    if verbose:
+        print(f"   🔗 P_cam=({x_cam:+.0f},{y_cam:+.0f},{z_cam:.0f})mm → "
+              f"P_wrist=({P_wrist[0]:+.0f},{P_wrist[1]:+.0f},{P_wrist[2]:.0f})mm → "
+              f"P_base=({x_base:+.0f},{y_base:+.0f},{z_base:.0f})mm")
     return x_base, y_base, z_base
 
 
@@ -1893,22 +1896,132 @@ def canny_centre(frame: np.ndarray, x1, y1, x2, y2):
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+# ── SO-ARM101 Gripper Mechanical Specifications (Official Robonine / LeRobot) ─
+# Standard parallel jaw stroke: 76.0mm to 84.0mm (driven by STS3215 servo).
+GRIPPER_MAX_STROKE_MM       = 84.0   # Published maximum physical jaw opening stroke
+GRIPPER_SAFE_CLEARANCE_MM   = 65.0   # Maximum safe object width to approach without collision
+GRIPPER_OPTIMAL_MIN_MM      = 12.0   # Minimum grasp width for stable grip
+
+
+def size_up_object(frame: np.ndarray | None,
+                   seg_mask: np.ndarray | None,
+                   bbox: tuple[int, int, int, int],
+                   depth_mm: float = 280.0,
+                   target_desc: str = "bottle",
+                   fx: float = 452.5) -> dict:
+    """
+    Sizes up the object and profiles its cross-sectional width along its height.
+    Determines whether the object body fits within the published SO-ARM101 gripper width (max 84mm, safe 65mm).
+    Identifies the thinnest section (neck/cap) for a secure, collision-free grasp.
+    
+    Returns a dict with:
+        body_width_mm: physical width of the widest body section
+        thinnest_width_mm: physical width of the narrowest graspable section
+        grasp_width_mm: width at the chosen grasp point
+        height_mm: physical total height estimate
+        height_pct: height percentage from base (e.g. 92% for cap/neck)
+        fits_gripper: True if thinnest section <= GRIPPER_SAFE_CLEARANCE_MM
+        opt_px: (x, y) pixel coordinates of the optimal grasp point
+        z_target_est: physical arm base Z elevation (mm) for level approach
+    """
+    x1, y1, x2, y2 = bbox
+    w_box = max(10, x2 - x1)
+    h_box = max(10, y2 - y1)
+    scale = depth_mm / fx
+    default_cx = (x1 + x2) // 2
+
+    is_bottle_like = any(w in target_desc.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
+
+    # Physical height estimate from camera projection
+    h_calc = float(np.clip((h_box * scale) / math.sin(math.radians(45.0)), 140.0, 270.0))
+
+    # Extract silhouette mask within bounding box
+    crop_mask = None
+    if seg_mask is not None and np.sum(seg_mask == 255) > 30:
+        crop_mask = seg_mask[y1:y2, x1:x2].copy()
+    elif frame is not None and frame.size > 0:
+        crop = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 25, 90)
+        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        corner_mean = (float(thresh[0,0]) + float(thresh[0,-1]) + float(thresh[-1,0]) + float(thresh[-1,-1])) / 4.0
+        if corner_mean > 128.0:
+            thresh = cv2.bitwise_not(thresh)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        crop_mask = cv2.morphologyEx(cv2.bitwise_or(edges, thresh), cv2.MORPH_CLOSE, kernel)
+
+    widths_px = []
+    mid_xs = []
+
+    if crop_mask is not None and crop_mask.size > 0:
+        for r in range(h_box):
+            row_px = crop_mask[r, :]
+            nz = np.where(row_px > 0)[0]
+            if len(nz) >= 2 and (nz[-1] - nz[0]) >= 3:
+                widths_px.append(nz[-1] - nz[0] + 1)
+                mid_xs.append((nz[0] + nz[-1]) // 2)
+            else:
+                widths_px.append(0)
+                mid_xs.append(w_box // 2)
+    else:
+        widths_px = [w_box] * h_box
+        mid_xs = [w_box // 2] * h_box
+
+    raw_mm = np.array(widths_px, dtype=np.float32) * scale
+    widths_mm = np.copy(raw_mm)
+    for i in range(2, h_box - 2):
+        widths_mm[i] = float(np.median(raw_mm[i-2:i+3]))
+
+    # Body width (80th percentile of lower half)
+    lower_half = [w for w in widths_mm[int(h_box * 0.4):] if w > 10.0]
+    body_width_mm = float(np.percentile(lower_half, 80)) if lower_half else float(w_box * scale)
+
+    # Search upper region (top 20% of bottle) for the thinnest part (neck & cap)
+    search_limit = max(5, int(h_box * 0.22))
+    upper_w = widths_mm[0:search_limit]
+    valid_candidates = np.where((upper_w >= GRIPPER_OPTIMAL_MIN_MM) & (upper_w <= GRIPPER_SAFE_CLEARANCE_MM))[0]
+
+    if len(valid_candidates) > 0:
+        min_w = float(np.min(upper_w[valid_candidates]))
+        best_rows = [r for r in valid_candidates if upper_w[r] <= min_w + 3.0]
+        r_opt = int(np.median(best_rows))
+        thinnest_width_mm = min_w
+        grasp_width_mm = float(widths_mm[r_opt])
+        opt_x = x1 + mid_xs[r_opt]
+        opt_y = y1 + r_opt
+    else:
+        r_opt = max(4, int(h_box * 0.06))
+        thinnest_width_mm = float(widths_mm[r_opt]) if widths_mm[r_opt] > 5.0 else 30.0
+        grasp_width_mm = thinnest_width_mm
+        opt_x = default_cx
+        opt_y = y1 + r_opt
+
+    height_pct = float(np.clip(((h_box - r_opt) / h_box) * 100.0, 50.0, 98.0))
+    fits_gripper = (thinnest_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
+    z_target_est = -130.0 + h_calc * (height_pct / 100.0) - 5.0
+
+    return {
+        "body_width_mm": round(body_width_mm, 1),
+        "thinnest_width_mm": round(thinnest_width_mm, 1),
+        "grasp_width_mm": round(grasp_width_mm, 1),
+        "height_mm": round(h_calc, 1),
+        "height_pct": round(height_pct, 1),
+        "fits_gripper": fits_gripper,
+        "opt_px": (int(opt_x), int(opt_y)),
+        "z_target_est": round(z_target_est, 1)
+    }
+
+
 def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle", frame: np.ndarray | None = None) -> tuple[int, int]:
     """
     Computes optimal grasp point (x_px, y_px) on the object.
     
-    For bottles, flasks, and tall containers:
-      - When segmentation mask is available: Uses 2D principal axis line fitting (cv2.fitLine)
-        and targets the upper neck / cap area (~85% along the major axis from base toward top).
-      - When segmentation mask is None (e.g. YOLO-World detection models):
-        * Upright bottle: Targets the cap/neck in the top 12% of the bounding box, refined with
-          local Canny edge analysis in the top crop if frame is provided.
-        * Horizontal bottle lying down: Identifies the narrower end (cap) or centers horizontally.
-        * Tilted bottle: Detects which upper quadrant contains the cap.
-      - Works whether the bottle is upright, elevated, or tilted at an angle!
-    
-    For other objects (balls, boxes, etc.):
-      - Defaults to the centroid / Canny edge center.
+    For bottles and tall containers:
+      - Uses cross-sectional silhouette profiling to identify the thinnest section
+        (cap / neck collar at 90-95% height) that fits within the SO-ARM101 gripper stroke (84mm).
+    For non-bottle objects:
+      - Defaults to contour centroid / Canny center.
     """
     x1, y1, x2, y2 = bbox
     w_box = max(10, x2 - x1)
@@ -1916,91 +2029,53 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
     default_cx, default_cy = (x1 + x2) // 2, (y1 + y2) // 2
     is_bottle_like = any(w in target_desc.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
 
-    if seg_mask is None or np.sum(seg_mask == 255) < 30:
-        if is_bottle_like:
-            if h_box >= 1.05 * w_box:
-                # Upright or mostly vertical bottle: target cap (top 5-8% of bounding box)
-                cap_y = y1 + max(5, int(h_box * 0.06))
-                cap_x = default_cx
-                return cap_x, cap_y
-            elif w_box >= 1.3 * h_box:
-                # Horizontal bottle lying down on table: target cap on narrower end
-                if frame is not None and frame.size > 0:
-                    left_w = max(5, int(w_box * 0.25))
-                    left_crop = frame[y1:y2, x1 : x1 + left_w]
-                    right_crop = frame[y1:y2, max(0, x2 - left_w) : x2]
-                    l_edges = np.sum(cv2.Canny(cv2.cvtColor(left_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if left_crop.size else 0
-                    r_edges = np.sum(cv2.Canny(cv2.cvtColor(right_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if right_crop.size else 0
-                    if l_edges < r_edges and l_edges > 0:
-                        return x1 + max(8, int(w_box * 0.08)), default_cy
-                    elif r_edges < l_edges and r_edges > 0:
-                        return x2 - max(8, int(w_box * 0.08)), default_cy
-                return default_cx, default_cy
-            else:
-                # Tilted bottle (~45 degrees): target upper quadrant cap
-                if frame is not None and frame.size > 0:
-                    top_h = max(5, int(h_box * 0.30))
-                    mid_w = x1 + w_box // 2
-                    top_left = frame[y1 : y1 + top_h, x1 : mid_w]
-                    top_right = frame[y1 : y1 + top_h, mid_w : x2]
-                    tl_edges = np.sum(cv2.Canny(cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_left.size else 0
-                    tr_edges = np.sum(cv2.Canny(cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_right.size else 0
-                    if tl_edges > tr_edges * 1.3:
-                        return x1 + int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
-                    elif tr_edges > tl_edges * 1.3:
-                        return x2 - int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
-                return default_cx, y1 + max(5, int(h_box * 0.08))
-        # Non-bottle objects
-        if frame is not None:
-            return canny_centre(frame, x1, y1, x2, y2)
-        return default_cx, default_cy
-
-    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        if is_bottle_like:
-            return default_cx, y1 + max(6, int(h_box * 0.12))
-        return default_cx, default_cy
-    c = max(contours, key=cv2.contourArea)
-
     if is_bottle_like:
-        try:
-            line = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
-            vx, vy, x0, y0 = float(line[0][0]), float(line[1][0]), float(line[2][0]), float(line[3][0])
-            # Orient vector upward (toward smaller y in image, which is higher elevation / neck of bottle)
-            if vy > 0:
-                vx, vy = -vx, -vy
+        if h_box >= 1.05 * w_box:
+            # Upright bottle: size up and locate thinnest section (neck/cap)
+            try:
+                sizing = size_up_object(frame, seg_mask, bbox, 280.0, target_desc)
+                return sizing["opt_px"]
+            except Exception:
+                return default_cx, y1 + max(5, int(h_box * 0.06))
+        elif w_box >= 1.3 * h_box:
+            # Horizontal bottle lying down: target narrower cap end
+            if frame is not None and frame.size > 0:
+                left_w = max(5, int(w_box * 0.25))
+                left_crop = frame[y1:y2, x1 : x1 + left_w]
+                right_crop = frame[y1:y2, max(0, x2 - left_w) : x2]
+                l_edges = np.sum(cv2.Canny(cv2.cvtColor(left_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if left_crop.size else 0
+                r_edges = np.sum(cv2.Canny(cv2.cvtColor(right_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if right_crop.size else 0
+                if l_edges < r_edges and l_edges > 0:
+                    return x1 + max(8, int(w_box * 0.08)), default_cy
+                elif r_edges < l_edges and r_edges > 0:
+                    return x2 - max(8, int(w_box * 0.08)), default_cy
+            return default_cx, default_cy
+        else:
+            # Tilted bottle (~45 degrees): target upper quadrant cap
+            if frame is not None and frame.size > 0:
+                top_h = max(5, int(h_box * 0.30))
+                mid_w = x1 + w_box // 2
+                top_left = frame[y1 : y1 + top_h, x1 : mid_w]
+                top_right = frame[y1 : y1 + top_h, mid_w : x2]
+                tl_edges = np.sum(cv2.Canny(cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_left.size else 0
+                tr_edges = np.sum(cv2.Canny(cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_right.size else 0
+                if tl_edges > tr_edges * 1.3:
+                    return x1 + int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
+                elif tr_edges > tl_edges * 1.3:
+                    return x2 - int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
+            return default_cx, y1 + max(5, int(h_box * 0.08))
 
-            pts = c.reshape(-1, 2)
-            proj = (pts[:, 0] - x0) * vx + (pts[:, 1] - y0) * vy
-            t_min, t_max = float(np.min(proj)), float(np.max(proj))
+    # Non-bottle objects
+    if seg_mask is not None and np.sum(seg_mask == 255) >= 30:
+        contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
-            # Bottle neck/cap is at ~85% along major axis from base (t_min) toward top (t_max)
-            t_target = t_min + 0.85 * (t_max - t_min)
-            opt_x = int(round(x0 + t_target * vx))
-            opt_y = int(round(y0 + t_target * vy))
-
-            h, w = seg_mask.shape[:2]
-            opt_x = max(0, min(w - 1, opt_x))
-            opt_y = max(0, min(h - 1, opt_y))
-
-            # Ensure optimal point is on or adjacent to mask pixels
-            if seg_mask[opt_y, opt_x] == 0:
-                row_xs = np.where(seg_mask[opt_y, :] == 255)[0]
-                if len(row_xs) > 0:
-                    opt_x = int(np.median(row_xs))
-                else:
-                    mask_pts = np.argwhere(seg_mask == 255)  # [row, col]
-                    dists = (mask_pts[:, 0] - opt_y)**2 + (mask_pts[:, 1] - opt_x)**2
-                    min_idx = np.argmin(dists)
-                    opt_y, opt_x = int(mask_pts[min_idx][0]), int(mask_pts[min_idx][1])
-            return opt_x, opt_y
-        except Exception:
-            pass
-
-    # Default to contour centroid
-    M = cv2.moments(c)
-    if M["m00"] > 0:
-        return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+    if frame is not None:
+        return canny_centre(frame, x1, y1, x2, y2)
     return default_cx, default_cy
 
 
@@ -2165,8 +2240,8 @@ def align_arm(robot, cap: RealSenseStream, model,
         last_pan_sign = cur_pan_sign
 
         err_mag = math.hypot(pan_err, lift_err)
-        # Responsive velocity scaling: fast when far, smooth linear deceleration within 40px
-        decay = float(np.clip(err_mag / 40.0, 0.25, 1.0))
+        # Responsive velocity scaling: fast when far, smooth linear deceleration within 30px
+        decay = float(np.clip(err_mag / 30.0, 0.35, 1.0))
 
         # Command calculations
         pan_cmd   = float(np.clip(pan_err * ALIGN_PAN_K * decay, -ALIGN_MAX_PAN_DEG, ALIGN_MAX_PAN_DEG))
@@ -2864,6 +2939,7 @@ def main():
                             min_dist = dist
                             best_idx = idx
             
+            sizing = None
             if best_idx >= 0:
                 box_aligned = results_aligned[0].boxes[best_idx]
                 x1_a, y1_a, x2_a, y2_a = map(int, box_aligned.xyxy[0].tolist())
@@ -2883,8 +2959,12 @@ def main():
                     else:
                         print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit) — using bounding-box cap target")
 
-                obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1_a, y1_a, x2_a, y2_a), TARGET_DESC, frame=color_aligned)
-                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py}) (Cap/Top grasp)")
+                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
+                obj_px, obj_py = sizing["opt_px"]
+                fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow neck"
+                print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
+                      f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
+                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py}) (Cap/Neck grasp)")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -2902,15 +2982,10 @@ def main():
             
             xyz = None
             if seg_mask is not None:
-                result = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
-                if result is not None:
-                    cx_px, cy_px, z_mm = result
-                    # Full deproject using the optimal grasp point
-                    s = cap.get_xyz(int(cx_px), int(cy_px), search_w=10, search_h=10)
-                    if s is not None:
-                        xyz = s
-                        print(f"   🎭 Mask depth (cap/top): point=({int(cx_px)},{int(cy_px)})  "
-                              f"z={z_mm:.0f}mm  (from {np.sum(seg_mask==255)} mask pixels)")
+                xyz = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
+                if xyz is not None:
+                    print(f"   🎭 Mask depth (cap/neck): x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
+                          f"(from {np.sum(seg_mask==255)} mask pixels)")
 
             if xyz is None:
                 # Tightly centered depth samples along the cap and upper neck of the bottle
@@ -2962,6 +3037,10 @@ def main():
                 STATE = "SEARCHING"
                 continue
 
+            # Refresh sizing with exact live depth measurement
+            if sizing is not None and xyz is not None:
+                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC)
+
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
             # Starts at GRASP_PENETRATION_MM (7.0mm: tip grasp with ~30mm clearance from the back servo),
             # adapting to shallower penetration (4.0mm, 0.0mm, -4.0mm) to guarantee the gripper NEVER pushes or topples the bottle.
@@ -2990,14 +3069,28 @@ def main():
                     arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
 
                 # ── Cap Grasp Height Guard for Bottles ────────────────────────
-                # Active tracking has positioned the wrist/shoulder directly toward the cap.
-                # Enforce a tabletop floor guard: bottles resting on the table (Z_table ~ -130mm)
-                # have their caps at Z >= -20mm. If arm_z is lower than -20mm, elevate to cap level.
+                # Uses cross-sectional silhouette sizing to enforce grasp at the thinnest section (neck collar/cap)
+                # and prevents dipping into the flaring body or table surface.
                 is_bottle_like = any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
-                if is_bottle_like:
-                    if arm_z < -20.0:
-                        print(f"   👑 Cap Floor Guard: arm_z was {arm_z:+.0f}mm (< -20mm table floor) → elevating to -20mm (cap level)")
-                        arm_z = -20.0
+                if is_bottle_like and sizing is not None:
+                    z_bottom = -130.0
+                    intr = cap._intrinsics
+                    if intr is not None and best_idx >= 0 and y2_a > 0:
+                        cx_a = (x1_a + x2_a) / 2.0
+                        pt_b3d = rs.rs2_deproject_pixel_to_point(intr, [float(cx_a), float(y2_a)], xyz[2] / 1000.0)
+                        b_target = depth_to_arm_target((pt_b3d[0]*1000.0, pt_b3d[1]*1000.0, xyz[2]), robot, penetration_mm=0.0, verbose=False)
+                        if b_target is not None:
+                            z_bottom = max(-130.0, b_target[2])
+
+                    z_neck_target = z_bottom + sizing["height_mm"] * (sizing["height_pct"] / 100.0) - 5.0
+                    if arm_z < z_neck_target:
+                        print(f"   👑 Cap Elevation Guard: arm_z was {arm_z:+.0f}mm (body/table level) → elevating to {z_neck_target:+.0f}mm (thinnest neck/cap at {sizing['height_pct']:.0f}% height, width={sizing['grasp_width_mm']}mm)")
+                        arm_z = z_neck_target
+                elif is_bottle_like:
+                    # Fallback tabletop floor guard if sizing wasn't available
+                    if arm_z < 35.0:
+                        print(f"   👑 Cap Floor Guard: arm_z was {arm_z:+.0f}mm (< +35mm cap floor) → elevating to +35mm (cap level)")
+                        arm_z = 35.0
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue

@@ -223,8 +223,9 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 600.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# 0 = gripper tip at surface. 22mm centers object in claw pads with ~15mm clearance from the servo face.
-GRASP_PENETRATION_MM = 22.0
+# Gripper throat depth is ~37mm. With 7.0mm penetration, the object is grasped near the claw tips
+# with a full 30mm of clearance away from the rear servo face, preventing pushing or toppling.
+GRASP_PENETRATION_MM = 7.0
 
 # Preferred gripper approach pitch (degrees relative to horizontal table).
 # 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
@@ -234,7 +235,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # Lateral gripper offset (mm) perpendicular to approach trajectory.
 # Positive (+ve) = shifts claw to the LEFT (aligns left claw with object edge, preventing tip poke)
 # Negative (-ve) = shifts claw to the RIGHT
-GRAB_LATERAL_OFFSET_MM = 18.0
+GRAB_LATERAL_OFFSET_MM = 12.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -2861,14 +2862,14 @@ def main():
             
             best_idx = -1
             min_dist = float('inf')
+            x1_a = y1_a = x2_a = y2_a = 0
             
             if results_aligned[0].boxes is not None:
                 for idx, box in enumerate(results_aligned[0].boxes):
                     if int(box.cls[0]) in TARGET_CLASS_IDS:
-                        x1_a, y1_a, x2_a, y2_a = map(int, box.xyxy[0].tolist())
-                        cx_a = (x1_a + x2_a) / 2
-                        cy_a = (y1_a + y2_a) / 2
-                        dist = math.hypot(cx_a - obj_px, cy_a - obj_py)
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                        cx_a = (bx1 + bx2) / 2
+                        dist = math.hypot(cx_a - obj_px, by1 - obj_py)
                         if dist < min_dist:
                             min_dist = dist
                             best_idx = idx
@@ -2922,20 +2923,27 @@ def main():
                               f"z={z_mm:.0f}mm  (from {np.sum(seg_mask==255)} mask pixels)")
 
             if xyz is None:
-                # Tightly centered depth samples at the grasp point (cap/neck)
-                # DO NOT use large search_w/search_h that averages with table/background!
+                # Tightly centered depth samples along the cap and upper neck of the bottle
+                # Samples at cap, and 18% / 28% down the neck to guarantee valid depth without table contamination
                 xyz_samples  = []
-                for _ in range(5):
-                    s = cap.get_xyz(obj_px, obj_py, search_w=14, search_h=14)
-                    if s is not None:
-                        xyz_samples.append(s)
-                    time.sleep(0.02)
+                sample_pts = [(obj_px, obj_py)]
+                if best_idx >= 0 and y2_a > y1_a:
+                    h_b = y2_a - y1_a
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.18))))
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.28))))
+
+                for pt in sample_pts:
+                    for _ in range(2):
+                        s = cap.get_xyz(pt[0], pt[1], search_w=14, search_h=14)
+                        if s is not None and s[2] > 70.0 and s[2] < MAX_GRAB_DEPTH_MM:
+                            xyz_samples.append(s)
+                        time.sleep(0.015)
                 if not xyz_samples:
                     for _ in range(3):
                         s = cap.get_xyz(obj_px, obj_py, search_w=24, search_h=24)
-                        if s is not None:
+                        if s is not None and s[2] > 70.0 and s[2] < MAX_GRAB_DEPTH_MM:
                             xyz_samples.append(s)
-                        time.sleep(0.02)
+                        time.sleep(0.015)
                 if not xyz_samples:
                     print("⚠️  No depth data — object may be in D405 blind zone")
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -2958,13 +2966,13 @@ def main():
                 continue
 
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Starts at GRASP_PENETRATION_MM (22mm: center claw grasp with ~15mm clearance from the back servo),
-            # adapting to shallower penetration if near the arm's physical reach boundary.
+            # Starts at GRASP_PENETRATION_MM (7.0mm: tip grasp with ~30mm clearance from the back servo),
+            # adapting to shallower penetration (4.0mm, 0.0mm, -4.0mm) to guarantee the gripper NEVER pushes or topples the bottle.
             penetration_candidates = [
-                GRASP_PENETRATION_MM,
-                GRASP_PENETRATION_MM - 3.0,
-                GRASP_PENETRATION_MM - 6.0,
-                14.0,
+                GRASP_PENETRATION_MM,         # 7.0mm: 30mm clearance from rear servo face
+                GRASP_PENETRATION_MM - 3.0,   # 4.0mm: 33mm clearance
+                0.0,                          # 0.0mm: 37mm clearance (tips at surface)
+                -4.0,                         # -4.0mm: 41mm clearance (tips 4mm standoff)
             ]
             grab_pos = None
             final_target = None
@@ -2984,15 +2992,26 @@ def main():
                     arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
                     arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
 
-                # ── Grasp Elevation Guard for Bottles ─────────────────────────
-                # Prevents grasping near the table surface/base if depth was sampled too low.
-                # Table is at z ≈ -130mm; an upright bottle's graspable neck is at least -80mm.
+                # ── Cap Grasp Targeting for Bottles ───────────────────────────
+                # When targeting a bottle, calculate the exact 3D cap height from the
+                # visual bounding box (top y1_a vs base y2_a) and camera depth, ensuring
+                # the gripper grasps the cap/neck rather than the table surface/base.
                 is_bottle_like = any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
-                if is_bottle_like:
-                    min_bottle_z = -80.0
-                    if arm_z < min_bottle_z:
-                        print(f"   📐 Bottle grasp elevation guard: raising target Z from {arm_z:+.0f}mm to {min_bottle_z:+.0f}mm (cap/neck height)")
-                        arm_z = min_bottle_z
+                if is_bottle_like and best_idx >= 0:
+                    # Physical bottle height (mm) from camera projection
+                    h_box_val = max(10, y2_a - y1_a)
+                    h_bottle_calc = (h_box_val * xyz[2]) / 452.5
+                    h_bottle_mm = float(np.clip(h_bottle_calc, 120.0, 260.0))
+
+                    # Bottle base height (tabletop is at -130mm, higher if on a riser)
+                    delta_z_base = max(0.0, (420.0 - y2_a) * xyz[2] / 452.5) if y2_a < 390 else 0.0
+                    z_base_est = -130.0 + delta_z_base
+
+                    # Cap target is 15mm below the top tip of the bottle
+                    z_cap = z_base_est + h_bottle_mm - 15.0
+                    if abs(arm_z - z_cap) > 10.0:
+                        print(f"   👑 Cap Grasp Height: Bottle H={h_bottle_mm:.0f}mm, Base={z_base_est:+.0f}mm → Cap Z={z_cap:+.0f}mm (overriding ground Z={arm_z:+.0f}mm)")
+                    arm_z = z_cap
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue
@@ -3019,7 +3038,8 @@ def main():
             if final_target is not None:
                 arm_x, arm_y, arm_z, pen_used = final_target
                 rho_t = math.sqrt(arm_x**2 + arm_y**2)
-                grasp_type = "PARALLEL GRASP (~15mm servo clearance)" if pen_used >= 16.0 else "ADAPTED SHALLOW GRASP"
+                clearance_val = 37.0 - pen_used
+                grasp_type = f"TIP GRASP (~{clearance_val:.0f}mm servo clearance)"
                 print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
                 print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch:.1f}°")
 

@@ -309,17 +309,19 @@ SEARCH_SWEEP_RANGE = 80.0   # ° pan left/right from START_POS centre
 SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 
 # ── Alignment — closed-loop visual servoing ───────────────────────────────────
-ALIGN_THRESHOLD    = 35    # px   centred when dot within this many px of crosshair (approx 10% margin)
-ALIGN_CENTRED_NEED = 3     # consecutive centred frames to confirm
-ALIGN_MAX_FRAMES   = 150   # give up after N frames (~7 s at 20 fps)
+ALIGN_THRESHOLD    = 30    # px   centred when dot within this many px of crosshair
+ALIGN_CENTRED_NEED = 4     # consecutive centred frames to confirm
+ALIGN_MAX_FRAMES   = 200   # give up after N frames (~10 s)
 ALIGN_LOST_GRACE   = 25    # consecutive not-found frames before abort
 
-ALIGN_PAN_OFFSET   = 35    # px: rightward crosshair offset (target ends up on the right, meaning the arm/claw is positioned to the LEFT of the object)
+ALIGN_PAN_OFFSET   = 0     # px: optical center (lateral claw offset handles claw clearance at grab time)
 
-ALIGN_PAN_K   = 0.04
-ALIGN_LIFT_K  = 0.05
-ALIGN_MAX_PAN_DEG  = 3.0
-ALIGN_MAX_LIFT_DEG = 1.5
+ALIGN_PAN_K        = 0.06  # responsive pan tracking
+ALIGN_WRIST_K      = 0.08  # responsive wrist tilt tracking (fast, direct optical pitch)
+ALIGN_LIFT_K       = 0.03  # gentle shoulder elevation assistance
+ALIGN_MAX_PAN_DEG  = 4.0   # max pan speed (°/frame)
+ALIGN_MAX_WRIST_DEG = 4.0  # max wrist tilt speed (°/frame)
+ALIGN_MAX_LIFT_DEG = 2.0   # max shoulder lift speed (°/frame)
 
 ALIGN_INIT_PAN_K    = 0.20
 ALIGN_INIT_LIFT_K   = 0.15
@@ -664,11 +666,11 @@ class RealSenseStream:
         self._running = False
         try:
             if hasattr(self, "_thread") and self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=0.6)
+                self._thread.join(timeout=1.5)
         except Exception:
             pass
         try:
-            if self._pipeline is not None:
+            if self._pipeline is not None and hasattr(self, "_thread") and (not self._thread.is_alive()):
                 self._pipeline.stop()
                 self._pipeline = None
         except Exception:
@@ -1917,24 +1919,12 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
     if seg_mask is None or np.sum(seg_mask == 255) < 30:
         if is_bottle_like:
             if h_box >= 1.05 * w_box:
-                # Upright or mostly vertical bottle: target cap/neck
-                top_h = max(10, int(h_box * 0.22))
-                cap_y_default = y1 + max(6, int(h_box * 0.12))
-                cap_x_default = default_cx
-                if frame is not None and frame.size > 0:
-                    crop = frame[y1 : min(frame.shape[0], y1 + top_h), x1 : min(frame.shape[1], x2)]
-                    if crop.size > 0:
-                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                        edges = cv2.Canny(gray, 40, 120)
-                        M = cv2.moments(edges)
-                        if M["m00"] > 0:
-                            cand_cx = x1 + int(M["m10"] / M["m00"])
-                            cand_cy = y1 + int(M["m01"] / M["m00"])
-                            if y1 <= cand_cy <= y1 + top_h:
-                                return cand_cx, cand_cy
-                return cap_x_default, cap_y_default
+                # Upright or mostly vertical bottle: target cap (top 5-8% of bounding box)
+                cap_y = y1 + max(5, int(h_box * 0.06))
+                cap_x = default_cx
+                return cap_x, cap_y
             elif w_box >= 1.3 * h_box:
-                # Horizontal bottle lying down on table
+                # Horizontal bottle lying down on table: target cap on narrower end
                 if frame is not None and frame.size > 0:
                     left_w = max(5, int(w_box * 0.25))
                     left_crop = frame[y1:y2, x1 : x1 + left_w]
@@ -1942,24 +1932,24 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
                     l_edges = np.sum(cv2.Canny(cv2.cvtColor(left_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if left_crop.size else 0
                     r_edges = np.sum(cv2.Canny(cv2.cvtColor(right_crop, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if right_crop.size else 0
                     if l_edges < r_edges and l_edges > 0:
-                        return x1 + max(8, int(w_box * 0.12)), default_cy
+                        return x1 + max(8, int(w_box * 0.08)), default_cy
                     elif r_edges < l_edges and r_edges > 0:
-                        return x2 - max(8, int(w_box * 0.12)), default_cy
+                        return x2 - max(8, int(w_box * 0.08)), default_cy
                 return default_cx, default_cy
             else:
-                # Tilted bottle (~45 degrees)
+                # Tilted bottle (~45 degrees): target upper quadrant cap
                 if frame is not None and frame.size > 0:
-                    top_h = max(5, int(h_box * 0.35))
+                    top_h = max(5, int(h_box * 0.30))
                     mid_w = x1 + w_box // 2
                     top_left = frame[y1 : y1 + top_h, x1 : mid_w]
                     top_right = frame[y1 : y1 + top_h, mid_w : x2]
                     tl_edges = np.sum(cv2.Canny(cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_left.size else 0
                     tr_edges = np.sum(cv2.Canny(cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY), 40, 120) > 0) if top_right.size else 0
                     if tl_edges > tr_edges * 1.3:
-                        return x1 + int(w_box * 0.25), y1 + int(h_box * 0.15)
+                        return x1 + int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
                     elif tr_edges > tl_edges * 1.3:
-                        return x2 - int(w_box * 0.25), y1 + int(h_box * 0.15)
-                return default_cx, y1 + int(h_box * 0.15)
+                        return x2 - int(w_box * 0.20), y1 + max(5, int(h_box * 0.08))
+                return default_cx, y1 + max(5, int(h_box * 0.08))
         # Non-bottle objects
         if frame is not None:
             return canny_centre(frame, x1, y1, x2, y2)
@@ -2094,7 +2084,7 @@ class ObjectTracker:
         bx, by, bw, bh = cv2.boundingRect(largest)
         if any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"]):
             if bh >= 1.05 * bw:
-                cy = by + max(8, int(bh * 0.12))
+                cy = by + max(5, int(bh * 0.06))
         area = (bw / fw) * (bh / fh)
         overlay = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
         frame[:] = cv2.addWeighted(frame, 0.8, overlay, 0.2, 0)
@@ -2110,10 +2100,9 @@ def align_arm(robot, cap: RealSenseStream, model,
               tracker: ObjectTracker,
               max_frames: int | None = None) -> tuple[bool, tuple[int, int] | None]:
     """
-    Closed-loop visual servoing. Returns (success, (obj_px, obj_py)).
-    obj_px/py is the final pixel coordinate of the object centre.
-
-    max_frames: override for ALIGN_MAX_FRAMES (useful for quick re-centre passes).
+    Closed-loop visual servoing with active 3-DOF tracking (pan, wrist-flex tilt, shoulder lift).
+    Follows target smoothly in real-time as it moves or changes elevation.
+    Returns (success, (obj_px, obj_py)).
     """
     centred_streak = 0
     lost_streak    = 0
@@ -2122,11 +2111,9 @@ def align_arm(robot, cap: RealSenseStream, model,
     last_obj_pixel = None
     effective_max  = max_frames if max_frames is not None else ALIGN_MAX_FRAMES
 
-    # ── Record initial posture ───────────────────────────────────────────────
-    # We freeze elbow, wrist, and gripper at their initial values for the duration
-    # of the alignment step. This prevents them from drifting more negative (stretching out)
-    # due to gravity sag being fed back into the position command.
+    # Record initial posture
     initial_pos = get_pos(robot)
+    start_pan   = initial_pos.get("shoulder_pan.pos", 0.0)
     start_lift  = initial_pos.get("shoulder_lift.pos", 0.0)
     start_elb   = initial_pos.get("elbow_flex.pos", 0.0)
     start_wst   = initial_pos.get("wrist_flex.pos", 0.0)
@@ -2157,7 +2144,7 @@ def align_arm(robot, cap: RealSenseStream, model,
                 if last_obj_pixel is not None:
                     last_pan_err = last_obj_pixel[0] - frame_cx
                     last_lift_err = last_obj_pixel[1] - frame_cy
-                    if abs(last_pan_err) <= 60 and abs(last_lift_err) <= 60:
+                    if abs(last_pan_err) <= 50 and abs(last_lift_err) <= 50:
                         print(f"   🟡 Object lost, but last pos was close enough (err={last_pan_err:+d},{last_lift_err:+d}) — proceeding to grab")
                         return True, last_obj_pixel
                 print(f"   ❌ Lost too long ({frame_idx+1} frames) — restarting search")
@@ -2177,57 +2164,60 @@ def align_arm(robot, cap: RealSenseStream, model,
             sign_flip_pan += 1
         last_pan_sign = cur_pan_sign
 
-        # Non-linear exponential decay as we approach the target to prevent overshoot
         err_mag = math.hypot(pan_err, lift_err)
-        decay = max(0.1, 1.0 - math.exp(-err_mag / 30.0))
-        
-        # NOTE: pan_err sign was originally correct (it oscillated around 0, proving it was a stable closed loop).
-        pan_cmd  = float(np.clip(pan_err * ALIGN_PAN_K * decay,  -ALIGN_MAX_PAN_DEG,  ALIGN_MAX_PAN_DEG))
-        lift_cmd = float(np.clip(lift_err * ALIGN_LIFT_K * decay, -ALIGN_MAX_LIFT_DEG, ALIGN_MAX_LIFT_DEG))
+        # Responsive velocity scaling: fast when far, smooth linear deceleration within 40px
+        decay = float(np.clip(err_mag / 40.0, 0.25, 1.0))
+
+        # Command calculations
+        pan_cmd   = float(np.clip(pan_err * ALIGN_PAN_K * decay, -ALIGN_MAX_PAN_DEG, ALIGN_MAX_PAN_DEG))
+        # Positive lift_err (obj_py > cy, object lower) -> wrist pitches down (wst increases)
+        # Negative lift_err (obj_py < cy, object higher) -> wrist pitches up (wst decreases)
+        wrist_cmd = float(np.clip(lift_err * ALIGN_WRIST_K * decay, -ALIGN_MAX_WRIST_DEG, ALIGN_MAX_WRIST_DEG))
+        # Negative lift_err (object higher) -> shoulder lifts up (lift becomes less negative, so + cmd)
+        lift_cmd  = float(np.clip(-lift_err * ALIGN_LIFT_K * decay, -ALIGN_MAX_LIFT_DEG, ALIGN_MAX_LIFT_DEG))
 
         cur = get_pos(robot)
-        
-        # ── Prevent backward tilt (more negative lift) ───────────────────────
-        # User constraint: Lift cannot become more negative than its starting position,
-        # otherwise the arm tilts back.
-        next_lift = cur["shoulder_lift.pos"] + lift_cmd
-        hit_lift_constraint = False
-        if next_lift < start_lift:
-            next_lift = start_lift
-            lift_cmd = start_lift - cur["shoulder_lift.pos"]
-            hit_lift_constraint = True
+        cur_pan  = cur.get("shoulder_pan.pos", start_pan)
+        cur_lift = cur.get("shoulder_lift.pos", start_lift)
+        cur_wst  = cur.get("wrist_flex.pos", start_wst)
+
+        next_pan  = float(np.clip(cur_pan + pan_cmd, PAN_MIN_DEG, PAN_MAX_DEG))
+        next_wst  = float(np.clip(cur_wst + wrist_cmd, -35.0, 55.0))
+        # Safe bounds on shoulder_lift: avoid excessive backward lean (below start_lift - 5.0)
+        # while allowing upward reach (up to start_lift + 22.0)
+        next_lift = float(np.clip(cur_lift + lift_cmd, start_lift - 5.0, start_lift + 22.0))
 
         centred_pan  = abs(pan_err) < ALIGN_THRESHOLD
-        centred_lift = (abs(lift_err) < ALIGN_THRESHOLD) or hit_lift_constraint
+        centred_lift = abs(lift_err) < ALIGN_THRESHOLD
         centred = centred_pan and centred_lift
 
         if centred:
             centred_streak += 1
             if centred_streak >= ALIGN_CENTRED_NEED:
-                print(f"   ✅ Aligned in {frame_idx+1} frames (pan={pan_err}px, lift={lift_err}px)")
+                print(f"   ✅ Aligned in {frame_idx+1} frames (pan={pan_err:+d}px, lift={lift_err:+d}px | wst={next_wst:+.1f}°, lift={next_lift:+.1f}°)")
                 return True, last_obj_pixel
         else:
             centred_streak = 0
 
         robot.send_action({
-            "shoulder_pan.pos":  cur["shoulder_pan.pos"] + pan_cmd,
+            "shoulder_pan.pos":  next_pan,
             "shoulder_lift.pos": next_lift,
             "elbow_flex.pos":    start_elb,
-            "wrist_flex.pos":    start_wst,
+            "wrist_flex.pos":    next_wst,
             "gripper.pos":       start_grp,
         })
-        
-        # Format the command printout to reflect actual movement (clamped)
+
         print(f"   [{src.upper():5s}] frame {frame_idx+1:03d}: "
               f"err=({pan_err:+4d},{lift_err:+4d})px  "
-              f"cmd=({pan_cmd:+5.2f},{lift_cmd:+5.2f})°")
+              f"cmd=(pan={pan_cmd:+4.1f}°, wst={wrist_cmd:+4.1f}°, lift={lift_cmd:+4.1f}°)  "
+              f"pose=(wst={next_wst:+4.1f}°, lift={next_lift:+4.1f}°)")
 
         src_color = (0,255,0) if src == "yolo" else (0,165,255)
         cv2.circle(display, (obj_px, obj_py), 7, src_color, -1)
         cv2.line(display, (frame_cx, frame_cy), (obj_px, obj_py), (0,255,255), 1)
-        status = "✅ CENTRED" if centred else "🎯 ALIGNING"
+        status = "✅ CENTRED" if centred else "🎯 TRACKING"
         cv2.putText(display,
-            f"{status} [{src.upper()}]  err=({pan_err:+d},{lift_err:+d})px",
+            f"{status} [{src.upper()}]  err=({pan_err:+d},{lift_err:+d})px  wst={next_wst:+.0f}deg",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
         _show_frame("Picker Vision", display)
         if not HEADLESS: cv2.waitKey(1)
@@ -2929,8 +2919,8 @@ def main():
                 sample_pts = [(obj_px, obj_py)]
                 if best_idx >= 0 and y2_a > y1_a:
                     h_b = y2_a - y1_a
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.18))))
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.28))))
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.10))))
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.15))))
 
                 for pt in sample_pts:
                     for _ in range(2):
@@ -2949,10 +2939,17 @@ def main():
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
                     STATE = "SEARCHING"
                     continue
-                xs = [s[0] for s in xyz_samples]
-                ys = [s[1] for s in xyz_samples]
                 zs = [s[2] for s in xyz_samples]
-                xyz = (float(np.median(xs)), float(np.median(ys)), float(np.median(zs)))
+                med_z = float(np.median(zs))
+                # Deproject the true CAP pixel (obj_px, obj_py) using median depth
+                intr = cap._intrinsics
+                if intr is not None:
+                    pt_3d = rs.rs2_deproject_pixel_to_point(intr, [float(obj_px), float(obj_py)], med_z / 1000.0)
+                    xyz = (pt_3d[0] * 1000.0, pt_3d[1] * 1000.0, med_z)
+                else:
+                    xyz = (float(np.median([s[0] for s in xyz_samples])),
+                           float(np.median([s[1] for s in xyz_samples])),
+                           med_z)
             print(f"   📍 Camera-space: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  "
                   f"depth={xyz[2]:.0f}mm")
             # Margin of error / Offset debug
@@ -2992,26 +2989,15 @@ def main():
                     arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
                     arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
 
-                # ── Cap Grasp Targeting for Bottles ───────────────────────────
-                # When targeting a bottle, calculate the exact 3D cap height from the
-                # visual bounding box (top y1_a vs base y2_a) and camera depth, ensuring
-                # the gripper grasps the cap/neck rather than the table surface/base.
+                # ── Cap Grasp Height Guard for Bottles ────────────────────────
+                # Active tracking has positioned the wrist/shoulder directly toward the cap.
+                # Enforce a tabletop floor guard: bottles resting on the table (Z_table ~ -130mm)
+                # have their caps at Z >= -20mm. If arm_z is lower than -20mm, elevate to cap level.
                 is_bottle_like = any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
-                if is_bottle_like and best_idx >= 0:
-                    # Physical bottle height (mm) from camera projection
-                    h_box_val = max(10, y2_a - y1_a)
-                    h_bottle_calc = (h_box_val * xyz[2]) / 452.5
-                    h_bottle_mm = float(np.clip(h_bottle_calc, 120.0, 260.0))
-
-                    # Bottle base height (tabletop is at -130mm, higher if on a riser)
-                    delta_z_base = max(0.0, (420.0 - y2_a) * xyz[2] / 452.5) if y2_a < 390 else 0.0
-                    z_base_est = -130.0 + delta_z_base
-
-                    # Cap target is 15mm below the top tip of the bottle
-                    z_cap = z_base_est + h_bottle_mm - 15.0
-                    if abs(arm_z - z_cap) > 10.0:
-                        print(f"   👑 Cap Grasp Height: Bottle H={h_bottle_mm:.0f}mm, Base={z_base_est:+.0f}mm → Cap Z={z_cap:+.0f}mm (overriding ground Z={arm_z:+.0f}mm)")
-                    arm_z = z_cap
+                if is_bottle_like:
+                    if arm_z < -20.0:
+                        print(f"   👑 Cap Floor Guard: arm_z was {arm_z:+.0f}mm (< -20mm table floor) → elevating to -20mm (cap level)")
+                        arm_z = -20.0
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue

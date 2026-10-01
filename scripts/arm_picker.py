@@ -218,9 +218,10 @@ CAM_PITCH_DEG   =  45.0   # tilt of camera relative to wrist axis (0 = parallel)
 # D405 minimum usable range. Objects closer than this have no valid depth.
 D405_MIN_RANGE_MM = 70.0
 
-# Maximum realistic table grab depth (mm). Readings larger than this (e.g. 1200mm)
-# mean the depth sensor sampled floor/background noise, so we reject them.
-MAX_GRAB_DEPTH_MM = 600.0
+# Maximum realistic table grab depth (mm). The maximum physical extension of the SO-ARM101
+# from shoulder pivot is 390mm (link lengths 152+153+100=405mm max). Readings larger than 380mm
+# mean the depth sensor sampled background table/floor/wall noise, so we reject them.
+MAX_GRAB_DEPTH_MM = 380.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
 # Gripper throat depth is ~37mm. With 7.0mm penetration, the object is grasped near the claw tips
@@ -2083,89 +2084,82 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
 # ObjectTracker: YOLO-primary, colour-mask fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 class ObjectTracker:
-    HSV_SLACK      = np.array([15, 60, 60], dtype=np.uint8)
-    COLOR_MIN_AREA = 80
-    SEARCH_PAD     = 40
-
+    """
+    Semantic Object Tracker for Visual Servoing.
+    Uses YOLO neural detections with spatial consistency / nearest-neighbor association.
+    Eliminates fragile HSV color fallback that locks onto human skin/hands.
+    Never modifies the camera frame buffer in-place (eliminates white QR-like artifacts).
+    """
     def __init__(self):
-        self.lower       = None
-        self.upper       = None
         self.last_box    = None
         self.last_center = None
         self.last_area   = None
         self.locked      = False
+        self.lost_frames = 0
 
     def lock_on(self, frame, x1, y1, x2, y2):
-        h_box      = y2 - y1
-        sample_y2  = y1 + max(4, int(h_box * 0.40))
-        crop       = frame[y1:sample_y2, x1:x2]
-        if crop.size == 0:
-            crop = frame[y1:y2, x1:x2]
-        hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        mean = hsv.mean(axis=(0, 1)).astype(np.float32)
-        self.lower = np.clip(mean - self.HSV_SLACK,
-                             [0, 20, 20], [180, 255, 255]).astype(np.uint8)
-        self.upper = np.clip(mean + self.HSV_SLACK,
-                             [0, 20, 20], [180, 255, 255]).astype(np.uint8)
-        fh, fw     = frame.shape[:2]
+        fh, fw = frame.shape[:2]
         self.last_box    = (x1, y1, x2, y2)
         self.last_center = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=frame)
         self.last_area   = ((x2 - x1) / fw) * ((y2 - y1) / fh)
         self.locked      = True
-        print(f"   🔒 Tracker locked: HSV [{self.lower}]–[{self.upper}]")
+        self.lost_frames = 0
+        print(f"   🔒 Tracker locked on target: box=({x1},{y1},{x2},{y2}) grasp={self.last_center}")
 
     def detect(self, frame, yolo_results, model_class_id):
+        """
+        Detects the locked target in the current frame using YOLO.
+        Matches by spatial proximity to last_center to avoid jumping to hands or other objects.
+        If YOLO misses a frame during motion, holds the last verified position for up to 3 frames.
+        """
         fh, fw = frame.shape[:2]
-        # YOLO first
-        for box in yolo_results[0].boxes:
-            cls_id = int(box.cls[0].item())
-            if isinstance(model_class_id, (list, tuple, set)):
-                if cls_id not in model_class_id:
-                    continue
-            else:
-                if cls_id != model_class_id:
-                    continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(fw, x2), min(fh, y2)
-            cx, cy  = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=frame)
-            area    = ((x2 - x1) / fw) * ((y2 - y1) / fh)
-            self.last_box = (x1, y1, x2, y2)
-            self.last_center = (cx, cy)
-            self.last_area   = area
-            return True, (cx, cy), area, "yolo"
-        # Colour fallback
-        if not (self.locked and self.lower is not None and self.last_box):
-            return False, self.last_center, self.last_area, "lost"
-        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.lower, self.upper)
-        lx1, ly1, lx2, ly2 = self.last_box
-        p    = self.SEARCH_PAD
-        rx1  = max(0, lx1 - p);  ry1 = max(0, ly1 - p)
-        rx2  = min(fw, lx2 + p); ry2 = min(fh, ly2 + p)
-        roi  = np.zeros_like(mask)
-        roi[ry1:ry2, rx1:rx2] = mask[ry1:ry2, rx1:rx2]
-        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return False, self.last_center, self.last_area, "lost"
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < self.COLOR_MIN_AREA:
-            return False, self.last_center, self.last_area, "lost"
-        M = cv2.moments(largest)
-        if M["m00"] <= 0:
-            return False, self.last_center, self.last_area, "lost"
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        bx, by, bw, bh = cv2.boundingRect(largest)
-        if any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"]):
-            if bh >= 1.05 * bw:
-                cy = by + max(5, int(bh * 0.06))
-        area = (bw / fw) * (bh / fh)
-        overlay = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
-        frame[:] = cv2.addWeighted(frame, 0.8, overlay, 0.2, 0)
-        self.last_center = (cx, cy)
-        self.last_area   = area
-        return True, (cx, cy), area, "color"
+        valid_boxes = []
+
+        if yolo_results is not None and len(yolo_results) > 0 and yolo_results[0].boxes is not None:
+            for box in yolo_results[0].boxes:
+                cls_id = int(box.cls[0].item())
+                # Strictly filter for target class IDs (person class 0 is rejected)
+                if isinstance(model_class_id, (list, tuple, set)):
+                    if cls_id not in model_class_id:
+                        continue
+                else:
+                    if cls_id != model_class_id:
+                        continue
+                
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                bx1, by1 = max(0, bx1), max(0, by1)
+                bx2, by2 = min(fw, bx2), min(fh, by2)
+                bcx, bcy = find_optimal_grasp_point(None, (bx1, by1, bx2, by2), TARGET_DESC, frame=frame)
+                barea = ((bx2 - bx1) / fw) * ((by2 - by1) / fh)
+                
+                # Proximity to last center
+                if self.last_center is not None:
+                    dist = math.hypot(bcx - self.last_center[0], bcy - self.last_center[1])
+                else:
+                    dist = 0.0
+                
+                valid_boxes.append((dist, (bx1, by1, bx2, by2), (bcx, bcy), barea))
+
+        if valid_boxes:
+            # Pick closest match to previous position
+            valid_boxes.sort(key=lambda item: item[0])
+            best_dist, best_box, best_center, best_area = valid_boxes[0]
+            
+            # Gating: reject jumps > 220px to prevent latching onto unrelated background objects
+            if self.last_center is None or best_dist < 220.0:
+                self.last_box = best_box
+                self.last_center = best_center
+                self.last_area = best_area
+                self.lost_frames = 0
+                return True, best_center, best_area, "yolo"
+
+        # Motion coasting: if YOLO dropped 1-3 frames during fast arm movement, hold steady
+        if self.locked and self.last_center is not None and self.lost_frames < 3:
+            self.lost_frames += 1
+            return True, self.last_center, self.last_area, "hold"
+
+        self.lost_frames += 1
+        return False, self.last_center, self.last_area, "lost"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2287,7 +2281,7 @@ def align_arm(robot, cap: RealSenseStream, model,
               f"cmd=(pan={pan_cmd:+4.1f}°, wst={wrist_cmd:+4.1f}°, lift={lift_cmd:+4.1f}°)  "
               f"pose=(wst={next_wst:+4.1f}°, lift={next_lift:+4.1f}°)")
 
-        src_color = (0,255,0) if src == "yolo" else (0,165,255)
+        src_color = (0,255,0) if src == "yolo" else ((0,255,255) if src == "hold" else (0,165,255))
         cv2.circle(display, (obj_px, obj_py), 7, src_color, -1)
         cv2.line(display, (frame_cx, frame_cy), (obj_px, obj_py), (0,255,255), 1)
         status = "✅ CENTRED" if centred else "🎯 TRACKING"
@@ -2922,12 +2916,13 @@ def main():
             # We must recalculate the mask because the camera has moved during alignment.
             color_aligned, _, _ = cap.read()
             h_a, w_a = color_aligned.shape[:2]
-            results_aligned = model(color_aligned, verbose=False, conf=0.5)
+            results_aligned = model(color_aligned, verbose=False, conf=0.35)
             seg_mask = None
             
             best_idx = -1
             min_dist = float('inf')
             x1_a = y1_a = x2_a = y2_a = 0
+            MAX_ALIGN_DIST = 120.0  # max allowable distance from aligned center
             
             if results_aligned[0].boxes is not None:
                 for idx, box in enumerate(results_aligned[0].boxes):
@@ -2935,7 +2930,7 @@ def main():
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
                         cx_a = (bx1 + bx2) / 2
                         dist = math.hypot(cx_a - obj_px, by1 - obj_py)
-                        if dist < min_dist:
+                        if dist < min_dist and dist <= MAX_ALIGN_DIST:
                             min_dist = dist
                             best_idx = idx
             
@@ -2965,6 +2960,11 @@ def main():
                 print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
                       f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
                 print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py}) (Cap/Neck grasp)")
+            elif tracker.last_box is not None:
+                x1_a, y1_a, x2_a, y2_a = tracker.last_box
+                sizing = size_up_object(color_aligned, None, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
+                obj_px, obj_py = sizing["opt_px"]
+                print(f"   🎯 Using tracked grasp point: ({obj_px},{obj_py}) (Cap/Neck grasp)")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -2983,34 +2983,37 @@ def main():
             xyz = None
             if seg_mask is not None:
                 xyz = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
-                if xyz is not None:
+                if xyz is not None and xyz[2] <= MAX_GRAB_DEPTH_MM:
                     print(f"   🎭 Mask depth (cap/neck): x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
                           f"(from {np.sum(seg_mask==255)} mask pixels)")
+                else:
+                    xyz = None
 
             if xyz is None:
                 # Tightly centered depth samples along the cap and upper neck of the bottle
-                # Samples at cap, and 18% / 28% down the neck to guarantee valid depth without table contamination
+                # Samples at cap, and 10% / 15% / 25% down the neck to guarantee valid depth without table contamination
                 xyz_samples  = []
                 sample_pts = [(obj_px, obj_py)]
-                if best_idx >= 0 and y2_a > y1_a:
+                if (best_idx >= 0 or tracker.last_box is not None) and y2_a > y1_a:
                     h_b = y2_a - y1_a
                     sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.10))))
                     sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.15))))
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.25))))
 
                 for pt in sample_pts:
                     for _ in range(2):
-                        s = cap.get_xyz(pt[0], pt[1], search_w=14, search_h=14)
-                        if s is not None and s[2] > 70.0 and s[2] < MAX_GRAB_DEPTH_MM:
+                        s = cap.get_xyz(pt[0], pt[1], search_w=12, search_h=12)
+                        if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
                             xyz_samples.append(s)
                         time.sleep(0.015)
                 if not xyz_samples:
                     for _ in range(3):
-                        s = cap.get_xyz(obj_px, obj_py, search_w=24, search_h=24)
-                        if s is not None and s[2] > 70.0 and s[2] < MAX_GRAB_DEPTH_MM:
+                        s = cap.get_xyz(obj_px, obj_py, search_w=18, search_h=18)
+                        if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
                             xyz_samples.append(s)
                         time.sleep(0.015)
                 if not xyz_samples:
-                    print("⚠️  No depth data — object may be in D405 blind zone")
+                    print(f"⚠️  No valid object depth (depth > {MAX_GRAB_DEPTH_MM:.0f}mm or in blind zone) — restarting search")
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
                     STATE = "SEARCHING"
                     continue

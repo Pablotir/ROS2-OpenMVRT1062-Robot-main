@@ -175,6 +175,7 @@ ARM_ID     = "jetson_arm"
 # ── Detection ─────────────────────────────────────────────────────────────────
 TARGET_DESC      = "red ball"
 YOLO_CLASS_ID    = 32     # 32 = sports ball in standard COCO segmentation models
+TARGET_CLASS_IDS = [32]   # Set of active class IDs (supports multi-angle concepts)
 SKIP_MOONDREAM   = True   # Set False to re-enable Moondream semantic verification
 
 # ── Arm Geometry (SO-ARM101 — Physical Kinematic Constants) ───────────────────
@@ -222,8 +223,8 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 600.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# 0 = gripper tip at surface. 27mm centers object in claw pads with ~10mm clearance from the servo face.
-GRASP_PENETRATION_MM = 27.0
+# 0 = gripper tip at surface. 22mm centers object in claw pads with ~15mm clearance from the servo face.
+GRASP_PENETRATION_MM = 22.0
 
 # Preferred gripper approach pitch (degrees relative to horizontal table).
 # 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
@@ -593,15 +594,15 @@ class RealSenseStream:
         point = rs.rs2_deproject_pixel_to_point(intr, [float(px), float(py)], z_m)
         return point[0] * 1000.0, point[1] * 1000.0, point[2] * 1000.0  # → mm
 
-    def get_xyz_from_mask(self, mask: np.ndarray) -> tuple[float, float, float] | None:
+    def get_xyz_from_mask(self, mask: np.ndarray, target_px: tuple[int, int] | None = None) -> tuple[float, float, float] | None:
         """
         Compute (cx_px, cy_px, z_mm) for the object described by a binary
         segmentation mask (same HxW as the color frame, dtype uint8, 255=object).
+        If target_px=(tx, ty) is provided (e.g. from optimal grasp point analysis
+        such as bottle neck/cap), it deprojects that point using local mask depth.
 
         Uses ONLY the depth pixels that belong to the mask so background
         depth values never contaminate the object distance estimate.
-        This is the recommended method when a segmentation model is available.
-
         Returns (cx_px, cy_px, median_depth_mm) or None if no valid depth pixels.
         """
         with self._lock:
@@ -611,31 +612,47 @@ class RealSenseStream:
         if depth_img is None or intr is None:
             return None
 
-        # Centroid of the mask (pixel coordinates)
-        M = cv2.moments(mask)
-        if M["m00"] < 1:
-            return None
-        cx_px = int(M["m10"] / M["m00"])
-        cy_px = int(M["m01"] / M["m00"])
+        if target_px is not None:
+            cx_px, cy_px = int(target_px[0]), int(target_px[1])
+        else:
+            # Centroid of the mask (pixel coordinates)
+            M = cv2.moments(mask)
+            if M["m00"] < 1:
+                return None
+            cx_px = int(M["m10"] / M["m00"])
+            cy_px = int(M["m01"] / M["m00"])
 
-        # Collect depth readings for all mask pixels
+        # Collect depth readings for mask pixels
         h, w  = depth_img.shape[:2]
         mh, mw = mask.shape[:2]
-        # Resize mask to depth resolution if they differ
         if (mh, mw) != (h, w):
             mask_rs = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         else:
             mask_rs = mask
 
-        raw_depths = depth_img[mask_rs == 255].astype(float) * scale
-        valid = raw_depths[(raw_depths > 0.001) & (raw_depths < 2.0)]
+        if target_px is not None:
+            tx, ty = cx_px, cy_px
+            rw = 20
+            y1_p, y2_p = max(0, ty - rw), min(h, ty + rw + 1)
+            x1_p, x2_p = max(0, tx - rw), min(w, tx + rw + 1)
+            local_mask = mask_rs[y1_p:y2_p, x1_p:x2_p]
+            local_depth = depth_img[y1_p:y2_p, x1_p:x2_p]
+            raw_depths = local_depth[local_mask == 255].astype(float) * scale
+            valid = raw_depths[(raw_depths > 0.001) & (raw_depths < 2.0)]
+            if valid.size < 5:
+                raw_depths = depth_img[mask_rs == 255].astype(float) * scale
+                valid = raw_depths[(raw_depths > 0.001) & (raw_depths < 2.0)]
+        else:
+            raw_depths = depth_img[mask_rs == 255].astype(float) * scale
+            valid = raw_depths[(raw_depths > 0.001) & (raw_depths < 2.0)]
+
         if valid.size == 0:
             return None
 
         z_m = float(np.median(valid))
         z_mm = z_m * 1000.0
 
-        # Deproject centroid pixel using the median mask depth
+        # Deproject target pixel using the median mask depth
         point = rs.rs2_deproject_pixel_to_point(
             intr, [float(cx_px), float(cy_px)], z_m)
         return float(cx_px), float(cy_px), z_mm
@@ -1873,6 +1890,77 @@ def canny_centre(frame: np.ndarray, x1, y1, x2, y2):
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle") -> tuple[int, int]:
+    """
+    Computes optimal grasp point (x_px, y_px) on the object.
+    
+    For bottles, flasks, and tall containers:
+      - Uses 2D principal component / axis line fitting (cv2.fitLine) on the segmentation mask.
+      - Finds the major axis orientation vector pointing toward the top of the bottle.
+      - Targets the upper neck / cap area (~75% along the major axis from the base toward the top),
+        rather than the geometric centroid (which is heavily biased toward the fat lower base and table).
+      - Works whether the bottle is upright, elevated, or tilted at an angle!
+    
+    For other objects (balls, boxes, etc.):
+      - Defaults to the stable 2D centroid / center of mass.
+    """
+    x1, y1, x2, y2 = bbox
+    default_cx, default_cy = (x1 + x2) // 2, (y1 + y2) // 2
+    if seg_mask is None or np.sum(seg_mask == 255) < 30:
+        if "bottle" in target_desc.lower():
+            # Upper quarter of bounding box
+            return default_cx, int(y1 + 0.25 * (y2 - y1))
+        return default_cx, default_cy
+
+    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        if "bottle" in target_desc.lower():
+            return default_cx, int(y1 + 0.25 * (y2 - y1))
+        return default_cx, default_cy
+    c = max(contours, key=cv2.contourArea)
+
+    if "bottle" in target_desc.lower() or "cup" in target_desc.lower() or "can" in target_desc.lower():
+        try:
+            line = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx, vy, x0, y0 = float(line[0][0]), float(line[1][0]), float(line[2][0]), float(line[3][0])
+            # Orient vector upward (toward smaller y in image, which is higher elevation / neck of bottle)
+            if vy > 0:
+                vx, vy = -vx, -vy
+
+            pts = c.reshape(-1, 2)
+            proj = (pts[:, 0] - x0) * vx + (pts[:, 1] - y0) * vy
+            t_min, t_max = float(np.min(proj)), float(np.max(proj))
+
+            # Bottle neck/cap is at 75% along major axis from base (t_min) toward top (t_max)
+            t_target = t_min + 0.75 * (t_max - t_min)
+            opt_x = int(round(x0 + t_target * vx))
+            opt_y = int(round(y0 + t_target * vy))
+
+            h, w = seg_mask.shape[:2]
+            opt_x = max(0, min(w - 1, opt_x))
+            opt_y = max(0, min(h - 1, opt_y))
+
+            # Ensure optimal point is on or adjacent to mask pixels
+            if seg_mask[opt_y, opt_x] == 0:
+                row_xs = np.where(seg_mask[opt_y, :] == 255)[0]
+                if len(row_xs) > 0:
+                    opt_x = int(np.median(row_xs))
+                else:
+                    mask_pts = np.argwhere(seg_mask == 255)  # [row, col]
+                    dists = (mask_pts[:, 0] - opt_y)**2 + (mask_pts[:, 1] - opt_x)**2
+                    min_idx = np.argmin(dists)
+                    opt_y, opt_x = int(mask_pts[min_idx][0]), int(mask_pts[min_idx][1])
+            return opt_x, opt_y
+        except Exception:
+            pass
+
+    # Default to contour centroid
+    M = cv2.moments(c)
+    if M["m00"] > 0:
+        return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+    return default_cx, default_cy
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ObjectTracker: YOLO-primary, colour-mask fallback
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1912,8 +2000,13 @@ class ObjectTracker:
         fh, fw = frame.shape[:2]
         # YOLO first
         for box in yolo_results[0].boxes:
-            if int(box.cls[0].item()) != model_class_id:
-                continue
+            cls_id = int(box.cls[0].item())
+            if isinstance(model_class_id, (list, tuple, set)):
+                if cls_id not in model_class_id:
+                    continue
+            else:
+                if cls_id != model_class_id:
+                    continue
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(fw, x2), min(fh, y2)
@@ -1990,7 +2083,7 @@ def align_arm(robot, cap: RealSenseStream, model,
         frame_cy =  h // 2
 
         results = model(color, verbose=False)
-        found, center, area, src = tracker.detect(color, results, YOLO_CLASS_ID)
+        found, center, area, src = tracker.detect(color, results, TARGET_CLASS_IDS)
 
         display = color.copy()
         cv2.line(display, (frame_cx-20, frame_cy), (frame_cx+20, frame_cy), (0,0,255), 1)
@@ -2402,7 +2495,7 @@ def main():
     print(f"📐 T_cam_wrist built:")
     print(f"   offsets X={CAM_X_OFFSET_MM}mm  Y={CAM_Y_OFFSET_MM}mm  Z={CAM_Z_OFFSET_MM}mm  pitch={CAM_PITCH_DEG}°")
 
-    global TARGET_DESC, YOLO_CLASS_ID
+    global TARGET_DESC, YOLO_CLASS_ID, TARGET_CLASS_IDS
     target_in = input(f"\n🎯 Enter object to grab (e.g. 'bottle', 'cup', 'red ball') [default '{TARGET_DESC}']: ").strip()
     if target_in:
         TARGET_DESC = target_in
@@ -2428,10 +2521,24 @@ def main():
     print(f"Loading YOLO model: {chosen_path}...")
     model = YOLO(chosen_path)
     if "world" in chosen_path.lower() or hasattr(model, "set_classes"):
-        model.set_classes([TARGET_DESC])
-        YOLO_CLASS_ID = 0  # In YOLO-World, the single custom class is index 0
-        print(f"   🌍 YOLO-World loaded and targeting: ['{TARGET_DESC}'] (Class ID: {YOLO_CLASS_ID})")
+        # Auto-expand multi-angle semantic concepts internally so the user doesn't have to write complex queries
+        user_target = TARGET_DESC.strip()
+        query_variants = [user_target]
+        if "bottle" in user_target.lower():
+            for v in ["bottle", "tilted bottle", "horizontal bottle", "drink container"]:
+                if v not in query_variants:
+                    query_variants.append(v)
+        elif "cup" in user_target.lower() or "mug" in user_target.lower():
+            for v in ["tilted cup", "lying cup"]:
+                if v not in query_variants:
+                    query_variants.append(v)
+
+        model.set_classes(query_variants)
+        TARGET_CLASS_IDS = list(range(len(query_variants)))
+        YOLO_CLASS_ID = 0  # Primary class ID
+        print(f"   🌍 YOLO-World loaded and targeting: {query_variants} (Class IDs: {TARGET_CLASS_IDS})")
     else:
+        TARGET_CLASS_IDS = [YOLO_CLASS_ID]
         print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
 
     # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
@@ -2579,7 +2686,7 @@ def main():
             target_box     = None
             target_box_idx = -1
             for i, box in enumerate(results[0].boxes):
-                if int(box.cls[0].item()) == YOLO_CLASS_ID:
+                if int(box.cls[0].item()) in TARGET_CLASS_IDS:
                     bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
                     
                     # Check if the bounding box has ANY valid depth inside it
@@ -2623,7 +2730,7 @@ def main():
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
 
-            # Use segmentation mask centroid if available (more accurate than bbox centre)
+            # Use segmentation mask optimal grasp point if available (e.g. neck/cap of bottle)
             seg_mask = None
             if (results[0].masks is not None and
                     target_box_idx >= 0 and
@@ -2631,15 +2738,9 @@ def main():
                 polygon  = results[0].masks.xy[target_box_idx].astype(np.int32)
                 seg_mask = np.zeros(color.shape[:2], dtype=np.uint8)
                 cv2.fillPoly(seg_mask, [polygon], 255)
-                # Centroid from mask moments
-                Mm = cv2.moments(seg_mask)
-                if Mm["m00"] > 0:
-                    obj_px = int(Mm["m10"] / Mm["m00"])
-                    obj_py = int(Mm["m01"] / Mm["m00"])
-                else:
-                    obj_px, obj_py = canny_centre(color, x1, y1, x2, y2)
+                obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1, y1, x2, y2), TARGET_DESC)
             else:
-                obj_px, obj_py = canny_centre(color, x1, y1, x2, y2)
+                obj_px, obj_py = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC)
 
             cv2.rectangle(display, (x1, y1), (x2, y2), (0,255,255), 2)
             cv2.circle(display, (obj_px, obj_py), 6, (0,255,0), -1)
@@ -2708,7 +2809,7 @@ def main():
             
             if results_aligned[0].boxes is not None:
                 for idx, box in enumerate(results_aligned[0].boxes):
-                    if int(box.cls[0]) == YOLO_CLASS_ID:
+                    if int(box.cls[0]) in TARGET_CLASS_IDS:
                         x1_a, y1_a, x2_a, y2_a = map(int, box.xyxy[0].tolist())
                         cx_a = (x1_a + x2_a) / 2
                         cy_a = (y1_a + y2_a) / 2
@@ -2728,11 +2829,8 @@ def main():
                           f" — likely floor/BG detection, using aligned centroid only")
                 else:
                     seg_mask = cand_mask
-                    Mm = cv2.moments(seg_mask)
-                    if Mm["m00"] > 0:
-                        obj_px = int(Mm["m10"] / Mm["m00"])
-                        obj_py = int(Mm["m01"] / Mm["m00"])
-                        print(f"   🎭 Valid fresh mask ({n_px}px) centroid=({obj_px},{obj_py})")
+                    obj_px, obj_py = find_optimal_grasp_point(seg_mask, (x1_a, y1_a, x2_a, y2_a), TARGET_DESC)
+                    print(f"   🎭 Valid fresh mask ({n_px}px) optimal grasp point=({obj_px},{obj_py}) (Neck/Cap target)")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -2750,14 +2848,14 @@ def main():
             
             xyz = None
             if seg_mask is not None:
-                result = cap.get_xyz_from_mask(seg_mask)
+                result = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
                 if result is not None:
                     cx_px, cy_px, z_mm = result
-                    # Full deproject using the mask centroid
-                    s = cap.get_xyz(int(cx_px), int(cy_px), search_w=5, search_h=5)
+                    # Full deproject using the optimal grasp point
+                    s = cap.get_xyz(int(cx_px), int(cy_px), search_w=7, search_h=7)
                     if s is not None:
                         xyz = s
-                        print(f"   🎭 Mask depth: centroid=({int(cx_px)},{int(cy_px)})  "
+                        print(f"   🎭 Mask depth (neck/top): point=({int(cx_px)},{int(cy_px)})  "
                               f"z={z_mm:.0f}mm  (from {np.sum(seg_mask==255)} mask pixels)")
 
             if xyz is None:
@@ -2791,13 +2889,13 @@ def main():
                 continue
 
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Starts at GRASP_PENETRATION_MM (27mm: center claw grasp with ~10mm clearance from the back servo),
+            # Starts at GRASP_PENETRATION_MM (22mm: center claw grasp with ~15mm clearance from the back servo),
             # adapting to shallower penetration if near the arm's physical reach boundary.
             penetration_candidates = [
                 GRASP_PENETRATION_MM,
                 GRASP_PENETRATION_MM - 3.0,
-                GRASP_PENETRATION_MM - 7.0,
-                18.0,
+                GRASP_PENETRATION_MM - 6.0,
+                14.0,
             ]
             grab_pos = None
             final_target = None
@@ -2842,7 +2940,7 @@ def main():
             if final_target is not None:
                 arm_x, arm_y, arm_z, pen_used = final_target
                 rho_t = math.sqrt(arm_x**2 + arm_y**2)
-                grasp_type = "PARALLEL GRASP (~10mm servo clearance)" if pen_used >= 20.0 else "ADAPTED SHALLOW GRASP"
+                grasp_type = "PARALLEL GRASP (~15mm servo clearance)" if pen_used >= 16.0 else "ADAPTED SHALLOW GRASP"
                 print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
                 print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Preferred Pitch={target_pitch:.1f}°")
 

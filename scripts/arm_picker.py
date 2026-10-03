@@ -183,15 +183,17 @@ PORT       = "/dev/arm_controller"
 ARM_ID     = "jetson_arm"
 
 # ── Detection ─────────────────────────────────────────────────────────────────
-TARGET_DESC      = "red ball"
-YOLO_CLASS_ID    = 32     # 32 = sports ball in standard COCO segmentation models
-TARGET_CLASS_IDS = [32]   # Set of active class IDs (supports multi-angle concepts)
+TARGET_DESC      = "bottle"
+YOLO_CLASS_ID    = 39     # 39 = bottle in standard COCO segmentation / detection models
+TARGET_CLASS_IDS = [39]   # Set of active class IDs
+YOLO_CONF        = 0.50   # Standard detection confidence (uncompromised high threshold)
 SKIP_MOONDREAM   = True   # Set False to re-enable Moondream semantic verification
 
 # ── Arm Geometry (SO-ARM101 — Physical Kinematic Constants) ───────────────────
 IK_L1 = 115.0   # shoulder pivot  → elbow pivot  (11.5 cm)
 IK_L2 = 137.5   # elbow pivot     → wrist flex pivot (13.75 cm)
 IK_L3 = 153.0   # wrist flex pivot → gripper fingertips (15.3 cm, matching teach_postures.py)
+IK_SHOULDER_HEIGHT_MM = 135.0  # Height of shoulder pivot above table/floor (mm)
 # Note: Maximum total physical reach of arm from base = 115 + 137.5 + 153 = 405.5 mm
 
 # Pan alignment calibration (measured: -4.6° corresponds to straight ahead X-axis)
@@ -234,9 +236,10 @@ D405_MIN_RANGE_MM = 70.0
 MAX_GRAB_DEPTH_MM = 380.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
-# Gripper throat depth is ~37mm. With 7.0mm penetration, the object is grasped near the claw tips
-# with a full 30mm of clearance away from the rear servo face, preventing pushing or toppling.
-GRASP_PENETRATION_MM = 7.0
+# Gripper throat depth is ~37mm. With 20.0mm penetration, the object is placed securely
+# between the rubber gripper pads (with ~17mm clearance from rear servo face), ensuring
+# firm grip without pushing or toppling.
+GRASP_PENETRATION_MM = 20.0
 
 # Preferred gripper approach pitch (degrees relative to horizontal table).
 # 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
@@ -244,9 +247,8 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 
 
 # Lateral gripper offset (mm) perpendicular to approach trajectory.
-# Positive (+ve) = shifts claw to the LEFT (aligns left claw with object edge, preventing tip poke)
-# Negative (-ve) = shifts claw to the RIGHT
-GRAB_LATERAL_OFFSET_MM = 12.0
+# 0.0 = centered directly on the object (eliminates side collisions that push the object)
+GRAB_LATERAL_OFFSET_MM = 0.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -334,11 +336,6 @@ ALIGN_MAX_PAN_DEG  = 5.0   # max pan speed (°/frame)
 ALIGN_MAX_WRIST_DEG = 5.0  # max wrist tilt speed (°/frame)
 ALIGN_MAX_LIFT_DEG = 2.5   # max shoulder lift speed (°/frame)
 
-ALIGN_INIT_PAN_K    = 0.20
-ALIGN_INIT_LIFT_K   = 0.15
-ALIGN_INIT_MAX_PAN  = 25.0
-ALIGN_INIT_MAX_LIFT = 12.0
-
 # ── Arm Positions ─────────────────────────────────────────────────────────────
 # Default fallback scan posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
 _BASE = {
@@ -393,16 +390,6 @@ def _load_reference_poses():
 
 # Load at import time if file exists
 _load_reference_poses()
-
-
-_ALIGN_READY = {
-    "shoulder_pan.pos":   -4.48,   # overwritten in pipeline to match target pan
-    "shoulder_lift.pos":  86.6,   # arm extended forward horizontally
-    "elbow_flex.pos":    -73.5,
-    "wrist_flex.pos":     -8.9,
-    "wrist_roll.pos":   -155.96,
-    "gripper.pos":        73.84,
-}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RealSense D405 camera stream
@@ -1417,51 +1404,6 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     return None
 
 
-def surface_proximity_depth(cap, obj_px: int, obj_py: int,
-                             inner_r: int = 35, outer_r: int = 80) -> float | None:
-    """
-    Sample depth in an annular ring around the ball centroid pixel to detect
-    the surface (floor/table) that the ball is resting on.
-
-    Returns the median depth (mm) of the surrounding surface, or None if not
-    enough valid pixels are available.
-
-    inner_r / outer_r: pixel radii defining the ring (excludes the ball itself).
-    """
-    with cap._lock:
-        depth_img = cap._depth_img
-        intr      = cap._intrinsics
-        scale     = cap._depth_scale
-    if depth_img is None or intr is None:
-        return None
-
-    h, w = depth_img.shape[:2]
-    # Build coordinate grids relative to centroid
-    ys, xs = np.ogrid[-outer_r:outer_r+1, -outer_r:outer_r+1]
-    r2 = xs**2 + ys**2
-    ring_mask = (r2 >= inner_r**2) & (r2 <= outer_r**2)
-
-    # Absolute pixel positions
-    row0 = max(0, obj_py - outer_r)
-    col0 = max(0, obj_px - outer_r)
-    row1 = min(h, obj_py + outer_r + 1)
-    col1 = min(w, obj_px + outer_r + 1)
-
-    rm_crop = ring_mask[
-        (row0 - (obj_py - outer_r)):(row1 - (obj_py - outer_r)),
-        (col0 - (obj_px - outer_r)):(col1 - (obj_px - outer_r))
-    ]
-    patch = depth_img[row0:row1, col0:col1]
-    if patch.shape != rm_crop.shape:
-        return None
-
-    depths = patch[rm_crop].astype(float) * scale * 1000.0   # → mm
-    valid = depths[(depths > D405_MIN_RANGE_MM) & (depths < MAX_GRAB_DEPTH_MM)]
-    if valid.size < 20:
-        return None
-    return float(np.median(valid))
-
-
 def depth_to_arm_target(xyz_cam: tuple[float, float, float],
                          robot,
                          penetration_mm: float | None = None,
@@ -2032,32 +1974,15 @@ def size_up_object(frame: np.ndarray | None,
         body_width_mm = float(np.percentile(valid_ws, 80)) if valid_ws else float(w_box * scale)
 
         if is_bottle_like:
-            # Determine which end is the narrower cap/neck end
-            top_w = np.median([w for w in widths_mm[:max(2, n_bins//4)] if w > 5.0]) if any(w > 5.0 for w in widths_mm[:n_bins//4]) else 999.0
-            bot_w = np.median([w for w in widths_mm[-max(2, n_bins//4):] if w > 5.0]) if any(w > 5.0 for w in widths_mm[-n_bins//4:]) else 999.0
-
-            cap_at_min = (top_w <= bot_w)
-            if cap_at_min:
-                search_indices = list(range(0, max(2, n_bins//4)))
-            else:
-                search_indices = list(range(max(0, n_bins - max(2, n_bins//4)), n_bins))
-
-            candidate_ws = [(widths_mm[idx], idx) for idx in search_indices if widths_mm[idx] >= GRIPPER_OPTIMAL_MIN_MM]
-            if candidate_ws:
-                candidate_ws.sort(key=lambda item: item[0])
-                thinnest_width_mm, best_idx = candidate_ws[0]
-                grasp_width_mm = thinnest_width_mm
-                s_opt = bin_centers[best_idx]
-                t_opt = mid_ts[best_idx]
-                opt_x = int(x1 + c_x + s_opt * v_maj[0] + t_opt * v_min[0])
-                opt_y = int(y1 + c_y + s_opt * v_maj[1] + t_opt * v_min[1])
-                height_pct = 92.0 if cap_at_min else 8.0
-            else:
-                thinnest_width_mm = float(np.min(valid_ws)) if valid_ws else 25.0
-                grasp_width_mm = thinnest_width_mm
-                opt_x = default_cx
-                opt_y = y1 + max(5, int(h_box * 0.08))
-                height_pct = 90.0
+            # Universal grasp target: center of mass (50% along principal axis)
+            # Upright, upside-down, tilted, or lying on tabletop:
+            # The midpoint of a bottle is ALWAYS the solid cylindrical body,
+            # providing balanced mass distribution without slipping off tapered neck/cap.
+            opt_x = int(np.clip(x1 + c_x, x1, x2))
+            opt_y = int(np.clip(y1 + c_y, y1, y2))
+            height_pct = 50.0
+            thinnest_width_mm = body_width_mm
+            grasp_width_mm = body_width_mm
         else:
             # Non-bottle objects: target centroid along major/minor axes
             opt_x = int(x1 + c_x)
@@ -2066,23 +1991,28 @@ def size_up_object(frame: np.ndarray | None,
             thinnest_width_mm = body_width_mm
             height_pct = 50.0
 
-        # Calculate recommended wrist_roll servo angle (symmetric within [-90°, +90°])
-        delta_roll = (tilt_deg + 90.0) % 180.0 - 90.0
-        recommended_roll = base_roll + delta_roll
+        # Calculate recommended wrist_roll servo angle
+        # Note: In arm kinematics, roll = -wrist_roll.pos, so delta_roll = -tilt_deg
+        # ensures the gripper jaws rotate in the exact same direction as the object tilt.
+        delta_roll = -tilt_deg
+        recommended_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
 
-        # Calculate adaptive approach pitch
+        # Calculate adaptive approach pitch:
+        # - Upright objects: level horizontal approach (pitch = 0°)
+        # - Tilted objects (25°-65°): angled approach (-20° to -45°)
+        # - Horizontal / tabletop objects (>65°): steep top-down approach (-70°)
         abs_tilt = abs(tilt_deg)
-        if abs_tilt <= 18.0:
+        if abs_tilt <= 25.0:
             recommended_pitch = 0.0   # Horizontal approach for upright objects
         elif abs_tilt < 65.0:
-            recommended_pitch = -float(np.clip(10.0 + abs_tilt * 0.5, 15.0, 45.0))   # Angled downward
+            recommended_pitch = -float(np.clip(15.0 + abs_tilt * 0.5, 20.0, 45.0))   # Angled downward
         else:
             recommended_pitch = -70.0  # Steep top-down approach for horizontal objects
 
     fits_gripper = (thinnest_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
     z_target_est = -130.0 + h_calc * (height_pct / 100.0) - 5.0
 
-    delta_roll_val = (tilt_deg + 90.0) % 180.0 - 90.0
+    delta_roll_val = -tilt_deg
     return {
         "body_width_mm": round(body_width_mm, 1),
         "thinnest_width_mm": round(thinnest_width_mm, 1),
@@ -2125,6 +2055,148 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
     if frame is not None:
         return canny_centre(frame, x1, y1, x2, y2)
     return default_cx, default_cy
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-Angle / Orientation-Invariant YOLO Inference
+# ═══════════════════════════════════════════════════════════════════════════════
+class DetectionBox:
+    def __init__(self, xyxy, cls_id, conf=0.8):
+        self.xyxy = np.array([xyxy], dtype=np.float32)
+        self.cls = np.array([cls_id], dtype=np.float32)
+        self.conf = np.array([conf], dtype=np.float32)
+
+class DetectionMasks:
+    def __init__(self, polygons):
+        self.xy = [np.array(p, dtype=np.float32) for p in polygons]
+
+class DetectionResult:
+    def __init__(self, boxes, masks=None):
+        self.boxes = boxes
+        self.masks = masks
+
+
+def derotate_detections(raw_result, rot_type: str, orig_w: int, orig_h: int) -> DetectionResult:
+    """
+    Transforms bounding boxes and segmentation masks from rotated inference image
+    back into the original camera image coordinate frame with exact pixel precision.
+    """
+    if raw_result is None or not hasattr(raw_result, 'boxes') or raw_result.boxes is None or len(raw_result.boxes) == 0:
+        return DetectionResult([])
+
+    new_boxes = []
+    new_masks_xy = []
+    has_masks = hasattr(raw_result, 'masks') and raw_result.masks is not None and hasattr(raw_result.masks, 'xy')
+
+    for i, box in enumerate(raw_result.boxes):
+        bx1, by1, bx2, by2 = map(float, box.xyxy[0].tolist())
+        cls_id = int(box.cls[0].item())
+        conf_val = float(box.conf[0].item()) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.8
+
+        poly = None
+        if has_masks and i < len(raw_result.masks.xy):
+            poly = np.array(raw_result.masks.xy[i], dtype=np.float32)
+
+        if rot_type == "rot90_cw":
+            pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.float32)
+            ox = pts[:, 1]
+            oy = (orig_h - 1) - pts[:, 0]
+            nx1, ny1, nx2, ny2 = float(np.min(ox)), float(np.min(oy)), float(np.max(ox)), float(np.max(oy))
+            if poly is not None and len(poly) > 0:
+                new_poly = np.column_stack([poly[:, 1], (orig_h - 1) - poly[:, 0]])
+                new_masks_xy.append(new_poly)
+
+        elif rot_type == "rot180":
+            nx1 = float((orig_w - 1) - bx2)
+            ny1 = float((orig_h - 1) - by2)
+            nx2 = float((orig_w - 1) - bx1)
+            ny2 = float((orig_h - 1) - by1)
+            if poly is not None and len(poly) > 0:
+                new_poly = np.column_stack([(orig_w - 1) - poly[:, 0], (orig_h - 1) - poly[:, 1]])
+                new_masks_xy.append(new_poly)
+
+        elif rot_type == "rot90_ccw":
+            pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.float32)
+            ox = (orig_w - 1) - pts[:, 1]
+            oy = pts[:, 0]
+            nx1, ny1, nx2, ny2 = float(np.min(ox)), float(np.min(oy)), float(np.max(ox)), float(np.max(oy))
+            if poly is not None and len(poly) > 0:
+                new_poly = np.column_stack([(orig_w - 1) - poly[:, 1], poly[:, 0]])
+                new_masks_xy.append(new_poly)
+
+        elif rot_type in ("rot45", "rot_neg45"):
+            angle = 45.0 if rot_type == "rot45" else -45.0
+            M_inv = cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), -angle, 1.0)
+            pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.float32)
+            orig_pts = cv2.transform(pts.reshape(1, -1, 2), M_inv)[0]
+            nx1 = float(np.clip(np.min(orig_pts[:, 0]), 0, orig_w - 1))
+            ny1 = float(np.clip(np.min(orig_pts[:, 1]), 0, orig_h - 1))
+            nx2 = float(np.clip(np.max(orig_pts[:, 0]), 0, orig_w - 1))
+            ny2 = float(np.clip(np.max(orig_pts[:, 1]), 0, orig_h - 1))
+            if poly is not None and len(poly) > 0:
+                new_poly = cv2.transform(poly.reshape(1, -1, 2), M_inv)[0]
+                new_masks_xy.append(new_poly)
+        else:
+            nx1, ny1, nx2, ny2 = bx1, by1, bx2, by2
+            if poly is not None:
+                new_masks_xy.append(poly)
+
+        new_boxes.append(DetectionBox([nx1, ny1, nx2, ny2], cls_id, conf_val))
+
+    masks_obj = DetectionMasks(new_masks_xy) if has_masks and len(new_masks_xy) > 0 else None
+    return DetectionResult(new_boxes, masks_obj)
+
+
+def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: float = 0.45, target_class_ids=None):
+    """
+    Multi-angle rotation-aware inference.
+    1. First tries normal 0° upright inference. If target is detected, returns immediately (zero overhead).
+    2. If no target is detected (e.g. bottle is lying on its side, upside down, or tilted),
+       tests rotated views where the object appears upright to standard YOLO weights.
+    3. De-rotates detected bounding boxes and masks back to the original image coordinate frame.
+    Guarantees detection at any angle without lowering confidence or adding extra vocabulary!
+    """
+    if model is None or frame is None or frame.size == 0:
+        return [DetectionResult([])]
+
+    # Step 1: Normal upright inference
+    results = model(frame, verbose=False, conf=conf, iou=iou)
+
+    target_found = False
+    if results and len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
+        if target_class_ids is None:
+            target_found = True
+        else:
+            for box in results[0].boxes:
+                if int(box.cls[0].item()) in target_class_ids:
+                    target_found = True
+                    break
+
+    if target_found:
+        return results
+
+    # Step 2: Test rotated views where non-upright objects appear upright to YOLO
+    orig_h, orig_w = frame.shape[:2]
+    rotations = [
+        ("rot90_cw", lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
+        ("rot90_ccw", lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        ("rot180", lambda img: cv2.rotate(img, cv2.ROTATE_180)),
+        ("rot45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), 45.0, 1.0), (orig_w, orig_h))),
+        ("rot_neg45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), -45.0, 1.0), (orig_w, orig_h))),
+    ]
+
+    for rot_name, rot_fn in rotations:
+        rot_frame = rot_fn(frame)
+        res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
+        if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
+            has_match = False
+            for box in res_rot[0].boxes:
+                if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
+                    has_match = True
+                    break
+            if has_match:
+                derotated_res = derotate_detections(res_rot[0], rot_name, orig_w, orig_h)
+                return [derotated_res]
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2241,7 +2313,7 @@ def align_arm(robot, cap: RealSenseStream, model,
         frame_cx = (w // 2) + ALIGN_PAN_OFFSET
         frame_cy =  h // 2
 
-        results = model(color, verbose=False)
+        results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
         found, center, area, src = tracker.detect(color, results, TARGET_CLASS_IDS)
 
         display = color.copy()
@@ -2346,14 +2418,6 @@ def align_arm(robot, cap: RealSenseStream, model,
         return False, None
 
 
-def _print_tuning_hints(sign_flip_count: int):
-    print("\n📐 ALIGNMENT TUNING HINTS:")
-    if sign_flip_count >= 3:
-        print(f"   ⚡ {sign_flip_count} oscillations → decrease ALIGN_PAN_K ({ALIGN_PAN_K})")
-    else:
-        print(f"   🐢 No oscillation → increase ALIGN_PAN_K ({ALIGN_PAN_K})")
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Calibration & Workspace Limit Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2456,69 +2520,6 @@ def demonstrate_workspace_boundaries(robot):
         smooth_move(robot, START_POS, step_size=3.0, step_delay=0.02)
 
 
-def demonstrate_raw_image_positions(robot):
-    """
-    Moves the arm to the EXACT joint angles captured in the user's calibration images,
-    bypassing IK completely.
-    """
-    positions = {
-        "1": ("Image 1 (Straight Out)", {
-            "shoulder_pan.pos": -4.6, "shoulder_lift.pos": 86.6,
-            "elbow_flex.pos": -80.5, "wrist_flex.pos": -8.9, "gripper.pos": 60.0
-        }),
-        "2": ("Image 2 (Touching floor, straight out)", {
-            "shoulder_pan.pos": -6.4, "shoulder_lift.pos": 104.2,
-            "elbow_flex.pos": -38.5, "wrist_flex.pos": -9.3, "gripper.pos": 60.0
-        }),
-        "3": ("Image 3 (Edge of main robot's frame)", {
-            "shoulder_pan.pos": -3.8, "shoulder_lift.pos": 81.4,
-            "elbow_flex.pos": 67.6, "wrist_flex.pos": -61.3, "gripper.pos": 60.0
-        }),
-        "4": ("Image 4 (Far left across 180° - floor)", {
-            "shoulder_pan.pos": -72.5, "shoulder_lift.pos": 86.6,
-            "elbow_flex.pos": -50.7, "wrist_flex.pos": 39.1, "gripper.pos": 60.0
-        }),
-        "5": ("Image 5 (Far left - level with frame)", {
-            "shoulder_pan.pos": -118.4, "shoulder_lift.pos": 86.6,
-            "elbow_flex.pos": -34.0, "wrist_flex.pos": -63.0, "gripper.pos": 60.0
-        }),
-        "6": ("Image 6 (Straight up)", {
-            "shoulder_pan.pos": -7.1, "shoulder_lift.pos": -3.0,
-            "elbow_flex.pos": -82.0, "wrist_flex.pos": -1.1, "gripper.pos": 60.0
-        }),
-        "7": ("Default Scan Posture (_BASE)", _BASE),
-        "8": ("Image 8 (Far right across 180° - floor)  [mirror of Image 4]", {
-            "shoulder_pan.pos": +72.5, "shoulder_lift.pos": 86.6,
-            "elbow_flex.pos": -50.7, "wrist_flex.pos": 39.1, "gripper.pos": 60.0
-        }),
-        "9": ("Image 9 (Far right - level with frame)  [mirror of Image 5]", {
-            "shoulder_pan.pos": +113.8, "shoulder_lift.pos": 86.6,
-            "elbow_flex.pos": -34.0, "wrist_flex.pos": -63.0, "gripper.pos": 60.0
-        }),
-    }
-
-    print("\n" + "═"*65)
-    print(" 📸 EXACT IMAGE CALIBRATION POSTURES (RAW JOINTS)")
-    print("═"*65)
-    for key, (name, _) in positions.items():
-        print(f"   [{key}] {name}")
-    print("   [0] Return to Main Menu")
-    print("═"*65)
-    
-    while True:
-        choice = input("\nSelect a posture to move to (0-9): ").strip()
-        if choice == "0":
-            break
-        if choice in positions:
-            name, target_pos = positions[choice]
-            print(f"▶ Moving to {name}...")
-            print(f"   Joints: Pan={target_pos.get('shoulder_pan.pos',0):.1f}°, Lift={target_pos.get('shoulder_lift.pos',0):.1f}°, "
-                  f"Elb={target_pos.get('elbow_flex.pos',0):.1f}°, Wst={target_pos.get('wrist_flex.pos',0):.1f}°")
-            smooth_move(robot, target_pos, step_size=2.0, step_delay=0.03)
-        else:
-            print("Invalid choice. Enter 0-9.")
-
-
 def run_manual_calibration(robot):
     """
     Cuts motor torque, allowing the user to move the arm manually by hand.
@@ -2602,11 +2603,10 @@ def main():
     print("   [1] Vision Alignment + Manual Lunge Demonstration")
     print("   [2] View Theoretical Arm Workspace Limits & Edge Boundaries")
     print("   [3] Record / Teach Reference Postures (Scan & Stow) [Torque OFF]")
-    print("   [4] Move to Exact Calibrated Image Postures (Raw Joints)")
-    print("   [5] Test Full Automatic Pick-and-Place (Vision + IK Lunge)")
-    print("   [6] Exit")
+    print("   [4] Test Full Automatic Pick-and-Place (Vision + IK Lunge)")
+    print("   [5] Exit")
     print("═"*65)
-    choice = input("Enter choice (1-6): ").strip()
+    choice = input("Enter choice (1-5): ").strip()
 
     if choice == "2":
         show_workspace_limits()
@@ -2631,17 +2631,10 @@ def main():
         finally:
             robot.disconnect()
         return
-    elif choice == "4":
-        robot = connect_robot()
-        try:
-            demonstrate_raw_image_positions(robot)
-        finally:
-            robot.disconnect()
-        return
-    elif choice == "6":
+    elif choice == "5":
         print("Exiting.")
         return
-    elif choice not in ["1", "5"]:
+    elif choice not in ["1", "4"]:
         print("Invalid selection. Exiting.")
         return
         
@@ -2683,18 +2676,8 @@ def main():
     print(f"Loading YOLO model: {chosen_path}...")
     model = YOLO(chosen_path)
     if "world" in chosen_path.lower() or hasattr(model, "set_classes"):
-        # Auto-expand multi-angle semantic concepts internally so the user doesn't have to write complex queries
         user_target = TARGET_DESC.strip()
         query_variants = [user_target]
-        if "bottle" in user_target.lower():
-            for v in ["bottle", "tilted bottle", "horizontal bottle", "drink container"]:
-                if v not in query_variants:
-                    query_variants.append(v)
-        elif "cup" in user_target.lower() or "mug" in user_target.lower():
-            for v in ["tilted cup", "lying cup"]:
-                if v not in query_variants:
-                    query_variants.append(v)
-
         model.set_classes(query_variants)
         TARGET_CLASS_IDS = list(range(len(query_variants)))
         YOLO_CLASS_ID = 0  # Primary class ID
@@ -2712,7 +2695,7 @@ def main():
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
     _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
     try:
-        model(_dummy, verbose=False, conf=0.5)
+        model(_dummy, verbose=False, conf=YOLO_CONF)
     except Exception:
         pass  # ignore warmup errors — just ensure cuda graph is built
     print("   ✅ YOLO warmup complete")
@@ -2842,7 +2825,7 @@ def main():
                 continue
             last_yolo_t = time.time()
 
-            results = model(color, verbose=False, conf=0.5)
+            results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
             
             # ── Draw YOLO detections ──────────────────────────────────────────
             target_box     = None
@@ -2855,7 +2838,23 @@ def main():
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
                     box_w, box_h = max(10, bx2 - bx1), max(10, by2 - by1)
                     
-                    if cap.get_xyz(cx, cy, search_w=box_w//2, search_h=box_h//2) is None:
+                    depth_sample = cap.get_xyz(cx, cy, search_w=box_w//2, search_h=box_h//2)
+                    if depth_sample is None:
+                        # Grid sample across box for diagonal or tilted objects
+                        grid_samples = [
+                            (bx1 + box_w // 4, by1 + box_h // 4),
+                            (bx1 + 3 * box_w // 4, by1 + box_h // 4),
+                            (bx1 + box_w // 4, by1 + 3 * box_h // 4),
+                            (bx1 + 3 * box_w // 4, by1 + 3 * box_h // 4),
+                            (bx1 + box_w // 2, by1 + box_h // 4),
+                            (bx1 + box_w // 2, by1 + 3 * box_h // 4),
+                        ]
+                        for sx, sy in grid_samples:
+                            depth_sample = cap.get_xyz(sx, sy, search_w=max(10, box_w // 3), search_h=max(10, box_h // 3))
+                            if depth_sample is not None:
+                                break
+
+                    if depth_sample is None:
                         cv2.rectangle(display, (bx1, by1), (bx2, by2), (0,0,255), 2)
                         cv2.putText(display, "OUT OF DEPTH FOV", (bx1, by1-10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
@@ -2947,7 +2946,7 @@ def main():
 
             obj_px, obj_py = final_pixel
 
-            print("✅ Ball centred — calculating direct trajectory...")
+            print(f"✅ Target ({TARGET_DESC}) centred — calculating direct trajectory...")
             STATE = "GRABBING"
             print("\n🎯 Reading depth for IK from scan posture...")
 
@@ -2963,23 +2962,36 @@ def main():
             # We must recalculate the mask because the camera has moved during alignment.
             color_aligned, _, _ = cap.read()
             h_a, w_a = color_aligned.shape[:2]
-            results_aligned = model(color_aligned, verbose=False, conf=0.35)
+            results_aligned = detect_with_rotation(model, color_aligned, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
             seg_mask = None
             
             best_idx = -1
             min_dist = float('inf')
             x1_a = y1_a = x2_a = y2_a = 0
-            MAX_ALIGN_DIST = 120.0  # max allowable distance from aligned center
+            MAX_ALIGN_DIST = 200.0  # max allowable distance from aligned center
             
             if results_aligned[0].boxes is not None:
                 for idx, box in enumerate(results_aligned[0].boxes):
                     if int(box.cls[0]) in TARGET_CLASS_IDS:
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
                         cx_a = (bx1 + bx2) / 2
-                        dist = math.hypot(cx_a - obj_px, by1 - obj_py)
-                        if dist < min_dist and dist <= MAX_ALIGN_DIST:
+                        cy_a = (by1 + by2) / 2
+                        dist = math.hypot(cx_a - obj_px, cy_a - obj_py)
+                        if dist < min_dist:
                             min_dist = dist
                             best_idx = idx
+                if best_idx >= 0 and min_dist > MAX_ALIGN_DIST:
+                    # If all boxes were further than MAX_ALIGN_DIST, pick the one closest to frame center
+                    center_min = float('inf')
+                    for idx, box in enumerate(results_aligned[0].boxes):
+                        if int(box.cls[0]) in TARGET_CLASS_IDS:
+                            bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                            cx_a = (bx1 + bx2) / 2
+                            cy_a = (by1 + by2) / 2
+                            dist_c = math.hypot(cx_a - (w_a / 2), cy_a - (h_a / 2))
+                            if dist_c < center_min:
+                                center_min = dist_c
+                                best_idx = idx
             
             sizing = None
             if best_idx >= 0:
@@ -2999,21 +3011,21 @@ def main():
                         cand_mask = m
                         seg_mask = cand_mask
                     else:
-                        print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit) — using bounding-box cap target")
+                        print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit) — using bounding-box target")
 
                 sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
                 obj_px, obj_py = sizing["opt_px"]
-                fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow neck"
+                fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
                 print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
                       f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
                 print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py}) (Cap/Neck grasp)")
+                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py})")
             elif tracker.last_box is not None:
                 x1_a, y1_a, x2_a, y2_a = tracker.last_box
                 sizing = size_up_object(color_aligned, None, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
                 obj_px, obj_py = sizing["opt_px"]
                 print(f"   📐 Orientation (from tracked box): Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-                print(f"   🎯 Using tracked grasp point: ({obj_px},{obj_py}) (Cap/Neck grasp)")
+                print(f"   🎯 Using tracked grasp point: ({obj_px},{obj_py})")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -3033,25 +3045,29 @@ def main():
             if seg_mask is not None:
                 xyz = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
                 if xyz is not None and xyz[2] <= MAX_GRAB_DEPTH_MM:
-                    print(f"   🎭 Mask depth (cap/neck): x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
+                    print(f"   🎭 Mask depth: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
                           f"(from {np.sum(seg_mask==255)} mask pixels)")
                 else:
                     xyz = None
 
             if xyz is None:
-                # Tightly centered depth samples along the cap and upper neck of the bottle
-                # Samples at cap, and 10% / 15% / 25% down the neck to guarantee valid depth without table contamination
+                # Centered depth samples along the target grasp point and object body
                 xyz_samples  = []
-                sample_pts = [(obj_px, obj_py)]
+                c_box_x = (x1_a + x2_a) // 2
+                c_box_y = (y1_a + y2_a) // 2
+                sample_pts = [
+                    (obj_px, obj_py),
+                    (c_box_x, c_box_y),
+                    ((obj_px + c_box_x) // 2, (obj_py + c_box_y) // 2),
+                ]
                 if (best_idx >= 0 or tracker.last_box is not None) and y2_a > y1_a:
                     h_b = y2_a - y1_a
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.10))))
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.15))))
                     sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.25))))
+                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.50))))
 
                 for pt in sample_pts:
                     for _ in range(2):
-                        s = cap.get_xyz(pt[0], pt[1], search_w=12, search_h=12)
+                        s = cap.get_xyz(pt[0], pt[1], search_w=14, search_h=14)
                         if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
                             xyz_samples.append(s)
                         time.sleep(0.015)
@@ -3094,13 +3110,14 @@ def main():
                 sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC)
 
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Starts at GRASP_PENETRATION_MM (7.0mm: tip grasp with ~30mm clearance from the back servo),
-            # adapting to shallower penetration (4.0mm, 0.0mm, -4.0mm) to guarantee the gripper NEVER pushes or topples the bottle.
+            # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
+            # securely between the rubber gripper pads (~17mm clearance from rear servo face).
+            # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
             penetration_candidates = [
-                GRASP_PENETRATION_MM,         # 7.0mm: 30mm clearance from rear servo face
-                GRASP_PENETRATION_MM - 3.0,   # 4.0mm: 33mm clearance
-                0.0,                          # 0.0mm: 37mm clearance (tips at surface)
-                -4.0,                         # -4.0mm: 41mm clearance (tips 4mm standoff)
+                GRASP_PENETRATION_MM,         # 20.0mm: ~17mm clearance from rear servo face
+                GRASP_PENETRATION_MM - 4.0,   # 16.0mm: ~21mm clearance
+                GRASP_PENETRATION_MM - 8.0,   # 12.0mm: ~25mm clearance
+                8.0,                          # 8.0mm: firm pad grip
             ]
             grab_pos = None
             final_target = None
@@ -3130,30 +3147,12 @@ def main():
                     arm_y +=  eff_lat * math.cos(pan_t)
                     arm_z +=  eff_vert
 
-                # ── Cap Grasp Height Guard & Tabletop Safeguard ───────────────
-                is_bottle_like = any(w in TARGET_DESC.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
-                tilt_mag = abs(sizing.get("tilt_deg", 0.0)) if sizing is not None else 0.0
-                if is_bottle_like and sizing is not None and tilt_mag <= 25.0:
-                    # Upright bottle: apply cap elevation guard relative to base
-                    z_bottom = -130.0
-                    intr = cap._intrinsics
-                    if intr is not None and best_idx >= 0 and y2_a > 0:
-                        cx_a = (x1_a + x2_a) / 2.0
-                        pt_b3d = rs.rs2_deproject_pixel_to_point(intr, [float(cx_a), float(y2_a)], xyz[2] / 1000.0)
-                        b_target = depth_to_arm_target((pt_b3d[0]*1000.0, pt_b3d[1]*1000.0, xyz[2]), robot, penetration_mm=0.0, verbose=False)
-                        if b_target is not None:
-                            z_bottom = max(-130.0, b_target[2])
-
-                    z_neck_target = z_bottom + sizing["height_mm"] * (sizing["height_pct"] / 100.0) - 5.0
-                    if arm_z < z_neck_target:
-                        print(f"   👑 Cap Elevation Guard: arm_z was {arm_z:+.0f}mm (body/table level) → elevating to {z_neck_target:+.0f}mm (thinnest neck/cap at {sizing['height_pct']:.0f}% height, width={sizing['grasp_width_mm']}mm)")
-                        arm_z = z_neck_target
-                else:
-                    # Tilted, angled, or tabletop object: safeguard against sinking below table surface
-                    table_floor_z = -135.0
-                    if arm_z < table_floor_z:
-                        print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {table_floor_z:.0f}mm) → elevating to {table_floor_z:.0f}mm")
-                        arm_z = table_floor_z
+                # ── Tabletop Safeguard ───────────────
+                # Prevents claw from sinking into the table/floor surface
+                table_floor_z = -135.0
+                if arm_z < table_floor_z:
+                    print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {table_floor_z:.0f}mm) → elevating to {table_floor_z:.0f}mm")
+                    arm_z = table_floor_z
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue
@@ -3203,7 +3202,7 @@ def main():
                 print(" The robot has finished visual alignment and calculated the target!")
                 print(f" Target coordinates: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm")
                 print("\n Disabling motor torque... You can now move the arm manually by hand.")
-                print(" Mimic the perfect lunge from this current position to grab the ball.")
+                print(f" Mimic the perfect lunge from this current position to grab the {TARGET_DESC}.")
                 print(" Hold the arm exactly where you want the lunge to end, then press ENTER in terminal.")
                 print("═"*65 + "\n")
                 
@@ -3257,7 +3256,7 @@ def main():
 
                     # Mask direction bit 10 (0x400 = 1024) to get true load magnitude (0-1023)
                     load_mag = abs(int(load)) & 0x03FF
-                    if load_mag > 150:
+                    if (time.time() - start_t > 0.15) and load_mag > 150:
                         try:
                             current_g = get_pos(robot).get("gripper.pos", 20.0)
                             current_g = max(current_g - 15.0, 0.7)

@@ -285,7 +285,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # Lateral gripper offset (mm) along jaw opening axis.
 # Positive (+ve) = shifts claw to the LEFT (away from the static pincer)
 # Centers the open jaws over the object and prevents static pincer poke on angled/tilted bottles.
-GRAB_LATERAL_OFFSET_MM = 14.0
+GRAB_LATERAL_OFFSET_MM = 18.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -2155,12 +2155,6 @@ def solve_optimal_roll(pan_deg: float, pitch_deg: float, V_obj: np.ndarray, base
     if norm_J > 1e-6:
         J /= norm_J
 
-    # Ensure J points to the LEFT (in positive Y / pan-left direction relative to reach)
-    pan_rad = math.radians(pan_deg)
-    left_ref = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0])
-    if float(np.dot(J, left_ref)) < 0.0:
-        J = -J
-
     err = abs(float(np.dot(J, V)))
     return best_roll, J, err
 
@@ -2474,11 +2468,11 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
         return results
 
     # Step 2: Test rotated views where non-upright objects appear upright to YOLO
+    # 90° CW turns horizontal cylinders vertical (covers all flat/tabletop orientations).
+    # 45° and -45° cover diagonal cylinders across 3D space.
     orig_h, orig_w = frame.shape[:2]
     rotations = [
         ("rot90_cw", lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
-        ("rot90_ccw", lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-        ("rot180", lambda img: cv2.rotate(img, cv2.ROTATE_180)),
         ("rot45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), 45.0, 1.0), (orig_w, orig_h))),
         ("rot_neg45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), -45.0, 1.0), (orig_w, orig_h))),
     ]
@@ -2497,6 +2491,67 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
                 return [derotated_res]
 
     return results
+
+
+class AsyncYOLODetector:
+    """
+    Asynchronous YOLO-World inference worker.
+    Runs multi-angle rotated inference in a background thread so the camera stream
+    and OpenCV display loop run at uncapped hardware speed (~90-120 FPS).
+    """
+    def __init__(self, model, conf: float = 0.50, iou: float = 0.45, target_class_ids=None):
+        self.model = model
+        self.conf = conf
+        self.iou = iou
+        self.target_class_ids = target_class_ids
+        self._lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_results = None
+        self._latest_timestamp = 0.0
+        self._running = True
+        self._new_frame_evt = threading.Event()
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def submit_frame(self, frame: np.ndarray):
+        """Pass the newest camera frame to the background detector."""
+        if frame is None or frame.size == 0:
+            return
+        with self._lock:
+            self._latest_frame = frame
+        self._new_frame_evt.set()
+
+    def get_latest(self) -> tuple[any, float]:
+        """Returns (latest_results, timestamp_of_detection)."""
+        with self._lock:
+            return self._latest_results, self._latest_timestamp
+
+    def _worker_loop(self):
+        while self._running:
+            if not self._new_frame_evt.wait(timeout=0.05):
+                continue
+            self._new_frame_evt.clear()
+
+            with self._lock:
+                frame = self._latest_frame
+            if frame is None or not self._running:
+                continue
+
+            try:
+                results = detect_with_rotation(
+                    self.model, frame,
+                    conf=self.conf, iou=self.iou,
+                    target_class_ids=self.target_class_ids
+                )
+                with self._lock:
+                    self._latest_results = results
+                    self._latest_timestamp = time.time()
+            except Exception:
+                time.sleep(0.01)
+
+    def stop(self):
+        self._running = False
+        self._new_frame_evt.set()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2584,7 +2639,7 @@ class ObjectTracker:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Visual servoing alignment loop
 # ═══════════════════════════════════════════════════════════════════════════════
-def align_arm(robot, cap: RealSenseStream, model,
+def align_arm(robot, cap: RealSenseStream, detector_or_model,
               tracker: ObjectTracker,
               max_frames: int | None = None) -> tuple[bool, tuple[int, int] | None]:
     """
@@ -2608,12 +2663,18 @@ def align_arm(robot, cap: RealSenseStream, model,
     start_grp   = initial_pos.get("gripper.pos", 60.0)
 
     for frame_idx in range(effective_max):
-        color, has_depth, depth_colormap = cap.read()
+        color, has_depth, depth_colormap = cap.read(wait_new=True, timeout=0.02)
+        if color is None:
+            continue
         h, w     = color.shape[:2]
         frame_cx = (w // 2) + ALIGN_PAN_OFFSET
         frame_cy =  h // 2
 
-        results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+        if isinstance(detector_or_model, AsyncYOLODetector):
+            detector_or_model.submit_frame(color)
+            results, _ = detector_or_model.get_latest()
+        else:
+            results = detect_with_rotation(detector_or_model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
         found, center, area, src = tracker.detect(color, results, TARGET_CLASS_IDS)
 
         display = color.copy()
@@ -3060,6 +3121,10 @@ def main():
     time.sleep(1.0)
 
 
+    # ── Background Async YOLO Worker ───────────────────────────────────────────
+    print("⚡ Starting asynchronous YOLO worker thread for uncapped 120 FPS vision...")
+    detector = AsyncYOLODetector(model, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+
     last_yolo_t = 0.0
     STATE       = "SEARCHING"
     sweep_dir   = 1.0
@@ -3073,6 +3138,10 @@ def main():
             return
         _arm_is_stowed[0] = True
         print("\n⚠️  Emergency stow triggered...")
+        try:
+            detector.stop()
+        except Exception:
+            pass
         try:
             # Probe the arm first — if it's dead (power-lost / disconnected)
             # smooth_move will raise ConnectionError and corrupt state further.
@@ -3098,12 +3167,15 @@ def main():
 
     try:
         while True:
-            color, has_depth, depth_colormap = cap.read()
+            color, has_depth, depth_colormap = cap.read(wait_new=True, timeout=0.02)
             if color is None or not has_depth:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
             h, w = color.shape[:2]
             frame_cx, frame_cy = w // 2, h // 2
+
+            # Submit newest camera frame to background YOLO worker
+            detector.submit_frame(color)
 
             # ── HUD base ──────────────────────────────────────────────────────
             display = color.copy()
@@ -3122,7 +3194,7 @@ def main():
                 cv2.putText(display, f"depth: {d_mm:.0f}mm",
                             (w - 160, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, depth_color, 2)
 
-            # ── Live FPS calculation and overlay ──────────────────────────────
+            # ── Live FPS calculation and overlay (Uncapped Hardware Rate) ──────
             t_now = time.time()
             dt = t_now - _last_fps_t[0]
             _last_fps_t[0] = t_now
@@ -3136,21 +3208,16 @@ def main():
                 cv2.putText(display, f"STATE: {STATE} | YOLO: {TARGET_DESC}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-            # ── Throttle YOLO to ~5 fps during search ─────────────────────────
-            if time.time() - last_yolo_t < 0.2:
-                _show_frame("Picker Vision", _make_vis(display, depth_colormap))
-                if not HEADLESS: cv2.waitKey(1)
-                continue
-            last_yolo_t = time.time()
-
-            results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+            # ── Query latest background detection (Zero Latency Video Stream) ──
+            results, res_t = detector.get_latest()
             
             # ── Draw YOLO detections ──────────────────────────────────────────
             target_box     = None
             target_box_idx = -1
-            for i, box in enumerate(results[0].boxes):
-                if int(box.cls[0].item()) in TARGET_CLASS_IDS:
-                    bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+            if results is not None and len(results) > 0 and results[0].boxes is not None:
+                for i, box in enumerate(results[0].boxes):
+                    if int(box.cls[0].item()) in TARGET_CLASS_IDS:
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
                     
                     # Check if the bounding box has ANY valid depth inside it
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
@@ -3255,7 +3322,7 @@ def main():
             print(f"🎯 Aligning arm to {TARGET_DESC} (scan pose)...")
             tracker = ObjectTracker()
             tracker.lock_on(color, x1, y1, x2, y2)
-            aligned, final_pixel = align_arm(robot, cap, model, tracker)
+            aligned, final_pixel = align_arm(robot, cap, detector, tracker)
             if not aligned or final_pixel is None:
                 print("❌ Alignment failed — restarting search")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
@@ -3588,11 +3655,21 @@ def main():
                 print("\n🔍 Search loop resumed\n")
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
-                print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
-                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
+                # Stage 1: Pre-orient wrist roll & open jaws wide at safe standoff distance
+                # Eliminates static pincer sweeping collision during the reach forward
+                print("\n🦾 PRE-ORIENTING WRIST ROLL & OPENING JAWS...")
+                standoff_pose = dict(get_pos(robot))
+                standoff_pose["wrist_roll.pos"] = grab_pos.get("wrist_roll.pos", target_roll)
+                standoff_pose["gripper.pos"] = 85.0
+                smooth_move(robot, standoff_pose, step_size=2.0, step_delay=0.02)
+                time.sleep(0.15)
+
+                # Stage 2: Pure translation approach along approach trajectory
+                print("🦾 APPROACHING (aligned gripper, jaws wide open)...")
+                grab_pos["gripper.pos"] = 85.0
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
-                time.sleep(0.4)
+                time.sleep(0.3)
 
     
                 print("✊ GRIPPING (Adaptive Maximum Speed)...")
@@ -3696,6 +3773,10 @@ def main():
     finally:
         try:
             atexit.unregister(_emergency_stow)
+        except Exception:
+            pass
+        try:
+            detector.stop()
         except Exception:
             pass
         try:

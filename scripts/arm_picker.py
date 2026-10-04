@@ -40,7 +40,48 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 # ─────────────────────────────────────────────────────────────────────────────
 """
 import os, sys, yaml
-from datetime import datetime
+# ── JetPack / aarch64 CUDA Runtime & Memory Safety ───────────────────────────
+# On NVIDIA Jetson, torch MUST be imported before cv2 to properly initialize
+# the CUDA runtime and OpenMP memory allocators cleanly. Importing cv2 first
+# causes native glibc heap corruption ("corrupted size vs. prev_size").
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
+# Prevent PyTorch/Ultralytics Conv+BN fusion glibc heap corruption on Jetson
+if torch is not None:
+    try:
+        import torch.nn.utils.fusion as _fusion
+        _fusion.fuse_conv_bn_weights = lambda conv_w, bn_w, bn_b=None, bn_rm=None, bn_rv=None, eps=1e-5: (conv_w, bn_b)
+    except Exception:
+        pass
+
+try:
+    import ultralytics.utils.torch_utils as _utu
+    _utu.fuse_conv_and_bn = lambda c, b: c
+except Exception:
+    pass
+
+try:
+    import ultralytics.nn.tasks as _tasks
+    if hasattr(_tasks, "BaseModel"):
+        _tasks.BaseModel.is_fused = lambda self: True
+        _tasks.BaseModel.fuse = lambda self, *args, **kwargs: self
+    if hasattr(_tasks, "DetectionModel"):
+        _tasks.DetectionModel.is_fused = lambda self: True
+        _tasks.DetectionModel.fuse = lambda self, *args, **kwargs: self
+    if hasattr(_tasks, "WorldModel"):
+        _tasks.WorldModel.is_fused = lambda self: True
+        _tasks.WorldModel.fuse = lambda self, *args, **kwargs: self
+except Exception:
+    pass
+
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 try:
@@ -48,11 +89,6 @@ try:
 except ImportError:
     rs = None
 import requests
-
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
 
 # ── Native Jetson Monitor Display Setup ───────────────────────────────────────
 HEADLESS = False
@@ -2055,6 +2091,191 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
     if frame is not None:
         return canny_centre(frame, x1, y1, x2, y2)
     return default_cx, default_cy
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3D Depth Orientation & Tabletop Span Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
+                           seg_mask: np.ndarray | None = None,
+                           sizing: dict | None = None) -> dict:
+    """
+    3D Orientation & Geometric Span Analysis:
+    Disambiguates objects lying flat on the tabletop vs. standing upright in true 3D space,
+    solving the 2D projection ambiguity where a bottle lying flat pointing towards the arm
+    appears as a vertical rectangle (tilt ≈ 0°) in the camera image.
+
+    Samples points along the object's primary axis, queries depth via RealSense,
+    projects each point to the arm base coordinate frame, and calculates true physical
+    horizontal (XY) and vertical (Z) spans.
+
+    Returns:
+        is_lying_flat (bool): True if horizontal tabletop span >> vertical elevation span
+        h_span_mm (float): physical length spanning the horizontal XY plane
+        v_span_mm (float): physical elevation span along the Z axis
+        target_pitch_deg (float): -70.0° for lying flat (top-down), or horizontal/angled
+        target_roll_deg (float): recommended wrist_roll servo angle
+        delta_roll_deg (float): roll offset relative to neutral
+        midpoint_base (tuple | None): (X, Y, Z) midpoint along the object length in base coordinates
+        midpoint_cam (tuple | None): (X, Y, Z) midpoint in camera coordinates
+        yaw_deg (float): orientation angle on tabletop relative to radial reach line
+        confidence (str): quality indicator of the 3D analysis
+    """
+    x1, y1, x2, y2 = bbox
+    w_box = max(10, x2 - x1)
+    h_box = max(10, y2 - y1)
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+
+    # Baseline defaults
+    base_roll = START_POS.get("wrist_roll.pos", -68.62) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", -68.62)
+    default_pitch = sizing.get("recommended_pitch_deg", PREFERRED_GRAB_PITCH_DEG) if sizing else PREFERRED_GRAB_PITCH_DEG
+    default_roll  = sizing.get("recommended_roll_deg", base_roll) if sizing else base_roll
+    default_delta = sizing.get("delta_roll_deg", 0.0) if sizing else 0.0
+
+    # Determine 2D sampling axis from sizing or bounding box
+    tilt_deg = sizing.get("tilt_deg", 0.0) if sizing else 0.0
+    theta_rad = math.radians(tilt_deg + 90.0)
+    ux = math.cos(theta_rad)
+    uy = math.sin(theta_rad)
+
+    # Half-span in pixels along the axis
+    L_px = math.hypot(w_box, h_box) * 0.42
+
+    sample_fractions = [-0.35, -0.20, 0.0, 0.20, 0.35]
+    sample_pixels = []
+    for f in sample_fractions:
+        px = int(np.clip(cx + f * L_px * ux, x1 + 2, x2 - 2))
+        py = int(np.clip(cy + f * L_px * uy, y1 + 2, y2 - 2))
+        sample_pixels.append((px, py))
+
+    # Centerline samples for vertical bounding boxes
+    if abs(tilt_deg) <= 30.0:
+        for f_y in [0.20, 0.35, 0.50, 0.65, 0.80]:
+            py_box = int(np.clip(y1 + f_y * h_box, y1 + 2, y2 - 2))
+            if (cx, py_box) not in sample_pixels:
+                sample_pixels.append((cx, py_box))
+
+    # Query 3D camera coordinates and convert to arm base frame
+    valid_samples = []
+    for px, py in sample_pixels:
+        query_px, query_py = px, py
+        if seg_mask is not None and seg_mask.size > 0:
+            if seg_mask[py, px] == 0:
+                y_lo, y_hi = max(0, py - 7), min(seg_mask.shape[0], py + 8)
+                x_lo, x_hi = max(0, px - 7), min(seg_mask.shape[1], px + 8)
+                sub = seg_mask[y_lo:y_hi, x_lo:x_hi]
+                my, mx = np.where(sub == 255)
+                if len(my) > 0:
+                    query_px = x_lo + int(mx[len(mx) // 2])
+                    query_py = y_lo + int(my[len(my) // 2])
+
+        xyz_c = cap.get_xyz(query_px, query_py, search_w=16, search_h=16)
+        if xyz_c is not None and 70.0 < xyz_c[2] <= MAX_GRAB_DEPTH_MM:
+            pt_b = depth_to_arm_target(xyz_c, robot, penetration_mm=0.0, verbose=False)
+            if pt_b is not None:
+                valid_samples.append((query_px, query_py, xyz_c, pt_b))
+
+    if len(valid_samples) < 2:
+        return {
+            "is_lying_flat": False,
+            "h_span_mm": 0.0,
+            "v_span_mm": 0.0,
+            "target_pitch_deg": default_pitch,
+            "target_roll_deg": default_roll,
+            "delta_roll_deg": default_delta,
+            "midpoint_base": None,
+            "midpoint_cam": None,
+            "yaw_deg": 0.0,
+            "confidence": "insufficient_3d_samples"
+        }
+
+    pts_b = [s[3] for s in valid_samples]
+    pts_c = [s[2] for s in valid_samples]
+    xs = [p[0] for p in pts_b]
+    ys = [p[1] for p in pts_b]
+    zs = [p[2] for p in pts_b]
+
+    dx_all = max(xs) - min(xs)
+    dy_all = max(ys) - min(ys)
+    h_span = math.hypot(dx_all, dy_all)
+    v_span = max(zs) - min(zs)
+
+    p_near = min(pts_b, key=lambda p: math.hypot(p[0], p[1]))
+    p_far  = max(pts_b, key=lambda p: math.hypot(p[0], p[1]))
+    end_dx = p_far[0] - p_near[0]
+    end_dy = p_far[1] - p_near[1]
+    end_dz = abs(p_far[2] - p_near[2])
+    end_dist = math.hypot(end_dx, end_dy)
+
+    # 3D Disambiguation:
+    # Lying flat on tabletop: both ends rest on table (v_span <= 45mm), length spans table (h_span >= 60mm).
+    # Standing upright: v_span >= 100mm, h_span <= 40mm.
+    is_lying_flat = (h_span > v_span + 25.0) or (v_span < 45.0 and h_span > 60.0)
+
+    mid_x_b = (p_near[0] + p_far[0]) / 2.0
+    mid_y_b = (p_near[1] + p_far[1]) / 2.0
+    mid_z_b = (p_near[2] + p_far[2]) / 2.0
+    mid_idx = len(pts_c) // 2
+    midpoint_cam = pts_c[mid_idx]
+
+    table_floor_z = -135.0
+    safe_z_b = max(table_floor_z + 15.0, mid_z_b)
+    midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
+
+    if is_lying_flat:
+        target_pitch = -70.0   # Steep top-down approach from above table
+
+        bottle_yaw_rad = math.atan2(end_dy, end_dx)
+        pan_rad = math.atan2(mid_y_b, mid_x_b)
+        rel_rad = bottle_yaw_rad - pan_rad
+        rel_deg = math.degrees(rel_rad)
+
+        while rel_deg > 90.0:
+            rel_deg -= 180.0
+        while rel_deg < -90.0:
+            rel_deg += 180.0
+
+        delta_roll = -rel_deg
+        target_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
+
+        yaw_desc = "pointing towards arm" if abs(rel_deg) <= 25.0 else (
+            "sideways" if abs(abs(rel_deg) - 90.0) <= 25.0 else f"angled {rel_deg:+.1f}°"
+        )
+        print(f"   📐 3D Analysis: Object is LYING FLAT on table ({yaw_desc}) | "
+              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm (EndDist={end_dist:.0f}mm, ΔZ={end_dz:.0f}mm)")
+        print(f"   🎯 Top-Down Grasp Command: Pitch={target_pitch:.1f}° | "
+              f"Wrist Roll={target_roll:.1f}° (Δroll={delta_roll:+.1f}°) | Base Target=({mid_x_b:.0f},{mid_y_b:.0f},{safe_z_b:.0f})mm")
+
+        return {
+            "is_lying_flat": True,
+            "h_span_mm": round(h_span, 1),
+            "v_span_mm": round(v_span, 1),
+            "target_pitch_deg": target_pitch,
+            "target_roll_deg": target_roll,
+            "delta_roll_deg": round(delta_roll, 1),
+            "midpoint_base": midpoint_base,
+            "midpoint_cam": midpoint_cam,
+            "yaw_deg": round(rel_deg, 1),
+            "confidence": "high_3d_span"
+        }
+    else:
+        print(f"   📐 3D Analysis: Object is STANDING UPRIGHT | "
+              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm → Level Approach (pitch={default_pitch:.1f}°)")
+        return {
+            "is_lying_flat": False,
+            "h_span_mm": round(h_span, 1),
+            "v_span_mm": round(v_span, 1),
+            "target_pitch_deg": default_pitch,
+            "target_roll_deg": default_roll,
+            "delta_roll_deg": default_delta,
+            "midpoint_base": midpoint_base,
+            "midpoint_cam": midpoint_cam,
+            "yaw_deg": 0.0,
+            "confidence": "high_3d_span"
+        }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Multi-Angle / Orientation-Invariant YOLO Inference
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2675,6 +2896,15 @@ def main():
 
     print(f"Loading YOLO model: {chosen_path}...")
     model = YOLO(chosen_path)
+    try:
+        if hasattr(model, "model") and model.model is not None:
+            model.model.is_fused = lambda: True
+            model.model.fuse = lambda *args, **kwargs: model.model
+        if hasattr(model, "fuse"):
+            model.fuse = lambda *args, **kwargs: model
+    except Exception:
+        pass
+
     if "world" in chosen_path.lower() or hasattr(model, "set_classes"):
         user_target = TARGET_DESC.strip()
         query_variants = [user_target]
@@ -2685,6 +2915,15 @@ def main():
     else:
         TARGET_CLASS_IDS = [YOLO_CLASS_ID]
         print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
+
+    try:
+        if hasattr(model, "model") and model.model is not None:
+            model.model.is_fused = lambda: True
+            model.model.fuse = lambda *args, **kwargs: model.model
+        if hasattr(model, "fuse"):
+            model.fuse = lambda *args, **kwargs: model
+    except Exception:
+        pass
 
     # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
     # The first inference triggers CUDA/model warmup (can take 2-5 s).  If this
@@ -3109,6 +3348,9 @@ def main():
             if sizing is not None and xyz is not None:
                 sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC)
 
+            # ── STEP 2b: 3D Orientation Analysis (Disambiguate Lying Flat vs Upright) ──
+            orient_3d = analyze_3d_orientation(cap, robot, (x1_a, y1_a, x2_a, y2_a), seg_mask, sizing)
+
             # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
             # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
             # securely between the rubber gripper pads (~17mm clearance from rear servo face).
@@ -3131,12 +3373,29 @@ def main():
                 target_roll  = sizing.get("recommended_roll_deg", target_roll)
                 delta_roll   = sizing.get("delta_roll_deg", 0.0)
 
-            for pen_mm in penetration_candidates:
-                target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
-                if target is None:
-                    continue
+            # 3D Orientation override (detects bottles lying flat pointing towards arm)
+            if orient_3d.get("confidence") == "high_3d_span":
+                target_pitch = orient_3d["target_pitch_deg"]
+                target_roll  = orient_3d["target_roll_deg"]
+                delta_roll   = orient_3d["delta_roll_deg"]
+                if orient_3d["is_lying_flat"] and orient_3d.get("midpoint_cam") is not None:
+                    xyz = orient_3d["midpoint_cam"]
 
-                arm_x, arm_y, arm_z = target
+            for pen_mm in penetration_candidates:
+                if orient_3d.get("is_lying_flat") and orient_3d.get("midpoint_base") is not None:
+                    # For lying flat: target is the midpoint along the cylinder body
+                    mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
+                    arm_x = mid_x
+                    arm_y = mid_y
+                    # In a steep top-down grasp (-70°), descend towards the cylinder midline
+                    # Clamped safely at table_floor_z + 15.0 mm (-120.0 mm) so fingertips never touch the table
+                    table_floor_z = -135.0
+                    arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
+                else:
+                    target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
+                    if target is None:
+                        continue
+                    arm_x, arm_y, arm_z = target
 
                 # ── Apply lateral claw offset (perpendicular to approach vector, rotated by roll) ──
                 if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
@@ -3150,9 +3409,10 @@ def main():
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface
                 table_floor_z = -135.0
-                if arm_z < table_floor_z:
-                    print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {table_floor_z:.0f}mm) → elevating to {table_floor_z:.0f}mm")
-                    arm_z = table_floor_z
+                min_safe_z = (table_floor_z + 15.0) if orient_3d.get("is_lying_flat") else table_floor_z
+                if arm_z < min_safe_z:
+                    print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {min_safe_z:.0f}mm) → elevating to {min_safe_z:.0f}mm")
+                    arm_z = min_safe_z
 
                 if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
                     continue

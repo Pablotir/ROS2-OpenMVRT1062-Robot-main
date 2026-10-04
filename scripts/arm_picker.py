@@ -282,9 +282,10 @@ GRASP_PENETRATION_MM = 20.0
 PREFERRED_GRAB_PITCH_DEG = 0.0
 
 
-# Lateral gripper offset (mm) perpendicular to approach trajectory.
-# 0.0 = centered directly on the object (eliminates side collisions that push the object)
-GRAB_LATERAL_OFFSET_MM = 0.0
+# Lateral gripper offset (mm) along jaw opening axis.
+# Positive (+ve) = shifts claw to the LEFT (away from the static pincer)
+# Increased by 15mm (from 14.0mm to 29.0mm) to cleanly center open jaws and eliminate static pincer poke!
+GRAB_LATERAL_OFFSET_MM = 29.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -1956,8 +1957,12 @@ def size_up_object(frame: np.ndarray | None,
     body_width_mm = float(w_box * scale)
     grasp_width_mm = 30.0
     h_calc = float(np.clip(h_box * scale, 80.0, 280.0))
-    height_pct = 90.0
-    opt_x, opt_y = default_cx, y1 + max(5, int(h_box * 0.08))
+    if is_bottle_like:
+        opt_x, opt_y = default_cx, default_cy
+        height_pct = 50.0
+    else:
+        opt_x, opt_y = default_cx, y1 + max(5, int(h_box * 0.08))
+        height_pct = 90.0
 
     nz_y, nz_x = np.where(crop_mask > 0) if (crop_mask is not None and crop_mask.size > 0) else ([], [])
     if len(nz_y) >= 35:
@@ -2010,12 +2015,12 @@ def size_up_object(frame: np.ndarray | None,
         body_width_mm = float(np.percentile(valid_ws, 80)) if valid_ws else float(w_box * scale)
 
         if is_bottle_like:
-            # Universal grasp target: center of mass (50% along principal axis)
+            # Universal grasp target: stable geometric center of the bottle
             # Upright, upside-down, tilted, or lying on tabletop:
-            # The midpoint of a bottle is ALWAYS the solid cylindrical body,
-            # providing balanced mass distribution without slipping off tapered neck/cap.
-            opt_x = int(np.clip(x1 + c_x, x1, x2))
-            opt_y = int(np.clip(y1 + c_y, y1, y2))
+            # The geometric midpoint of a bottle is ALWAYS the solid cylindrical body,
+            # providing balanced mass distribution without slipping or jumping.
+            opt_x = default_cx
+            opt_y = default_cy
             height_pct = 50.0
             thinnest_width_mm = body_width_mm
             grasp_width_mm = body_width_mm
@@ -2094,32 +2099,95 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3D Depth Orientation & Tabletop Span Analysis
+# 3D Depth Orientation, Diagonal Vectors & Closed-Form Optimal Roll
 # ═══════════════════════════════════════════════════════════════════════════════
+def compute_wrist_basis(pan_deg: float, pitch_deg: float):
+    """
+    Computes the 3D unit coordinate axes (X_wrist, Y_wrist, Z_wrist) of the arm wrist
+    in the base coordinate frame for a given pan angle and approach pitch.
+    """
+    pan = math.radians(pan_deg)
+    pitch = math.radians(pitch_deg)
+
+    # Approach direction (Wrist X)
+    ax = math.cos(pitch) * math.cos(pan)
+    ay = math.cos(pitch) * math.sin(pan)
+    az = math.sin(pitch)
+
+    # Perpendicular horizontal direction (Wrist Z)
+    zx = -math.sin(pan)
+    zy =  math.cos(pan)
+    zz = 0.0
+
+    # Wrist Y = Z cross X
+    yx = zy * az - zz * ay
+    yy = zz * ax - zx * az
+    yz = zx * ay - zy * ax
+
+    X_wrist = np.array([ax, ay, az], dtype=np.float64)
+    Y_wrist = np.array([yx, yy, yz], dtype=np.float64)
+    Z_wrist = np.array([zx, zy, zz], dtype=np.float64)
+
+    return X_wrist, Y_wrist, Z_wrist
+
+
+def solve_optimal_roll(pan_deg: float, pitch_deg: float, V_obj: np.ndarray, base_roll_deg: float = -68.62) -> tuple[float, np.ndarray, float]:
+    """
+    Analytically solves the closed-form wrist_roll servo angle such that the
+    gripper jaw opening axis J is strictly perpendicular to the 3D object axis V (J . V = 0).
+    Also ensures J points toward the LEFT (away from the static pincer).
+    Calibrated to physical robot hardware where base_roll_deg (-68.62°) is horizontally level.
+    """
+    X_w, Y_w, Z_w = compute_wrist_basis(pan_deg, pitch_deg)
+    norm = np.linalg.norm(V_obj)
+    V = (V_obj / norm) if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+    dot_Y = float(np.dot(Y_w, V))
+    dot_Z = float(np.dot(Z_w, V))
+
+    roll_candidate_rad = math.atan2(-dot_Y, dot_Z)
+    cand_deg = -math.degrees(roll_candidate_rad)
+    # Calibrated physical servo offset: theoretical horizontal is -90°, physical horizontal is base_roll_deg
+    cal_cand = cand_deg + (base_roll_deg - (-90.0))
+    cands_deg = [cal_cand, cal_cand + 180.0, cal_cand - 180.0]
+
+    valid = [c for c in cands_deg if -170.0 <= c <= 170.0]
+    if not valid:
+        valid = cands_deg
+
+    best_roll = min(valid, key=lambda c: abs(c - base_roll_deg))
+    delta = best_roll - base_roll_deg
+    d_rad = math.radians(delta)
+    # At delta=0, J points along Z_w (pure left: [-sin(pan), cos(pan), 0])
+    # As wrist rolls by delta, J rotates in the Y_w/Z_w plane
+    J = math.cos(d_rad) * Z_w - math.sin(d_rad) * Y_w
+    norm_J = np.linalg.norm(J)
+    if norm_J > 1e-6:
+        J /= norm_J
+
+    # Ensure J points to the LEFT (in positive Y / pan-left direction relative to reach)
+    pan_rad = math.radians(pan_deg)
+    left_ref = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0])
+    if float(np.dot(J, left_ref)) < 0.0:
+        J = -J
+
+    err = abs(float(np.dot(J, V)))
+    return best_roll, J, err
+
+
 def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
                            seg_mask: np.ndarray | None = None,
                            sizing: dict | None = None) -> dict:
     """
-    3D Orientation & Geometric Span Analysis:
-    Disambiguates objects lying flat on the tabletop vs. standing upright in true 3D space,
-    solving the 2D projection ambiguity where a bottle lying flat pointing towards the arm
-    appears as a vertical rectangle (tilt ≈ 0°) in the camera image.
+    Full 3D Orientation & Geometric Vector Analysis:
+    Resolves objects at arbitrary 3D diagonal poses across (X, Y) and (X, Z) space.
+    Accurately handles:
+      1) Lying flat on tabletop (radial or angled 0°-90°)
+      2) 3D diagonal vectors (angled in XY tabletop plane and tilted up in XZ elevation)
+      3) Standing upright (or tilted propped against obstacles)
 
-    Samples points along the object's primary axis, queries depth via RealSense,
-    projects each point to the arm base coordinate frame, and calculates true physical
-    horizontal (XY) and vertical (Z) spans.
-
-    Returns:
-        is_lying_flat (bool): True if horizontal tabletop span >> vertical elevation span
-        h_span_mm (float): physical length spanning the horizontal XY plane
-        v_span_mm (float): physical elevation span along the Z axis
-        target_pitch_deg (float): -70.0° for lying flat (top-down), or horizontal/angled
-        target_roll_deg (float): recommended wrist_roll servo angle
-        delta_roll_deg (float): roll offset relative to neutral
-        midpoint_base (tuple | None): (X, Y, Z) midpoint along the object length in base coordinates
-        midpoint_cam (tuple | None): (X, Y, Z) midpoint in camera coordinates
-        yaw_deg (float): orientation angle on tabletop relative to radial reach line
-        confidence (str): quality indicator of the 3D analysis
+    Uses 3D PCA to extract the true 3D spatial axis vector V, determines the optimal
+    approach pitch -(90° - elev), and computes the closed-form wrist roll with jaw vector J.
     """
     x1, y1, x2, y2 = bbox
     w_box = max(10, x2 - x1)
@@ -2142,19 +2210,30 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     # Half-span in pixels along the axis
     L_px = math.hypot(w_box, h_box) * 0.42
 
-    sample_fractions = [-0.35, -0.20, 0.0, 0.20, 0.35]
+    sample_fractions = [-0.38, -0.25, -0.12, 0.0, 0.12, 0.25, 0.38]
     sample_pixels = []
     for f in sample_fractions:
         px = int(np.clip(cx + f * L_px * ux, x1 + 2, x2 - 2))
         py = int(np.clip(cy + f * L_px * uy, y1 + 2, y2 - 2))
         sample_pixels.append((px, py))
 
-    # Centerline samples for vertical bounding boxes
+    # Centerline samples for vertical or steep bounding boxes
     if abs(tilt_deg) <= 30.0:
-        for f_y in [0.20, 0.35, 0.50, 0.65, 0.80]:
+        for f_y in [0.18, 0.32, 0.50, 0.68, 0.82]:
             py_box = int(np.clip(y1 + f_y * h_box, y1 + 2, y2 - 2))
             if (cx, py_box) not in sample_pixels:
                 sample_pixels.append((cx, py_box))
+
+    # General diagonal bounding box samples
+    diag_pts = [
+        (int(x1 + 0.25 * w_box), int(y1 + 0.25 * h_box)),
+        (int(x1 + 0.75 * w_box), int(y1 + 0.25 * h_box)),
+        (int(x1 + 0.25 * w_box), int(y1 + 0.75 * h_box)),
+        (int(x1 + 0.75 * w_box), int(y1 + 0.75 * h_box)),
+    ]
+    for dpx, dpy in diag_pts:
+        if (dpx, dpy) not in sample_pixels:
+            sample_pixels.append((dpx, dpy))
 
     # Query 3D camera coordinates and convert to arm base frame
     valid_samples = []
@@ -2179,101 +2258,132 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     if len(valid_samples) < 2:
         return {
             "is_lying_flat": False,
+            "is_3d_diagonal": False,
+            "is_upright": True,
             "h_span_mm": 0.0,
             "v_span_mm": 0.0,
+            "elev_deg": 90.0,
+            "yaw_deg": 0.0,
             "target_pitch_deg": default_pitch,
             "target_roll_deg": default_roll,
             "delta_roll_deg": default_delta,
             "midpoint_base": None,
             "midpoint_cam": None,
-            "yaw_deg": 0.0,
+            "V_axis": None,
+            "J_vec": None,
             "confidence": "insufficient_3d_samples"
         }
 
-    pts_b = [s[3] for s in valid_samples]
+    pts_b = np.array([s[3] for s in valid_samples], dtype=np.float64)
     pts_c = [s[2] for s in valid_samples]
-    xs = [p[0] for p in pts_b]
-    ys = [p[1] for p in pts_b]
-    zs = [p[2] for p in pts_b]
 
-    dx_all = max(xs) - min(xs)
-    dy_all = max(ys) - min(ys)
+    # 3D Centroid
+    midpoint_b = np.mean(pts_b, axis=0)
+    mid_x_b, mid_y_b, mid_z_b = float(midpoint_b[0]), float(midpoint_b[1]), float(midpoint_b[2])
+
+    # 3D PCA to extract the true 3D spatial axis vector V of the cylinder
+    centered = pts_b - midpoint_b
+    if len(pts_b) >= 3:
+        cov = np.cov(centered, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov)
+        V = evecs[:, -1]
+    else:
+        diff = pts_b[-1] - pts_b[0]
+        norm_d = np.linalg.norm(diff)
+        V = (diff / norm_d) if norm_d > 1e-4 else np.array([1.0, 0.0, 0.0])
+
+    # Ensure V points upwards (V_z >= 0) or forward
+    if V[2] < -1e-4:
+        V = -V
+    elif abs(V[2]) < 0.05 and V[0] < 0:
+        V = -V
+
+    dx_all = float(np.max(pts_b[:, 0]) - np.min(pts_b[:, 0]))
+    dy_all = float(np.max(pts_b[:, 1]) - np.min(pts_b[:, 1]))
     h_span = math.hypot(dx_all, dy_all)
-    v_span = max(zs) - min(zs)
+    v_span = float(np.max(pts_b[:, 2]) - np.min(pts_b[:, 2]))
 
-    p_near = min(pts_b, key=lambda p: math.hypot(p[0], p[1]))
-    p_far  = max(pts_b, key=lambda p: math.hypot(p[0], p[1]))
-    end_dx = p_far[0] - p_near[0]
-    end_dy = p_far[1] - p_near[1]
-    end_dz = abs(p_far[2] - p_near[2])
-    end_dist = math.hypot(end_dx, end_dy)
+    # 3D Elevation angle above horizontal table (0° = flat, 90° = vertical upright)
+    V_xy = math.hypot(V[0], V[1])
+    elev_deg = math.degrees(math.atan2(abs(V[2]), V_xy))
 
-    # 3D Disambiguation:
-    # Lying flat on tabletop: both ends rest on table (v_span <= 45mm), length spans table (h_span >= 60mm).
-    # Standing upright: v_span >= 100mm, h_span <= 40mm.
-    is_lying_flat = (h_span > v_span + 25.0) or (v_span < 45.0 and h_span > 60.0)
+    # Tabletop yaw angle
+    pan_rad = math.atan2(mid_y_b, mid_x_b)
+    pan_deg = math.degrees(pan_rad)
+    bottle_yaw_deg = math.degrees(math.atan2(V[1], V[0]))
+    rel_table_deg = bottle_yaw_deg - pan_deg
+    while rel_table_deg > 90.0:
+        rel_table_deg -= 180.0
+    while rel_table_deg < -90.0:
+        rel_table_deg += 180.0
 
-    mid_x_b = (p_near[0] + p_far[0]) / 2.0
-    mid_y_b = (p_near[1] + p_far[1]) / 2.0
-    mid_z_b = (p_near[2] + p_far[2]) / 2.0
+    # Classification
+    is_lying_flat = (elev_deg < 20.0) or (h_span > v_span + 25.0 and v_span < 45.0)
+    is_upright = (elev_deg > 75.0) or (v_span > h_span + 50.0 and h_span < 45.0)
+    is_3d_diagonal = not is_lying_flat and not is_upright
+
+    # Approach pitch calculation
+    if is_lying_flat:
+        target_pitch = -70.0
+        pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
+    elif is_upright:
+        target_pitch = 0.0
+        pose_desc = "STANDING UPRIGHT"
+    else:
+        calc_pitch = -(90.0 - elev_deg)
+        target_pitch = float(np.clip(calc_pitch, -70.0, 0.0))
+        pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, tabletop angle={rel_table_deg:+.1f}°)"
+
+    # Closed-form optimal wrist_roll and jaw axis J calculation:
+    pan_rad = math.radians(pan_deg)
+    if is_upright:
+        target_roll = base_roll
+        delta_roll = 0.0
+        J_vec = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0], dtype=np.float64)
+    elif is_lying_flat and abs(rel_table_deg) < 15.0:
+        # Radial flat (pointing towards or away from arm): jaws horizontal across bottle
+        target_roll = base_roll
+        delta_roll = 0.0
+        J_vec = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0], dtype=np.float64)
+    elif is_lying_flat:
+        delta_roll = -rel_table_deg
+        target_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
+        eff_lat = math.cos(math.radians(delta_roll))
+        eff_vert = math.sin(math.radians(delta_roll))
+        J_vec = np.array([-eff_lat * math.sin(pan_rad), eff_lat * math.cos(pan_rad), eff_vert], dtype=np.float64)
+        norm_J = np.linalg.norm(J_vec)
+        if norm_J > 1e-6:
+            J_vec /= norm_J
+    else:
+        target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
+        delta_roll = target_roll - base_roll
+
     mid_idx = len(pts_c) // 2
     midpoint_cam = pts_c[mid_idx]
-
     table_floor_z = -135.0
-    safe_z_b = max(table_floor_z + 15.0, mid_z_b)
+    safe_z_b = max(table_floor_z + 15.0, mid_z_b) if is_lying_flat else mid_z_b
     midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
 
-    if is_lying_flat:
-        target_pitch = -70.0   # Steep top-down approach from above table
+    print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
+    print(f"   🎯 Grasp Command: Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}° | Left Offset=+{GRAB_LATERAL_OFFSET_MM:.1f}mm along J=[{J_vec[0]:+.2f},{J_vec[1]:+.2f},{J_vec[2]:+.2f}]")
 
-        bottle_yaw_rad = math.atan2(end_dy, end_dx)
-        pan_rad = math.atan2(mid_y_b, mid_x_b)
-        rel_rad = bottle_yaw_rad - pan_rad
-        rel_deg = math.degrees(rel_rad)
-
-        while rel_deg > 90.0:
-            rel_deg -= 180.0
-        while rel_deg < -90.0:
-            rel_deg += 180.0
-
-        delta_roll = -rel_deg
-        target_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
-
-        yaw_desc = "pointing towards arm" if abs(rel_deg) <= 25.0 else (
-            "sideways" if abs(abs(rel_deg) - 90.0) <= 25.0 else f"angled {rel_deg:+.1f}°"
-        )
-        print(f"   📐 3D Analysis: Object is LYING FLAT on table ({yaw_desc}) | "
-              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm (EndDist={end_dist:.0f}mm, ΔZ={end_dz:.0f}mm)")
-        print(f"   🎯 Top-Down Grasp Command: Pitch={target_pitch:.1f}° | "
-              f"Wrist Roll={target_roll:.1f}° (Δroll={delta_roll:+.1f}°) | Base Target=({mid_x_b:.0f},{mid_y_b:.0f},{safe_z_b:.0f})mm")
-
-        return {
-            "is_lying_flat": True,
-            "h_span_mm": round(h_span, 1),
-            "v_span_mm": round(v_span, 1),
-            "target_pitch_deg": target_pitch,
-            "target_roll_deg": target_roll,
-            "delta_roll_deg": round(delta_roll, 1),
-            "midpoint_base": midpoint_base,
-            "midpoint_cam": midpoint_cam,
-            "yaw_deg": round(rel_deg, 1),
-            "confidence": "high_3d_span"
-        }
-    else:
-        print(f"   📐 3D Analysis: Object is STANDING UPRIGHT | "
-              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm → Level Approach (pitch={default_pitch:.1f}°)")
-        return {
-            "is_lying_flat": False,
-            "h_span_mm": round(h_span, 1),
-            "v_span_mm": round(v_span, 1),
-            "target_pitch_deg": default_pitch,
-            "target_roll_deg": default_roll,
-            "delta_roll_deg": default_delta,
-            "midpoint_base": midpoint_base,
-            "midpoint_cam": midpoint_cam,
-            "yaw_deg": 0.0,
-            "confidence": "high_3d_span"
-        }
+    return {
+        "is_lying_flat": is_lying_flat,
+        "is_3d_diagonal": is_3d_diagonal,
+        "is_upright": is_upright,
+        "h_span_mm": round(h_span, 1),
+        "v_span_mm": round(v_span, 1),
+        "elev_deg": round(elev_deg, 1),
+        "yaw_deg": round(rel_table_deg, 1),
+        "target_pitch_deg": round(target_pitch, 1),
+        "target_roll_deg": round(target_roll, 1),
+        "delta_roll_deg": round(target_roll - base_roll, 1),
+        "midpoint_base": midpoint_base,
+        "midpoint_cam": midpoint_cam,
+        "V_axis": V,
+        "J_vec": J_vec,
+        "confidence": "high_3d_span"
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2420,86 +2530,136 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
     return results
 
 
+def compute_iou(boxA, boxB) -> float:
+    """Computes Intersection-over-Union (IoU) of two bounding boxes [x1, y1, x2, y2]."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter = max(0.0, float(xB - xA)) * max(0.0, float(yB - yA))
+    areaA = max(1.0, float((boxA[2] - boxA[0]) * (boxA[3] - boxA[1])))
+    areaB = max(1.0, float((boxB[2] - boxB[0]) * (boxB[3] - boxB[1])))
+    return inter / float(areaA + areaB - inter)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# ObjectTracker: YOLO-primary, colour-mask fallback
+# ObjectTracker: Persistent Spatial-Temporal Memory & Geometric Centroid
 # ═══════════════════════════════════════════════════════════════════════════════
 class ObjectTracker:
     """
-    Semantic Object Tracker for Visual Servoing.
-    Uses YOLO neural detections with spatial consistency / nearest-neighbor association.
-    Eliminates fragile HSV color fallback that locks onto human skin/hands.
-    Never modifies the camera frame buffer in-place (eliminates white QR-like artifacts).
+    Robust Semantic Object Tracker with Persistent Spatial-Temporal Memory.
+    Features:
+      1) Exponential Moving Average (EMA) bounding box smoothing across frames.
+      2) Combined IoU + spatial proximity association (rejects background clutter and jumps).
+      3) Stable geometric centroid: (cx, cy) = ((x1+x2)/2, (y1+y2)/2).
+         Never re-runs noisy Otsu/Canny edge thresholds on every frame!
+      4) Long-term coasting memory: holds target in memory across scene shifts/arm lunges
+         for up to 15 frames (~1.0s).
+      5) Locked target coordinates invariant to camera ego-motion.
     """
-    def __init__(self):
-        self.last_box    = None
-        self.last_center = None
-        self.last_area   = None
-        self.locked      = False
+    def __init__(self, ema_alpha: float = 0.65, max_memory_frames: int = 15):
+        self.smooth_box = None          # [x1, y1, x2, y2] float
+        self.smooth_center = None       # (cx, cy) int
+        self.last_box = None            # (x1, y1, x2, y2) int
+        self.last_center = None         # (cx, cy) int
+        self.last_area = None
+        self.last_mask_polygon = None   # np.ndarray mask polygon
+        self.locked = False
         self.lost_frames = 0
+        self.ema_alpha = ema_alpha
+        self.max_memory_frames = max_memory_frames
+        self.confirmed_frames = 0
 
     def lock_on(self, frame, x1, y1, x2, y2):
         fh, fw = frame.shape[:2]
-        self.last_box    = (x1, y1, x2, y2)
-        self.last_center = find_optimal_grasp_point(None, (x1, y1, x2, y2), TARGET_DESC, frame=frame)
-        self.last_area   = ((x2 - x1) / fw) * ((y2 - y1) / fh)
-        self.locked      = True
+        self.smooth_box = [float(x1), float(y1), float(x2), float(y2)]
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        self.smooth_center = (cx, cy)
+        self.last_box = (int(x1), int(y1), int(x2), int(y2))
+        self.last_center = (cx, cy)
+        self.last_area = ((x2 - x1) / fw) * ((y2 - y1) / fh)
+        self.last_mask_polygon = None
+        self.locked = True
         self.lost_frames = 0
-        print(f"   🔒 Tracker locked on target: box=({x1},{y1},{x2},{y2}) grasp={self.last_center}")
+        self.confirmed_frames = 1
+        print(f"   🔒 Tracker locked on target: box=({x1},{y1},{x2},{y2}) stable_center={self.smooth_center}")
 
     def detect(self, frame, yolo_results, model_class_id):
-        """
-        Detects the locked target in the current frame using YOLO.
-        Matches by spatial proximity to last_center to avoid jumping to hands or other objects.
-        If YOLO misses a frame during motion, holds the last verified position for up to 3 frames.
-        """
         fh, fw = frame.shape[:2]
-        valid_boxes = []
+        valid_candidates = []
 
         if yolo_results is not None and len(yolo_results) > 0 and yolo_results[0].boxes is not None:
-            for box in yolo_results[0].boxes:
+            has_masks = hasattr(yolo_results[0], 'masks') and yolo_results[0].masks is not None and hasattr(yolo_results[0].masks, 'xy')
+            for box_idx, box in enumerate(yolo_results[0].boxes):
                 cls_id = int(box.cls[0].item())
-                # Strictly filter for target class IDs (person class 0 is rejected)
                 if isinstance(model_class_id, (list, tuple, set)):
                     if cls_id not in model_class_id:
                         continue
                 else:
                     if cls_id != model_class_id:
                         continue
-                
+
                 bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
                 bx1, by1 = max(0, bx1), max(0, by1)
                 bx2, by2 = min(fw, bx2), min(fh, by2)
-                bcx, bcy = find_optimal_grasp_point(None, (bx1, by1, bx2, by2), TARGET_DESC, frame=frame)
-                barea = ((bx2 - bx1) / fw) * ((by2 - by1) / fh)
-                
-                # Proximity to last center
-                if self.last_center is not None:
-                    dist = math.hypot(bcx - self.last_center[0], bcy - self.last_center[1])
+                cand_box = [float(bx1), float(by1), float(bx2), float(by2)]
+                cand_cx = (bx1 + bx2) / 2.0
+                cand_cy = (by1 + by2) / 2.0
+                cand_area = ((bx2 - bx1) / fw) * ((by2 - by1) / fh)
+                poly = yolo_results[0].masks.xy[box_idx] if (has_masks and box_idx < len(yolo_results[0].masks.xy)) else None
+
+                if self.smooth_box is not None:
+                    iou = compute_iou(self.smooth_box, cand_box)
+                    cur_cx = (self.smooth_box[0] + self.smooth_box[2]) / 2.0
+                    cur_cy = (self.smooth_box[1] + self.smooth_box[3]) / 2.0
+                    dist = math.hypot(cand_cx - cur_cx, cand_cy - cur_cy)
+
+                    if iou >= 0.10 or dist < 250.0:
+                        score = iou * 0.65 + max(0.0, 1.0 - (dist / float(fw))) * 0.35
+                        valid_candidates.append((score, cand_box, cand_area, poly))
                 else:
-                    dist = 0.0
-                
-                valid_boxes.append((dist, (bx1, by1, bx2, by2), (bcx, bcy), barea))
+                    valid_candidates.append((1.0, cand_box, cand_area, poly))
 
-        if valid_boxes:
-            # Pick closest match to previous position
-            valid_boxes.sort(key=lambda item: item[0])
-            best_dist, best_box, best_center, best_area = valid_boxes[0]
-            
-            # Gating: reject jumps > 220px to prevent latching onto unrelated background objects
-            if self.last_center is None or best_dist < 220.0:
-                self.last_box = best_box
-                self.last_center = best_center
-                self.last_area = best_area
-                self.lost_frames = 0
-                return True, best_center, best_area, "yolo"
+        if valid_candidates:
+            valid_candidates.sort(key=lambda item: item[0], reverse=True)
+            best_score, best_box, best_area, best_poly = valid_candidates[0]
+            if best_poly is not None:
+                self.last_mask_polygon = best_poly
 
-        # Motion coasting: if YOLO dropped 1-3 frames during fast arm movement, hold steady
-        if self.locked and self.last_center is not None and self.lost_frames < 3:
+            if self.smooth_box is not None:
+                a = self.ema_alpha
+                self.smooth_box = [
+                    a * best_box[0] + (1.0 - a) * self.smooth_box[0],
+                    a * best_box[1] + (1.0 - a) * self.smooth_box[1],
+                    a * best_box[2] + (1.0 - a) * self.smooth_box[2],
+                    a * best_box[3] + (1.0 - a) * self.smooth_box[3],
+                ]
+            else:
+                self.smooth_box = list(best_box)
+
+            cx = int((self.smooth_box[0] + self.smooth_box[2]) / 2.0)
+            cy = int((self.smooth_box[1] + self.smooth_box[3]) / 2.0)
+            self.smooth_center = (cx, cy)
+            self.last_box = (int(round(self.smooth_box[0])), int(round(self.smooth_box[1])),
+                             int(round(self.smooth_box[2])), int(round(self.smooth_box[3])))
+            self.last_center = (cx, cy)
+            self.last_area = best_area
+            self.lost_frames = 0
+            self.confirmed_frames += 1
+            return True, self.smooth_center, self.last_area, "yolo"
+
+        # Coasting / Memory Hold across scene shifts and arm motion
+        if self.locked and self.smooth_box is not None and self.lost_frames < self.max_memory_frames:
             self.lost_frames += 1
-            return True, self.last_center, self.last_area, "hold"
+            cx = int((self.smooth_box[0] + self.smooth_box[2]) / 2.0)
+            cy = int((self.smooth_box[1] + self.smooth_box[3]) / 2.0)
+            self.smooth_center = (cx, cy)
+            self.last_center = (cx, cy)
+            return True, self.smooth_center, self.last_area, "hold"
 
         self.lost_frames += 1
-        return False, self.last_center, self.last_area, "lost"
+        return False, self.smooth_center, self.last_area, "lost"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3189,82 +3349,55 @@ def main():
             STATE = "GRABBING"
             print("\n🎯 Reading depth for IK from scan posture...")
 
-            # ── IK-based grab ─────────────────────────────────────────────────
-            STATE = "GRABBING"
-            print("\n🎯 Reading depth for IK...")
+            # ── Step 2a: Settle & Consensus Burst using Tracker Memory ────────
+            # Give servos 150ms to settle to a mechanical standstill after visual servoing.
+            time.sleep(0.15)
 
-
-            # Take a fresh depth snapshot to ensure we have the latest frame
-            time.sleep(0.2)
-
-            # ── Refresh seg mask with size guard ──────────────────────────────
-            # We must recalculate the mask because the camera has moved during alignment.
-            color_aligned, _, _ = cap.read()
-            h_a, w_a = color_aligned.shape[:2]
-            results_aligned = detect_with_rotation(model, color_aligned, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+            # Consensus burst across 3 consecutive frames:
+            # Updates tracker.smooth_box via ObjectTracker.detect, maintaining persistent
+            # spatial-temporal track across the scene shift!
+            color_aligned = None
             seg_mask = None
-            
-            best_idx = -1
-            min_dist = float('inf')
-            x1_a = y1_a = x2_a = y2_a = 0
-            MAX_ALIGN_DIST = 200.0  # max allowable distance from aligned center
-            
-            if results_aligned[0].boxes is not None:
-                for idx, box in enumerate(results_aligned[0].boxes):
-                    if int(box.cls[0]) in TARGET_CLASS_IDS:
-                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                        cx_a = (bx1 + bx2) / 2
-                        cy_a = (by1 + by2) / 2
-                        dist = math.hypot(cx_a - obj_px, cy_a - obj_py)
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_idx = idx
-                if best_idx >= 0 and min_dist > MAX_ALIGN_DIST:
-                    # If all boxes were further than MAX_ALIGN_DIST, pick the one closest to frame center
-                    center_min = float('inf')
-                    for idx, box in enumerate(results_aligned[0].boxes):
-                        if int(box.cls[0]) in TARGET_CLASS_IDS:
-                            bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                            cx_a = (bx1 + bx2) / 2
-                            cy_a = (by1 + by2) / 2
-                            dist_c = math.hypot(cx_a - (w_a / 2), cy_a - (h_a / 2))
-                            if dist_c < center_min:
-                                center_min = dist_c
-                                best_idx = idx
-            
-            sizing = None
-            if best_idx >= 0:
-                box_aligned = results_aligned[0].boxes[best_idx]
-                x1_a, y1_a, x2_a, y2_a = map(int, box_aligned.xyxy[0].tolist())
-                x1_a, y1_a = max(0, x1_a), max(0, y1_a)
-                x2_a, y2_a = min(w_a, x2_a), min(h_a, y2_a)
+            best_box = tracker.last_box if tracker.last_box is not None else (x1, y1, x2, y2)
 
-                cand_mask = None
-                if results_aligned[0].masks is not None and best_idx < len(results_aligned[0].masks.xy):
-                    polygon  = results_aligned[0].masks.xy[best_idx].astype(np.int32)
-                    m = np.zeros(color_aligned.shape[:2], dtype=np.uint8)
-                    cv2.fillPoly(m, [polygon], 255)
-                    n_px = int(np.sum(m == 255))
-                    MAX_MASK_PIXELS = int(h_a * w_a * 0.15)
-                    if n_px <= MAX_MASK_PIXELS:
-                        cand_mask = m
-                        seg_mask = cand_mask
-                    else:
-                        print(f"   ⚠️  Mask too large ({n_px}px > {MAX_MASK_PIXELS}px limit) — using bounding-box target")
+            for _ in range(3):
+                c_snap, _, _ = cap.read()
+                if c_snap is not None:
+                    color_aligned = c_snap
+                    res_snap = detect_with_rotation(model, color_aligned, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+                    found_snap, _, _, _ = tracker.detect(color_aligned, res_snap, TARGET_CLASS_IDS)
+                    if found_snap and tracker.last_box is not None:
+                        best_box = tracker.last_box
+                        if hasattr(tracker, 'last_mask_polygon') and tracker.last_mask_polygon is not None:
+                            h_s, w_s = color_aligned.shape[:2]
+                            m = np.zeros((h_s, w_s), dtype=np.uint8)
+                            cv2.fillPoly(m, [tracker.last_mask_polygon.astype(np.int32)], 255)
+                            n_px = int(np.sum(m == 255))
+                            MAX_MASK_PIXELS = int(h_s * w_s * 0.15)
+                            if n_px <= MAX_MASK_PIXELS:
+                                seg_mask = m
+                time.sleep(0.02)
 
-                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
-                obj_px, obj_py = sizing["opt_px"]
-                fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
-                print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
-                      f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
-                print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-                print(f"   🎯 Grasp point verified on aligned frame: ({obj_px},{obj_py})")
-            elif tracker.last_box is not None:
-                x1_a, y1_a, x2_a, y2_a = tracker.last_box
-                sizing = size_up_object(color_aligned, None, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
-                obj_px, obj_py = sizing["opt_px"]
-                print(f"   📐 Orientation (from tracked box): Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-                print(f"   🎯 Using tracked grasp point: ({obj_px},{obj_py})")
+            if color_aligned is None:
+                color_aligned, _, _ = cap.read()
+            h_a, w_a = color_aligned.shape[:2]
+
+            x1_a, y1_a, x2_a, y2_a = best_box
+            x1_a, y1_a = max(0, x1_a), max(0, y1_a)
+            x2_a, y2_a = min(w_a, x2_a), min(h_a, y2_a)
+
+            # Locked geometric center of the tracked object (inviolable, immune to edge jitter)
+            obj_px = int((x1_a + x2_a) / 2)
+            obj_py = int((y1_a + y2_a) / 2)
+            print(f"   🔒 Target Track Locked in Memory: box=({x1_a},{y1_a},{x2_a},{y2_a}) stable_center=({obj_px},{obj_py})")
+
+            # Size up object to determine dimensions & orientation
+            sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
+            fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
+            print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
+                  f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
+            print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
+            print(f"   🎯 Stable Grasp point: ({obj_px},{obj_py})")
 
             # ── STEP 2: Get 3-D object position in camera space ────────────────
             # Prefer mask-based depth (object pixels only) over point sampling.
@@ -3299,7 +3432,7 @@ def main():
                     (c_box_x, c_box_y),
                     ((obj_px + c_box_x) // 2, (obj_py + c_box_y) // 2),
                 ]
-                if (best_idx >= 0 or tracker.last_box is not None) and y2_a > y1_a:
+                if y2_a > y1_a:
                     h_b = y2_a - y1_a
                     sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.25))))
                     sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.50))))
@@ -3382,34 +3515,55 @@ def main():
                     xyz = orient_3d["midpoint_cam"]
 
             for pen_mm in penetration_candidates:
-                if orient_3d.get("is_lying_flat") and orient_3d.get("midpoint_base") is not None:
-                    # For lying flat: target is the midpoint along the cylinder body
+                if orient_3d.get("confidence") == "high_3d_span" and orient_3d.get("midpoint_base") is not None:
                     mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
                     arm_x = mid_x
                     arm_y = mid_y
-                    # In a steep top-down grasp (-70°), descend towards the cylinder midline
-                    # Clamped safely at table_floor_z + 15.0 mm (-120.0 mm) so fingertips never touch the table
                     table_floor_z = -135.0
-                    arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
+
+                    if orient_3d["is_lying_flat"]:
+                        # Lying flat: descend towards cylinder midline from above
+                        arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
+                    elif orient_3d.get("is_3d_diagonal"):
+                        # 3D diagonal: approach along pitch angle towards cylinder center
+                        pitch_rad = math.radians(target_pitch)
+                        pan_rad = math.atan2(arm_y, arm_x)
+                        ax = math.cos(pitch_rad) * math.cos(pan_rad)
+                        ay = math.cos(pitch_rad) * math.sin(pan_rad)
+                        az = math.sin(pitch_rad)
+                        arm_x += pen_mm * ax
+                        arm_y += pen_mm * ay
+                        arm_z = max(table_floor_z + 15.0, mid_z + pen_mm * az)
+                    else:
+                        # Upright: target via depth_to_arm_target with penetration
+                        target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
+                        if target is not None:
+                            arm_x, arm_y, arm_z = target
+                        else:
+                            arm_z = mid_z
                 else:
                     target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
                     if target is None:
                         continue
                     arm_x, arm_y, arm_z = target
 
-                # ── Apply lateral claw offset (perpendicular to approach vector, rotated by roll) ──
+                # ── Apply true 3D lateral claw offset along jaw opening vector J ──
+                # Shifts claw to the LEFT (away from static pincer) so jaws center cleanly over object
                 if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
-                    pan_t = math.atan2(arm_y, arm_x)
-                    eff_lat = GRAB_LATERAL_OFFSET_MM * math.cos(math.radians(delta_roll))
-                    eff_vert = GRAB_LATERAL_OFFSET_MM * math.sin(math.radians(delta_roll))
-                    arm_x += -eff_lat * math.sin(pan_t)
-                    arm_y +=  eff_lat * math.cos(pan_t)
-                    arm_z +=  eff_vert
+                    J = orient_3d.get("J_vec")
+                    if J is not None:
+                        arm_x += GRAB_LATERAL_OFFSET_MM * float(J[0])
+                        arm_y += GRAB_LATERAL_OFFSET_MM * float(J[1])
+                        arm_z += GRAB_LATERAL_OFFSET_MM * float(J[2])
+                    else:
+                        pan_t = math.atan2(arm_y, arm_x)
+                        arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
+                        arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
 
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface
                 table_floor_z = -135.0
-                min_safe_z = (table_floor_z + 15.0) if orient_3d.get("is_lying_flat") else table_floor_z
+                min_safe_z = (table_floor_z + 15.0) if (orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal")) else table_floor_z
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {min_safe_z:.0f}mm) → elevating to {min_safe_z:.0f}mm")
                     arm_z = min_safe_z

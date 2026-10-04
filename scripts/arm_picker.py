@@ -1932,124 +1932,111 @@ def size_up_object(frame: np.ndarray | None,
 
     is_bottle_like = any(w in target_desc.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
 
-    # Extract silhouette mask within bounding box
+    # Extract silhouette mask within bounding box if valid mask is provided
     crop_mask = None
-    if seg_mask is not None and np.sum(seg_mask == 255) >= 30:
+    if seg_mask is not None and np.sum(seg_mask == 255) >= 35:
         crop_mask = seg_mask[y1:y2, x1:x2].copy()
-    elif frame is not None and frame.size > 0:
-        crop = frame[y1:y2, x1:x2]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 25, 90)
-        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        corner_mean = (float(thresh[0,0]) + float(thresh[0,-1]) + float(thresh[-1,0]) + float(thresh[-1,-1])) / 4.0
-        if corner_mean > 128.0:
-            thresh = cv2.bitwise_not(thresh)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        crop_mask = cv2.morphologyEx(cv2.bitwise_or(edges, thresh), cv2.MORPH_CLOSE, kernel)
 
     # Baseline defaults
     base_roll = START_POS.get("wrist_roll.pos", -68.62) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", -68.62)
     tilt_deg = 0.0
     recommended_roll = base_roll
     recommended_pitch = PREFERRED_GRAB_PITCH_DEG
-    thinnest_width_mm = 30.0
     body_width_mm = float(w_box * scale)
-    grasp_width_mm = 30.0
     h_calc = float(np.clip(h_box * scale, 80.0, 280.0))
-    height_pct = 90.0
-    opt_x, opt_y = default_cx, y1 + max(5, int(h_box * 0.08))
 
-    nz_y, nz_x = np.where(crop_mask > 0) if (crop_mask is not None and crop_mask.size > 0) else ([], [])
-    if len(nz_y) >= 35:
-        # ── PCA Principal Component Analysis for 2-D Orientation ───────────────
-        pts_crop = np.column_stack((nz_x, nz_y)).astype(np.float32)
-        mean, eigenvectors = cv2.PCACompute(pts_crop, mean=None)
-        c_x, c_y = float(mean[0][0]), float(mean[0][1])
-        v_maj = eigenvectors[0]   # unit vector along object length
-        v_min = eigenvectors[1]   # unit vector along object thickness
-
-        # Ensure major axis points downwards in the image frame (v_maj_y >= 0)
-        if v_maj[1] < 0:
-            v_maj = -v_maj
-            v_min = -v_min
-
-        theta_maj = math.degrees(math.atan2(v_maj[1], v_maj[0]))   # 0° to 180°
-        tilt_deg = theta_maj - 90.0                               # -90° to +90° (0° = vertical upright)
-
-        # Project points onto PCA coordinates: s (along major axis), t (along minor axis)
-        s = (pts_crop[:, 0] - c_x) * v_maj[0] + (pts_crop[:, 1] - c_y) * v_maj[1]
-        t = (pts_crop[:, 0] - c_x) * v_min[0] + (pts_crop[:, 1] - c_y) * v_min[1]
-        s_min, s_max = float(np.min(s)), float(np.max(s))
-        L_px = s_max - s_min
-        h_calc = float(np.clip(L_px * scale, 80.0, 280.0))
-
-        # Oriented cross-sectional profiling in discrete bins along the major axis
-        n_bins = 30
-        bin_edges = np.linspace(s_min, s_max, n_bins + 1)
-        widths_px = []
-        mid_ts = []
-        bin_centers = []
-        for i in range(n_bins):
-            in_b = (s >= bin_edges[i]) & (s < bin_edges[i+1])
-            if np.sum(in_b) >= 3:
-                t_b = t[in_b]
-                widths_px.append(float(np.max(t_b) - np.min(t_b)))
-                mid_ts.append(float((np.max(t_b) + np.min(t_b)) / 2.0))
-                bin_centers.append(float((bin_edges[i] + bin_edges[i+1]) / 2.0))
-            else:
-                widths_px.append(0.0)
-                mid_ts.append(0.0)
-                bin_centers.append(float((bin_edges[i] + bin_edges[i+1]) / 2.0))
-
-        raw_mm = np.array(widths_px, dtype=np.float32) * scale
-        widths_mm = np.copy(raw_mm)
-        for i in range(1, n_bins - 1):
-            widths_mm[i] = float(np.median(raw_mm[max(0, i-1):min(n_bins, i+2)]))
-
-        valid_ws = [w for w in widths_mm if w > 5.0]
-        body_width_mm = float(np.percentile(valid_ws, 80)) if valid_ws else float(w_box * scale)
-
-        if is_bottle_like:
-            # Universal grasp target: center of mass (50% along principal axis)
-            # Upright, upside-down, tilted, or lying on tabletop:
-            # The midpoint of a bottle is ALWAYS the solid cylindrical body,
-            # providing balanced mass distribution without slipping off tapered neck/cap.
-            opt_x = int(np.clip(x1 + c_x, x1, x2))
-            opt_y = int(np.clip(y1 + c_y, y1, y2))
+    if is_bottle_like:
+        if h_box >= int(1.15 * w_box):
+            # Upright standing bottle: target the narrow cap/neck (18% from top) - 100% stable, zero jitter!
+            opt_x = default_cx
+            opt_y = int(np.clip(y1 + 0.18 * h_box, y1 + 5, y2 - 5))
+            height_pct = 82.0
+            thinnest_width_mm = 30.0
+            grasp_width_mm = 30.0
+            tilt_deg = 0.0
+            recommended_roll = base_roll
+            recommended_pitch = 0.0
+            delta_roll_val = 0.0
+            fits_gripper = True
+        elif w_box >= int(1.15 * h_box):
+            # Horizontal lying flat bottle across table
+            opt_x = default_cx
+            opt_y = default_cy
             height_pct = 50.0
             thinnest_width_mm = body_width_mm
             grasp_width_mm = body_width_mm
+            tilt_deg = 90.0
+            recommended_roll = base_roll
+            recommended_pitch = -70.0
+            delta_roll_val = 0.0
+            fits_gripper = (body_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
         else:
-            # Non-bottle objects: target centroid along major/minor axes
+            # Diagonal or propped bottle: PCA on mask if available, otherwise box centroid
+            nz_y, nz_x = np.where(crop_mask > 0) if (crop_mask is not None and crop_mask.size > 0) else ([], [])
+            if len(nz_y) >= 35:
+                pts_crop = np.column_stack((nz_x, nz_y)).astype(np.float32)
+                mean, eigenvectors = cv2.PCACompute(pts_crop, mean=None)
+                c_x, c_y = float(mean[0][0]), float(mean[0][1])
+                v_maj = eigenvectors[0]
+                if v_maj[1] < 0:
+                    v_maj = -v_maj
+                theta_maj = math.degrees(math.atan2(v_maj[1], v_maj[0]))
+                tilt_deg = theta_maj - 90.0
+                opt_x = int(np.clip(x1 + c_x, x1, x2))
+                opt_y = int(np.clip(y1 + c_y, y1, y2))
+                delta_roll = -tilt_deg
+                recommended_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
+                abs_tilt = abs(tilt_deg)
+                if abs_tilt <= 25.0:
+                    recommended_pitch = 0.0
+                elif abs_tilt < 65.0:
+                    recommended_pitch = -float(np.clip(15.0 + abs_tilt * 0.5, 20.0, 45.0))
+                else:
+                    recommended_pitch = -70.0
+                delta_roll_val = -tilt_deg
+            else:
+                opt_x = default_cx
+                opt_y = default_cy
+                tilt_deg = 0.0
+                recommended_pitch = -30.0
+                recommended_roll = base_roll
+                delta_roll_val = 0.0
+
+            height_pct = 50.0
+            thinnest_width_mm = body_width_mm
+            grasp_width_mm = body_width_mm
+            fits_gripper = (body_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
+    else:
+        # Non-bottle objects
+        nz_y, nz_x = np.where(crop_mask > 0) if (crop_mask is not None and crop_mask.size > 0) else ([], [])
+        if len(nz_y) >= 35:
+            pts_crop = np.column_stack((nz_x, nz_y)).astype(np.float32)
+            mean, eigenvectors = cv2.PCACompute(pts_crop, mean=None)
+            c_x, c_y = float(mean[0][0]), float(mean[0][1])
+            v_maj = eigenvectors[0]
+            if v_maj[1] < 0:
+                v_maj = -v_maj
+            theta_maj = math.degrees(math.atan2(v_maj[1], v_maj[0]))
+            tilt_deg = theta_maj - 90.0
             opt_x = int(x1 + c_x)
             opt_y = int(y1 + c_y)
-            grasp_width_mm = body_width_mm
-            thinnest_width_mm = body_width_mm
-            height_pct = 50.0
-
-        # Calculate recommended wrist_roll servo angle
-        # Note: In arm kinematics, roll = -wrist_roll.pos, so delta_roll = -tilt_deg
-        # ensures the gripper jaws rotate in the exact same direction as the object tilt.
-        delta_roll = -tilt_deg
-        recommended_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
-
-        # Calculate adaptive approach pitch:
-        # - Upright objects: level horizontal approach (pitch = 0°)
-        # - Tilted objects (25°-65°): angled approach (-20° to -45°)
-        # - Horizontal / tabletop objects (>65°): steep top-down approach (-70°)
-        abs_tilt = abs(tilt_deg)
-        if abs_tilt <= 25.0:
-            recommended_pitch = 0.0   # Horizontal approach for upright objects
-        elif abs_tilt < 65.0:
-            recommended_pitch = -float(np.clip(15.0 + abs_tilt * 0.5, 20.0, 45.0))   # Angled downward
+            delta_roll = -tilt_deg
+            recommended_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
+            delta_roll_val = -tilt_deg
         else:
-            recommended_pitch = -70.0  # Steep top-down approach for horizontal objects
+            opt_x = default_cx
+            opt_y = default_cy
+            tilt_deg = 0.0
+            recommended_roll = base_roll
+            delta_roll_val = 0.0
 
-    fits_gripper = (thinnest_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
+        grasp_width_mm = body_width_mm
+        thinnest_width_mm = body_width_mm
+        height_pct = 50.0
+        fits_gripper = (thinnest_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
+
     z_target_est = -130.0 + h_calc * (height_pct / 100.0) - 5.0
 
-    delta_roll_val = -tilt_deg
     return {
         "body_width_mm": round(body_width_mm, 1),
         "thinnest_width_mm": round(thinnest_width_mm, 1),
@@ -2068,20 +2055,26 @@ def size_up_object(frame: np.ndarray | None,
 
 def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle", frame: np.ndarray | None = None) -> tuple[int, int]:
     """
-    Computes optimal grasp point (x_px, y_px) on the object using PCA oriented profiling.
-    Directly delegates to size_up_object with robust fallback to contour moments or Canny center.
+    Computes optimal grasp point (x_px, y_px) on the object.
+    For upright bottle-like objects, targets the narrow neck/cap (~18% from top) with zero jitter.
+    For horizontal/lying-flat objects, targets the center of the cylinder body.
     """
     x1, y1, x2, y2 = bbox
-    default_cx, default_cy = (x1 + x2) // 2, (y1 + y2) // 2
+    w_box = max(10, x2 - x1)
+    h_box = max(10, y2 - y1)
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
 
-    try:
-        sizing = size_up_object(frame, seg_mask, bbox, 280.0, target_desc)
-        return sizing["opt_px"]
-    except Exception:
-        pass
+    is_bottle_like = any(w in target_desc.lower() for w in ["bottle", "flask", "can", "cup", "drink", "container", "mug"])
 
-    # Non-bottle or sparse mask fallback
-    if seg_mask is not None and np.sum(seg_mask == 255) >= 30:
+    if is_bottle_like:
+        if h_box >= int(1.15 * w_box):
+            cap_y = int(np.clip(y1 + 0.18 * h_box, y1 + 5, y2 - 5))
+            return cx, cap_y
+        else:
+            return cx, cy
+
+    if seg_mask is not None and np.sum(seg_mask == 255) >= 50:
         contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             c = max(contours, key=cv2.contourArea)
@@ -2089,9 +2082,7 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
             if M["m00"] > 0:
                 return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
 
-    if frame is not None:
-        return canny_centre(frame, x1, y1, x2, y2)
-    return default_cx, default_cy
+    return cx, cy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2301,25 +2292,39 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     while rel_table_deg < -90.0:
         rel_table_deg += 180.0
 
-    # Classification
-    is_lying_flat = (elev_deg < 20.0) or (h_span > v_span + 25.0 and v_span < 45.0)
-    is_upright = (elev_deg > 75.0) or (v_span > h_span + 50.0 and h_span < 45.0)
+    is_tall_box = (h_box >= int(1.15 * w_box))
+    is_wide_box = (w_box >= int(1.15 * h_box))
+
+    # Lying flat: vertical span is small (bottle rests on table surface)
+    is_lying_flat = (elev_deg < 22.0) or (v_span <= 55.0 and h_span >= 70.0) or (is_wide_box and v_span <= 60.0)
+
+    # Upright: tall bounding box and vertically extended or elevated
+    is_upright = not is_lying_flat and (
+        (is_tall_box and (v_span >= 60.0 or elev_deg >= 50.0 or h_span <= 65.0 or v_span >= h_span * 0.7)) or
+        (elev_deg >= 70.0) or
+        (v_span >= 100.0 and v_span >= h_span * 1.2)
+    )
+
     is_3d_diagonal = not is_lying_flat and not is_upright
 
-    # Approach pitch calculation
-    if is_lying_flat:
-        target_pitch = -70.0
-        pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
-    elif is_upright:
+    # Approach pitch calculation & pose determination
+    if is_upright:
         target_pitch = 0.0
-        pose_desc = "STANDING UPRIGHT"
+        target_roll = base_roll
+        delta_roll = 0.0
+        J_vec = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0], dtype=np.float64)
+        pose_desc = f"STANDING UPRIGHT (h_span={h_span:.0f}mm, v_span={v_span:.0f}mm, elev={elev_deg:.1f}°)"
+    elif is_lying_flat:
+        target_pitch = -70.0
+        target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
+        delta_roll = target_roll - base_roll
+        pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°, elev={elev_deg:.1f}°)"
     else:
         calc_pitch = -(90.0 - elev_deg)
         target_pitch = float(np.clip(calc_pitch, -70.0, 0.0))
+        target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
+        delta_roll = target_roll - base_roll
         pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, tabletop angle={rel_table_deg:+.1f}°)"
-
-    # Closed-form optimal wrist_roll solver
-    target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
 
     mid_idx = len(pts_c) // 2
     midpoint_cam = pts_c[mid_idx]
@@ -3359,9 +3364,8 @@ def main():
                 for idx, box in enumerate(results_aligned[0].boxes):
                     if int(box.cls[0]) in TARGET_CLASS_IDS:
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                        cx_a = (bx1 + bx2) / 2
-                        cy_a = (by1 + by2) / 2
-                        dist = math.hypot(cx_a - obj_px, cy_a - obj_py)
+                        bcx, bcy = find_optimal_grasp_point(None, (bx1, by1, bx2, by2), TARGET_DESC)
+                        dist = math.hypot(bcx - obj_px, bcy - obj_py)
                         if dist < min_dist:
                             min_dist = dist
                             best_idx = idx
@@ -3371,9 +3375,8 @@ def main():
                     for idx, box in enumerate(results_aligned[0].boxes):
                         if int(box.cls[0]) in TARGET_CLASS_IDS:
                             bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                            cx_a = (bx1 + bx2) / 2
-                            cy_a = (by1 + by2) / 2
-                            dist_c = math.hypot(cx_a - (w_a / 2), cy_a - (h_a / 2))
+                            bcx, bcy = find_optimal_grasp_point(None, (bx1, by1, bx2, by2), TARGET_DESC)
+                            dist_c = math.hypot(bcx - (w_a / 2), bcy - (h_a / 2))
                             if dist_c < center_min:
                                 center_min = dist_c
                                 best_idx = idx
@@ -3548,12 +3551,11 @@ def main():
                         arm_y += pen_mm * ay
                         arm_z = max(table_floor_z + 15.0, mid_z + pen_mm * az)
                     else:
-                        # Upright: target via depth_to_arm_target with penetration
+                        # Upright: target the cap/neck via depth_to_arm_target with penetration
                         target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
-                        if target is not None:
-                            arm_x, arm_y, arm_z = target
-                        else:
-                            arm_z = mid_z
+                        if target is None:
+                            continue
+                        arm_x, arm_y, arm_z = target
                 else:
                     target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
                     if target is None:
@@ -3576,7 +3578,7 @@ def main():
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface
                 table_floor_z = -135.0
-                min_safe_z = (table_floor_z + 15.0) if (orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal")) else table_floor_z
+                min_safe_z = (table_floor_z + 15.0) if (orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal")) else (table_floor_z + 40.0)
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {min_safe_z:.0f}mm) → elevating to {min_safe_z:.0f}mm")
                     arm_z = min_safe_z

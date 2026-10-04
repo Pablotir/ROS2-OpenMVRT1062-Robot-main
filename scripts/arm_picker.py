@@ -282,9 +282,10 @@ GRASP_PENETRATION_MM = 20.0
 PREFERRED_GRAB_PITCH_DEG = 0.0
 
 
-# Lateral gripper offset (mm) perpendicular to approach trajectory.
-# 0.0 = centered directly on the object (eliminates side collisions that push the object)
-GRAB_LATERAL_OFFSET_MM = 0.0
+# Lateral gripper offset (mm) along jaw opening axis.
+# Positive (+ve) = shifts claw to the LEFT (away from the static pincer)
+# Centers the open jaws over the object and prevents static pincer poke on angled/tilted bottles.
+GRAB_LATERAL_OFFSET_MM = 14.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -2094,32 +2095,89 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3D Depth Orientation & Tabletop Span Analysis
+# 3D Depth Orientation, Diagonal Vectors & Closed-Form Optimal Roll
 # ═══════════════════════════════════════════════════════════════════════════════
+def compute_wrist_basis(pan_deg: float, pitch_deg: float):
+    """
+    Computes the 3D unit coordinate axes (X_wrist, Y_wrist, Z_wrist) of the arm wrist
+    in the base coordinate frame for a given pan angle and approach pitch.
+    """
+    pan = math.radians(pan_deg)
+    pitch = math.radians(pitch_deg)
+
+    # Approach direction (Wrist X)
+    ax = math.cos(pitch) * math.cos(pan)
+    ay = math.cos(pitch) * math.sin(pan)
+    az = math.sin(pitch)
+
+    # Perpendicular horizontal direction (Wrist Z)
+    zx = -math.sin(pan)
+    zy =  math.cos(pan)
+    zz = 0.0
+
+    # Wrist Y = Z cross X
+    yx = zy * az - zz * ay
+    yy = zz * ax - zx * az
+    yz = zx * ay - zy * ax
+
+    X_wrist = np.array([ax, ay, az], dtype=np.float64)
+    Y_wrist = np.array([yx, yy, yz], dtype=np.float64)
+    Z_wrist = np.array([zx, zy, zz], dtype=np.float64)
+
+    return X_wrist, Y_wrist, Z_wrist
+
+
+def solve_optimal_roll(pan_deg: float, pitch_deg: float, V_obj: np.ndarray, base_roll_deg: float = -68.62) -> tuple[float, np.ndarray, float]:
+    """
+    Analytically solves the closed-form wrist_roll servo angle such that the
+    gripper jaw opening axis J is strictly perpendicular to the 3D object axis V (J . V = 0).
+    Also ensures J points toward the LEFT (away from the static pincer).
+    """
+    X_w, Y_w, Z_w = compute_wrist_basis(pan_deg, pitch_deg)
+    norm = np.linalg.norm(V_obj)
+    V = (V_obj / norm) if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+    dot_Y = float(np.dot(Y_w, V))
+    dot_Z = float(np.dot(Z_w, V))
+
+    roll_candidate_rad = math.atan2(-dot_Y, dot_Z)
+    cand_deg = -math.degrees(roll_candidate_rad)
+    cands_deg = [cand_deg, cand_deg + 180.0, cand_deg - 180.0]
+
+    valid = [c for c in cands_deg if -170.0 <= c <= 170.0]
+    if not valid:
+        valid = cands_deg
+
+    best_roll = min(valid, key=lambda c: abs(c - base_roll_deg))
+    roll_rad = math.radians(-best_roll)
+    J = math.cos(roll_rad) * Y_w + math.sin(roll_rad) * Z_w
+    norm_J = np.linalg.norm(J)
+    if norm_J > 1e-6:
+        J /= norm_J
+
+    # Ensure J points to the LEFT (in positive Y / pan-left direction relative to reach)
+    pan_rad = math.radians(pan_deg)
+    left_ref = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0])
+    if float(np.dot(J, left_ref)) < 0.0:
+        J = -J
+
+    err = abs(float(np.dot(J, V)))
+    return best_roll, J, err
+
+
 def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
                            seg_mask: np.ndarray | None = None,
                            sizing: dict | None = None) -> dict:
     """
-    3D Orientation & Geometric Span Analysis:
-    Disambiguates objects lying flat on the tabletop vs. standing upright in true 3D space,
-    solving the 2D projection ambiguity where a bottle lying flat pointing towards the arm
-    appears as a vertical rectangle (tilt ≈ 0°) in the camera image.
+    Full 3D Orientation & Geometric Vector Analysis:
+    Resolves objects at arbitrary 3D diagonal poses across (X, Y) and (X, Z) space.
+    Accurately handles:
+      1) Lying flat on tabletop (radial or angled 0°-90°)
+      2) 3D diagonal vectors (angled in XY tabletop plane and tilted up in XZ elevation)
+      3) Standing upright (or tilted propped against obstacles)
 
-    Samples points along the object's primary axis, queries depth via RealSense,
-    projects each point to the arm base coordinate frame, and calculates true physical
-    horizontal (XY) and vertical (Z) spans.
-
-    Returns:
-        is_lying_flat (bool): True if horizontal tabletop span >> vertical elevation span
-        h_span_mm (float): physical length spanning the horizontal XY plane
-        v_span_mm (float): physical elevation span along the Z axis
-        target_pitch_deg (float): -70.0° for lying flat (top-down), or horizontal/angled
-        target_roll_deg (float): recommended wrist_roll servo angle
-        delta_roll_deg (float): roll offset relative to neutral
-        midpoint_base (tuple | None): (X, Y, Z) midpoint along the object length in base coordinates
-        midpoint_cam (tuple | None): (X, Y, Z) midpoint in camera coordinates
-        yaw_deg (float): orientation angle on tabletop relative to radial reach line
-        confidence (str): quality indicator of the 3D analysis
+    Uses 3D PCA to extract the true 3D spatial axis vector V, determines the optimal
+    approach pitch -(90° - elev), and computes the closed-form wrist roll with jaw vector J.
     """
     x1, y1, x2, y2 = bbox
     w_box = max(10, x2 - x1)
@@ -2142,19 +2200,30 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     # Half-span in pixels along the axis
     L_px = math.hypot(w_box, h_box) * 0.42
 
-    sample_fractions = [-0.35, -0.20, 0.0, 0.20, 0.35]
+    sample_fractions = [-0.38, -0.25, -0.12, 0.0, 0.12, 0.25, 0.38]
     sample_pixels = []
     for f in sample_fractions:
         px = int(np.clip(cx + f * L_px * ux, x1 + 2, x2 - 2))
         py = int(np.clip(cy + f * L_px * uy, y1 + 2, y2 - 2))
         sample_pixels.append((px, py))
 
-    # Centerline samples for vertical bounding boxes
+    # Centerline samples for vertical or steep bounding boxes
     if abs(tilt_deg) <= 30.0:
-        for f_y in [0.20, 0.35, 0.50, 0.65, 0.80]:
+        for f_y in [0.18, 0.32, 0.50, 0.68, 0.82]:
             py_box = int(np.clip(y1 + f_y * h_box, y1 + 2, y2 - 2))
             if (cx, py_box) not in sample_pixels:
                 sample_pixels.append((cx, py_box))
+
+    # General diagonal bounding box samples
+    diag_pts = [
+        (int(x1 + 0.25 * w_box), int(y1 + 0.25 * h_box)),
+        (int(x1 + 0.75 * w_box), int(y1 + 0.25 * h_box)),
+        (int(x1 + 0.25 * w_box), int(y1 + 0.75 * h_box)),
+        (int(x1 + 0.75 * w_box), int(y1 + 0.75 * h_box)),
+    ]
+    for dpx, dpy in diag_pts:
+        if (dpx, dpy) not in sample_pixels:
+            sample_pixels.append((dpx, dpy))
 
     # Query 3D camera coordinates and convert to arm base frame
     valid_samples = []
@@ -2179,101 +2248,111 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     if len(valid_samples) < 2:
         return {
             "is_lying_flat": False,
+            "is_3d_diagonal": False,
+            "is_upright": True,
             "h_span_mm": 0.0,
             "v_span_mm": 0.0,
+            "elev_deg": 90.0,
+            "yaw_deg": 0.0,
             "target_pitch_deg": default_pitch,
             "target_roll_deg": default_roll,
             "delta_roll_deg": default_delta,
             "midpoint_base": None,
             "midpoint_cam": None,
-            "yaw_deg": 0.0,
+            "V_axis": None,
+            "J_vec": None,
             "confidence": "insufficient_3d_samples"
         }
 
-    pts_b = [s[3] for s in valid_samples]
+    pts_b = np.array([s[3] for s in valid_samples], dtype=np.float64)
     pts_c = [s[2] for s in valid_samples]
-    xs = [p[0] for p in pts_b]
-    ys = [p[1] for p in pts_b]
-    zs = [p[2] for p in pts_b]
 
-    dx_all = max(xs) - min(xs)
-    dy_all = max(ys) - min(ys)
+    # 3D Centroid
+    midpoint_b = np.mean(pts_b, axis=0)
+    mid_x_b, mid_y_b, mid_z_b = float(midpoint_b[0]), float(midpoint_b[1]), float(midpoint_b[2])
+
+    # 3D PCA to extract the true 3D spatial axis vector V of the cylinder
+    centered = pts_b - midpoint_b
+    if len(pts_b) >= 3:
+        cov = np.cov(centered, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov)
+        V = evecs[:, -1]
+    else:
+        diff = pts_b[-1] - pts_b[0]
+        norm_d = np.linalg.norm(diff)
+        V = (diff / norm_d) if norm_d > 1e-4 else np.array([1.0, 0.0, 0.0])
+
+    # Ensure V points upwards (V_z >= 0) or forward
+    if V[2] < -1e-4:
+        V = -V
+    elif abs(V[2]) < 0.05 and V[0] < 0:
+        V = -V
+
+    dx_all = float(np.max(pts_b[:, 0]) - np.min(pts_b[:, 0]))
+    dy_all = float(np.max(pts_b[:, 1]) - np.min(pts_b[:, 1]))
     h_span = math.hypot(dx_all, dy_all)
-    v_span = max(zs) - min(zs)
+    v_span = float(np.max(pts_b[:, 2]) - np.min(pts_b[:, 2]))
 
-    p_near = min(pts_b, key=lambda p: math.hypot(p[0], p[1]))
-    p_far  = max(pts_b, key=lambda p: math.hypot(p[0], p[1]))
-    end_dx = p_far[0] - p_near[0]
-    end_dy = p_far[1] - p_near[1]
-    end_dz = abs(p_far[2] - p_near[2])
-    end_dist = math.hypot(end_dx, end_dy)
+    # 3D Elevation angle above horizontal table (0° = flat, 90° = vertical upright)
+    V_xy = math.hypot(V[0], V[1])
+    elev_deg = math.degrees(math.atan2(abs(V[2]), V_xy))
 
-    # 3D Disambiguation:
-    # Lying flat on tabletop: both ends rest on table (v_span <= 45mm), length spans table (h_span >= 60mm).
-    # Standing upright: v_span >= 100mm, h_span <= 40mm.
-    is_lying_flat = (h_span > v_span + 25.0) or (v_span < 45.0 and h_span > 60.0)
+    # Tabletop yaw angle
+    pan_rad = math.atan2(mid_y_b, mid_x_b)
+    pan_deg = math.degrees(pan_rad)
+    bottle_yaw_deg = math.degrees(math.atan2(V[1], V[0]))
+    rel_table_deg = bottle_yaw_deg - pan_deg
+    while rel_table_deg > 90.0:
+        rel_table_deg -= 180.0
+    while rel_table_deg < -90.0:
+        rel_table_deg += 180.0
 
-    mid_x_b = (p_near[0] + p_far[0]) / 2.0
-    mid_y_b = (p_near[1] + p_far[1]) / 2.0
-    mid_z_b = (p_near[2] + p_far[2]) / 2.0
+    # Classification
+    is_lying_flat = (elev_deg < 20.0) or (h_span > v_span + 25.0 and v_span < 45.0)
+    is_upright = (elev_deg > 75.0) or (v_span > h_span + 50.0 and h_span < 45.0)
+    is_3d_diagonal = not is_lying_flat and not is_upright
+
+    # Approach pitch calculation
+    if is_lying_flat:
+        target_pitch = -70.0
+        pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
+    elif is_upright:
+        target_pitch = 0.0
+        pose_desc = "STANDING UPRIGHT"
+    else:
+        calc_pitch = -(90.0 - elev_deg)
+        target_pitch = float(np.clip(calc_pitch, -70.0, 0.0))
+        pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, tabletop angle={rel_table_deg:+.1f}°)"
+
+    # Closed-form optimal wrist_roll solver
+    target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
+
     mid_idx = len(pts_c) // 2
     midpoint_cam = pts_c[mid_idx]
-
     table_floor_z = -135.0
-    safe_z_b = max(table_floor_z + 15.0, mid_z_b)
+    safe_z_b = max(table_floor_z + 15.0, mid_z_b) if is_lying_flat else mid_z_b
     midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
 
-    if is_lying_flat:
-        target_pitch = -70.0   # Steep top-down approach from above table
+    print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
+    print(f"   🎯 Grasp Command: Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}° | Left Offset=+{GRAB_LATERAL_OFFSET_MM:.1f}mm along J=[{J_vec[0]:+.2f},{J_vec[1]:+.2f},{J_vec[2]:+.2f}]")
 
-        bottle_yaw_rad = math.atan2(end_dy, end_dx)
-        pan_rad = math.atan2(mid_y_b, mid_x_b)
-        rel_rad = bottle_yaw_rad - pan_rad
-        rel_deg = math.degrees(rel_rad)
-
-        while rel_deg > 90.0:
-            rel_deg -= 180.0
-        while rel_deg < -90.0:
-            rel_deg += 180.0
-
-        delta_roll = -rel_deg
-        target_roll = float(np.clip(base_roll + delta_roll, -170.0, 170.0))
-
-        yaw_desc = "pointing towards arm" if abs(rel_deg) <= 25.0 else (
-            "sideways" if abs(abs(rel_deg) - 90.0) <= 25.0 else f"angled {rel_deg:+.1f}°"
-        )
-        print(f"   📐 3D Analysis: Object is LYING FLAT on table ({yaw_desc}) | "
-              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm (EndDist={end_dist:.0f}mm, ΔZ={end_dz:.0f}mm)")
-        print(f"   🎯 Top-Down Grasp Command: Pitch={target_pitch:.1f}° | "
-              f"Wrist Roll={target_roll:.1f}° (Δroll={delta_roll:+.1f}°) | Base Target=({mid_x_b:.0f},{mid_y_b:.0f},{safe_z_b:.0f})mm")
-
-        return {
-            "is_lying_flat": True,
-            "h_span_mm": round(h_span, 1),
-            "v_span_mm": round(v_span, 1),
-            "target_pitch_deg": target_pitch,
-            "target_roll_deg": target_roll,
-            "delta_roll_deg": round(delta_roll, 1),
-            "midpoint_base": midpoint_base,
-            "midpoint_cam": midpoint_cam,
-            "yaw_deg": round(rel_deg, 1),
-            "confidence": "high_3d_span"
-        }
-    else:
-        print(f"   📐 3D Analysis: Object is STANDING UPRIGHT | "
-              f"H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm → Level Approach (pitch={default_pitch:.1f}°)")
-        return {
-            "is_lying_flat": False,
-            "h_span_mm": round(h_span, 1),
-            "v_span_mm": round(v_span, 1),
-            "target_pitch_deg": default_pitch,
-            "target_roll_deg": default_roll,
-            "delta_roll_deg": default_delta,
-            "midpoint_base": midpoint_base,
-            "midpoint_cam": midpoint_cam,
-            "yaw_deg": 0.0,
-            "confidence": "high_3d_span"
-        }
+    return {
+        "is_lying_flat": is_lying_flat,
+        "is_3d_diagonal": is_3d_diagonal,
+        "is_upright": is_upright,
+        "h_span_mm": round(h_span, 1),
+        "v_span_mm": round(v_span, 1),
+        "elev_deg": round(elev_deg, 1),
+        "yaw_deg": round(rel_table_deg, 1),
+        "target_pitch_deg": round(target_pitch, 1),
+        "target_roll_deg": round(target_roll, 1),
+        "delta_roll_deg": round(target_roll - base_roll, 1),
+        "midpoint_base": midpoint_base,
+        "midpoint_cam": midpoint_cam,
+        "V_axis": V,
+        "J_vec": J_vec,
+        "confidence": "high_3d_span"
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3382,34 +3461,55 @@ def main():
                     xyz = orient_3d["midpoint_cam"]
 
             for pen_mm in penetration_candidates:
-                if orient_3d.get("is_lying_flat") and orient_3d.get("midpoint_base") is not None:
-                    # For lying flat: target is the midpoint along the cylinder body
+                if orient_3d.get("confidence") == "high_3d_span" and orient_3d.get("midpoint_base") is not None:
                     mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
                     arm_x = mid_x
                     arm_y = mid_y
-                    # In a steep top-down grasp (-70°), descend towards the cylinder midline
-                    # Clamped safely at table_floor_z + 15.0 mm (-120.0 mm) so fingertips never touch the table
                     table_floor_z = -135.0
-                    arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
+
+                    if orient_3d["is_lying_flat"]:
+                        # Lying flat: descend towards cylinder midline from above
+                        arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
+                    elif orient_3d.get("is_3d_diagonal"):
+                        # 3D diagonal: approach along pitch angle towards cylinder center
+                        pitch_rad = math.radians(target_pitch)
+                        pan_rad = math.atan2(arm_y, arm_x)
+                        ax = math.cos(pitch_rad) * math.cos(pan_rad)
+                        ay = math.cos(pitch_rad) * math.sin(pan_rad)
+                        az = math.sin(pitch_rad)
+                        arm_x += pen_mm * ax
+                        arm_y += pen_mm * ay
+                        arm_z = max(table_floor_z + 15.0, mid_z + pen_mm * az)
+                    else:
+                        # Upright: target via depth_to_arm_target with penetration
+                        target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
+                        if target is not None:
+                            arm_x, arm_y, arm_z = target
+                        else:
+                            arm_z = mid_z
                 else:
                     target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
                     if target is None:
                         continue
                     arm_x, arm_y, arm_z = target
 
-                # ── Apply lateral claw offset (perpendicular to approach vector, rotated by roll) ──
+                # ── Apply true 3D lateral claw offset along jaw opening vector J ──
+                # Shifts claw to the LEFT (away from static pincer) so jaws center cleanly over object
                 if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
-                    pan_t = math.atan2(arm_y, arm_x)
-                    eff_lat = GRAB_LATERAL_OFFSET_MM * math.cos(math.radians(delta_roll))
-                    eff_vert = GRAB_LATERAL_OFFSET_MM * math.sin(math.radians(delta_roll))
-                    arm_x += -eff_lat * math.sin(pan_t)
-                    arm_y +=  eff_lat * math.cos(pan_t)
-                    arm_z +=  eff_vert
+                    J = orient_3d.get("J_vec")
+                    if J is not None:
+                        arm_x += GRAB_LATERAL_OFFSET_MM * float(J[0])
+                        arm_y += GRAB_LATERAL_OFFSET_MM * float(J[1])
+                        arm_z += GRAB_LATERAL_OFFSET_MM * float(J[2])
+                    else:
+                        pan_t = math.atan2(arm_y, arm_x)
+                        arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
+                        arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
 
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface
                 table_floor_z = -135.0
-                min_safe_z = (table_floor_z + 15.0) if orient_3d.get("is_lying_flat") else table_floor_z
+                min_safe_z = (table_floor_z + 15.0) if (orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal")) else table_floor_z
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {min_safe_z:.0f}mm) → elevating to {min_safe_z:.0f}mm")
                     arm_z = min_safe_z

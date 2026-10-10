@@ -373,14 +373,49 @@ class HighFPSRealSenseStream:
         self.thread.start()
 
     def _init_hardware(self):
+        target_fps_list = [self.target_fps, 60, 30, 15]
+        target_fps_list = list(dict.fromkeys(target_fps_list))
+
+        candidates = []
+        for f in target_fps_list:
+            candidates.append((self.width, self.height, rs.format.yuyv, f, f"YUYV {self.width}x{self.height} {f}fps"))
+            candidates.append((640,        480,         rs.format.yuyv, f, f"YUYV 640x480 {f}fps"))
+            candidates.append((self.width, self.height, rs.format.rgb8, f, f"RGB8 {self.width}x{self.height} {f}fps"))
+            candidates.append((640,        480,         rs.format.rgb8, f, f"RGB8 640x480 {f}fps"))
+            candidates.append((self.width, self.height, rs.format.bgr8, f, f"BGR8 {self.width}x{self.height} {f}fps"))
+
         self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        # Enable 60 FPS streaming profile
-        cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps)
-        cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.target_fps)
-        profile = self.pipeline.start(cfg)
-        
-        # Extract true camera intrinsics
+        profile = None
+
+        for (w, h, fmt, f, label) in candidates:
+            try:
+                cfg = rs.config()
+                cfg.enable_stream(rs.stream.color, w, h, fmt, f)
+                cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, f)
+                profile = self.pipeline.start(cfg)
+                self._color_format = fmt
+                self.width, self.height = w, h
+                print(f"[CAM] RealSense D405 started: {label}")
+                break
+            except Exception:
+                if self.pipeline:
+                    try:
+                        self.pipeline.stop()
+                    except Exception:
+                        pass
+                self.pipeline = rs.pipeline()
+
+        if profile is None:
+            # Fallback auto-detect
+            try:
+                print("      Trying RealSense auto-detect profile...")
+                profile = self.pipeline.start()
+                color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                self._color_format = color_stream.format()
+                print(f"[CAM] RealSense D405 started: auto-detect ({self._color_format})")
+            except Exception as e:
+                raise RuntimeError(f"Could not open RealSense in any format: {e}")
+
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
         self.intrinsics = {
@@ -389,7 +424,11 @@ class HighFPSRealSenseStream:
             "cx": intr.ppx,
             "cy": intr.ppy
         }
-        print(f"[CAM] RealSense D405 connected @ {self.width}x{self.height} {self.target_fps} FPS (Hardware Mode)")
+        try:
+            self.actual_fps = color_stream.fps()
+            print(f"      Actual hardware stream: {self._color_format} @ {self.actual_fps} FPS")
+        except Exception:
+            pass
 
     def _worker_loop(self):
         frame_interval = 1.0 / max(1, self.target_fps)
@@ -404,7 +443,19 @@ class HighFPSRealSenseStream:
                     d_f = frames.get_depth_frame()
                     if not c_f or not d_f:
                         continue
-                    color_frame = np.asanyarray(c_f.get_data())
+                    color_raw = np.asanyarray(c_f.get_data())
+                    fmt = getattr(self, "_color_format", rs.format.bgr8)
+                    if fmt == rs.format.bgr8:
+                        color_frame = color_raw
+                    elif fmt == rs.format.rgb8:
+                        color_frame = cv2.cvtColor(color_raw, cv2.COLOR_RGB2BGR)
+                    elif fmt == rs.format.yuyv:
+                        raw = color_raw.view(np.uint8)
+                        color_frame = raw.reshape(c_f.height, c_f.width, 2)
+                        color_frame = cv2.cvtColor(color_frame, cv2.COLOR_YUV2BGR_YUYV)
+                    else:
+                        color_frame = color_raw
+                    color_frame = np.ascontiguousarray(color_frame, dtype=np.uint8)
                     depth_frame = np.asanyarray(d_f.get_data()).astype(np.uint16)
                 except Exception:
                     color_frame, depth_frame = self._generate_mock_frame()
@@ -569,14 +620,20 @@ class LocalVLMConfirmation:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 model_id = "microsoft/Florence-2-base"
                 print(f"[VLM] Loading Local VLM ({model_id}) on {device.upper()}...")
-                # Note: In production this loads local cached weights in ~1.5s
-                # For quick startup, check if cached:
                 self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                    trust_remote_code=True
-                ).to(device)
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_id,
+                        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                        trust_remote_code=True,
+                        attn_implementation="sdpa"
+                    ).to(device)
+                except Exception:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_id,
+                        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                        trust_remote_code=True
+                    ).to(device)
                 self._loaded = True
                 print("[OK] Local Florence-2 VLM loaded successfully!")
                 return
@@ -832,6 +889,65 @@ class ArmKinematicsSolver:
         return solution, (bx, by, bz), latency_ms
 
 
+def setup_native_display() -> bool:
+    """
+    Ensure the script has full permission to open native popup windows directly
+    on the Jetson monitor, handling root X11 permissions automatically.
+    Returns True if an X11 window can be opened, False otherwise.
+    """
+    import glob, subprocess
+
+    cur_auth = os.environ.get("XAUTHORITY", "")
+    if not cur_auth or not os.path.exists(cur_auth):
+        candidates = [
+            "/home/pablo/.Xauthority",
+            "/home/jetson/.Xauthority",
+            "/root/.Xauthority",
+            "/run/user/1000/gdm/Xauthority",
+            "/run/user/1000/Xauthority",
+        ]
+        candidates.extend(glob.glob("/home/*/.Xauthority"))
+        for p in candidates:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                os.environ["XAUTHORITY"] = p
+                break
+
+    display_candidates = []
+    if os.environ.get("DISPLAY"):
+        display_candidates.append(os.environ["DISPLAY"])
+    display_candidates.extend([":0", ":1", ":0.0", ":1.0"])
+
+    seen = set()
+    unique_displays = [d for d in display_candidates if not (d in seen or seen.add(d))]
+
+    for disp in unique_displays:
+        os.environ["DISPLAY"] = disp
+        try:
+            subprocess.run(["xhost", "+local:root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+        except Exception:
+            try:
+                subprocess.run(["xhost", "+"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+            except Exception:
+                pass
+
+        try:
+            test_win = "__display_probe__"
+            cv2.namedWindow(test_win, cv2.WINDOW_AUTOSIZE)
+            probe_frame = np.zeros((10, 10, 3), dtype=np.uint8)
+            cv2.imshow(test_win, probe_frame)
+            cv2.waitKey(1)
+            cv2.destroyWindow(test_win)
+            cv2.waitKey(1)
+            print(f"[DISPLAY] Jetson monitor connected! Live GUI enabled on DISPLAY={disp}.")
+            return True
+        except Exception:
+            continue
+
+    print("[DISPLAY] No active X11 display available. Running in HEADLESS mode.")
+    print("          (Tip: Run 'xhost +' on your Jetson desktop terminal if you wish to see the live window)")
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Main Pipeline Runner & Live Latency Dashboard
 # ─────────────────────────────────────────────────────────────────────────────
@@ -846,6 +962,17 @@ def run_tiered_pipeline_benchmark(args):
     print(f" * Max Allowed Latency:      < 300.0 ms (Target)")
     print("=" * 72)
 
+    # Automatically probe X11 display permissions if GUI was requested
+    if not args.headless:
+        has_display = setup_native_display()
+        if not has_display:
+            args.headless = True
+        else:
+            try:
+                cv2.namedWindow("Tiered Grasp Pipeline", cv2.WINDOW_AUTOSIZE)
+            except Exception:
+                args.headless = True
+
     # Initialize components
     cam = HighFPSRealSenseStream(target_fps=args.fps, width=args.width, height=args.height, use_mock=args.mock)
     tripwire = TripwireScanner(target_label=args.target)
@@ -853,9 +980,6 @@ def run_tiered_pipeline_benchmark(args):
     cropper = PointCloudCropper(max_points=2048)
     grasp_planner = GraspPosePredictor()
     ik_solver = ArmKinematicsSolver()
-
-    if not args.headless:
-        cv2.namedWindow("Tiered Grasp Pipeline", cv2.WINDOW_AUTOSIZE)
 
     iteration = 0
     t_last_report = time.time()
@@ -957,10 +1081,13 @@ def run_tiered_pipeline_benchmark(args):
                 cv2.circle(vis, (gx, gy), int(grasp_cand.jaw_opening_mm / 3.0), (0, 255, 0), 2)
 
             if not args.headless:
-                cv2.imshow("Tiered Grasp Pipeline", vis)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27 or key == ord('q'):
-                    break
+                try:
+                    cv2.imshow("Tiered Grasp Pipeline", vis)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27 or key == ord('q'):
+                        break
+                except Exception:
+                    args.headless = True
 
             iteration += 1
             if args.frames > 0 and iteration >= args.frames:

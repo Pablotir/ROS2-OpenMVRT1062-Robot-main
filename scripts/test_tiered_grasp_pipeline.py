@@ -127,15 +127,311 @@ CAM_Y_OFFSET_MM = 50.0
 CAM_Z_OFFSET_MM = 0.0
 CAM_PITCH_DEG   = 45.0
 
-# Reference Home Scan Pose (from arm_reference_poses.yaml)
-DEFAULT_SCAN_JOINTS = {
-    "shoulder_pan.pos": -14.95,
-    "shoulder_lift.pos": -104.22,
-    "elbow_flex.pos": 98.29,
-    "wrist_flex.pos": 18.02,
-    "wrist_roll.pos": -68.62,
-    "gripper.pos": 72.60
+try:
+    from lerobot.robots.so101_follower.so101_follower import SO101Follower as SOFollower
+    from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig as SOFollowerRobotConfig
+except (ImportError, ModuleNotFoundError):
+    try:
+        from lerobot.robots.so_follower.so_follower import SOFollower
+        from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from lerobot.common.robot_devices.robots.feetech import SO100Follower as SOFollower
+            from lerobot.common.robot_devices.robots.configs import SO100FollowerConfig as SOFollowerRobotConfig
+        except (ImportError, ModuleNotFoundError):
+            SOFollower = None
+            SOFollowerRobotConfig = None
+
+PORT   = "/dev/arm_controller"
+ARM_ID = "jetson_arm"
+
+_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex",
+                "wrist_flex", "wrist_roll", "gripper"]
+_HW_ERR_BITS = {
+    0x01: "Input Voltage Error",
+    0x02: "Motor Overheat",
+    0x04: "Overload Error",
+    0x08: "ElectricalShock Error",
+    0x10: "Overheated Error",
+    0x20: "Instruction Error",
 }
+_ERR_REG_CANDIDATES = [
+    "Hardware_Error_Status",
+    "hardware_error_status",
+    "Hw_Error_Status",
+    "HW_Error_Status",
+]
+_LOAD_REG_CANDIDATES = ["Present_Load", "present_load", "Load"]
+_LOAD_STALL_THRESHOLD = 800
+
+# Reference scan & stow postures (loaded from arm_reference_poses.yaml)
+_BASE = {
+    "shoulder_pan.pos":   -14.95,
+    "shoulder_lift.pos": -104.22,
+    "elbow_flex.pos":      98.29,
+    "wrist_flex.pos":      18.02,
+    "wrist_roll.pos":     -68.62,
+    "gripper.pos":         72.60,
+}
+_STOW_BASE = {
+    "shoulder_pan.pos":   -15.03,
+    "shoulder_lift.pos": -100.00,
+    "elbow_flex.pos":      98.20,
+    "wrist_flex.pos":      76.84,
+    "wrist_roll.pos":     -68.62,
+    "gripper.pos":         72.60,
+}
+
+def load_reference_poses():
+    """Load calibrated scan_base and stow_base postures from YAML if available."""
+    import yaml
+    search_paths = [
+        "/root/ros2_ws/calibration/arm_reference_poses.yaml",
+        os.path.join(os.path.dirname(__file__), "..", "calibration", "arm_reference_poses.yaml"),
+        os.path.join(os.path.dirname(__file__), "calibration", "arm_reference_poses.yaml"),
+        os.path.join(os.path.dirname(__file__), "arm_reference_poses.yaml"),
+        "calibration/arm_reference_poses.yaml",
+        "arm_reference_poses.yaml",
+    ]
+    for p in search_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r") as f:
+                    data = yaml.safe_load(f)
+                if not data:
+                    continue
+                scan = data.get("scan_base", {}).get("joints")
+                stow = data.get("stow_base", {}).get("joints")
+                if scan:
+                    for k, v in scan.items():
+                        _BASE[k] = round(float(v), 2)
+                    print(f"[POSE] Loaded scan_base posture from: {p}")
+                if stow:
+                    for k, v in stow.items():
+                        _STOW_BASE[k] = round(float(v), 2)
+                return p
+            except Exception as e:
+                print(f"[WARN] Failed reading {p}: {e}")
+    return None
+
+load_reference_poses()
+DEFAULT_SCAN_JOINTS = dict(_BASE)
+
+
+def get_pos(robot) -> dict:
+    """Reads current joint positions from the physical arm."""
+    obs = robot.get_observation()
+    joints = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
+              "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
+    return {k: v for k, v in obs.items() if k in joints}
+
+
+def check_servo_health(robot) -> bool:
+    """Read error status from every servo BEFORE issuing motion."""
+    err_reg = None
+    for candidate in _ERR_REG_CANDIDATES:
+        try:
+            robot.bus.read(candidate, _MOTOR_NAMES[0])
+            err_reg = candidate
+            break
+        except Exception:
+            continue
+
+    if err_reg is not None:
+        all_ok = True
+        for name in _MOTOR_NAMES:
+            try:
+                val = int(robot.bus.read(err_reg, name))
+                if val != 0:
+                    flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
+                    print(f"   [ERR]  {name}: error=0x{val:02X}  ({', '.join(flags)})")
+                    all_ok = False
+            except Exception:
+                pass
+        return all_ok
+
+    load_reg = None
+    for candidate in _LOAD_REG_CANDIDATES:
+        try:
+            robot.bus.read(candidate, _MOTOR_NAMES[0])
+            load_reg = candidate
+            break
+        except Exception:
+            continue
+
+    if load_reg is not None:
+        all_ok = True
+        for name in _MOTOR_NAMES:
+            try:
+                raw_val = abs(int(robot.bus.read(load_reg, name)))
+                load_mag = raw_val & 0x03FF
+                if load_mag > _LOAD_STALL_THRESHOLD:
+                    print(f"   [ERR]  {name}: high load ({load_mag}/1023)")
+                    all_ok = False
+            except Exception:
+                pass
+        return all_ok
+
+    return True
+
+
+def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.03):
+    """Interpolates motion smoothly between current pose and target pose."""
+    cur = get_pos(robot)
+    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+    if max_delta < 0.5:
+        return
+    n = max(1, int(max_delta / step_size))
+    for s in range(1, n + 1):
+        t = s / n
+        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0)) for j in target}
+        robot.send_action(interp)
+        time.sleep(step_delay)
+
+
+def connect_robot():
+    """Connect to SO-ARM101 using calibrated JSON and verify health."""
+    if SOFollower is None or SOFollowerRobotConfig is None:
+        raise RuntimeError("lerobot package not found. Cannot connect to physical arm.")
+
+    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
+    robot = SOFollower(config)
+
+    # Locate calibration JSON
+    import json as _json, pathlib as _pathlib, builtins as _builtins
+    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
+                  os.environ.get("TRANSFORMERS_CACHE",
+                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
+    _calib_search = [
+        _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/ros2_ws/scripts/{ARM_ID}.json"),
+        _pathlib.Path(__file__).parent / f"{ARM_ID}.json",
+        _pathlib.Path(__file__).parent.parent / "calibration" / f"{ARM_ID}.json",
+        _pathlib.Path(__file__).parent / "calibration" / f"{ARM_ID}.json",
+        _pathlib.Path(f"calibration/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+    ]
+    _calib_path = next((p for p in _calib_search if p.exists()), None)
+
+    _EMBEDDED_CALIB = {
+        "shoulder_pan":  {"id": 1, "drive_mode": 0, "homing_offset": 1604,  "range_min": 962,  "range_max": 3486},
+        "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": -1498, "range_min": 814,  "range_max": 3207},
+        "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
+        "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
+        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 0,    "range_max": 4095},
+        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626}
+    }
+
+    if _calib_path is not None:
+        print(f"   [CALIB] Calibration: {_calib_path}")
+        with open(_calib_path) as _f:
+            _calib_data = _json.load(_f)
+    else:
+        _calib_data = _EMBEDDED_CALIB
+
+    if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
+        robot.bus.default_num_retry = 3
+
+    connected = False
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            try:
+                robot.connect(calibrate=False)
+            except TypeError:
+                _real_input = _builtins.input
+                def _auto_use_file(prompt=""):
+                    if "enter" in prompt.lower() and "range" not in prompt.lower():
+                        return ""
+                    _builtins.input = _real_input
+                    return _real_input(prompt)
+                _builtins.input = _auto_use_file
+                try:
+                    robot.connect()
+                finally:
+                    _builtins.input = _real_input
+            connected = True
+            break
+        except Exception as e:
+            last_err = e
+            if hasattr(robot, "bus"):
+                try:
+                    robot.bus.disconnect()
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+    if not connected:
+        raise RuntimeError(f"Could not connect to arm: {last_err}")
+
+    # Build typed calibration objects for LeRobot
+    from types import SimpleNamespace as _NS
+    _MC = None
+    for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
+                    "lerobot.common.robot_devices.motors.feetech"):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_mc_mod)
+            for _cname in ("MotorCalibration", "CalibrationData", "Calibration"):
+                if hasattr(_mod, _cname):
+                    _MC = getattr(_mod, _cname)
+                    break
+            if _MC:
+                break
+        except Exception:
+            pass
+
+    def _make_motor_calib(d: dict):
+        if _MC is not None:
+            try:
+                import dataclasses as _dc
+                if _dc.is_dataclass(_MC):
+                    _fields = {f.name for f in _dc.fields(_MC)}
+                    return _MC(**{k: v for k, v in d.items() if k in _fields})
+                return _MC(**d)
+            except Exception:
+                pass
+        return _NS(**d)
+
+    _typed_calib = {
+        _motor: _make_motor_calib(_jdata)
+        for _motor, _jdata in _calib_data.items()
+        if isinstance(_jdata, dict)
+    }
+
+    _registered = False
+    for _method in ("set_calibration", "load_calibration", "_set_calibration"):
+        if hasattr(robot.bus, _method):
+            for _payload in (_typed_calib, _calib_data):
+                try:
+                    getattr(robot.bus, _method)(_payload)
+                    _registered = True
+                    break
+                except Exception:
+                    pass
+            if _registered:
+                break
+    if not _registered:
+        for _attr in ("calibration", "_calibration"):
+            try:
+                setattr(robot.bus, _attr, _typed_calib)
+                _registered = True
+                break
+            except Exception:
+                pass
+
+    if not check_servo_health(robot):
+        robot.disconnect()
+        raise RuntimeError("Servo health check failed — power cycle arm.")
+
+    return robot
 
 
 def build_T_cam_wrist() -> np.ndarray:
@@ -994,6 +1290,26 @@ def run_tiered_pipeline_benchmark(args):
     last_joint_sol = None
     last_base_xyz = None
 
+    # Connect to physical SO-ARM101 robot and move to scan posture
+    robot = None
+    arm_live_joints = dict(_BASE)
+
+    if not args.no_arm and os.path.exists(PORT) and SOFollower is not None:
+        try:
+            print(f"[ROBOT] Connecting to SO-ARM101 on {PORT}...")
+            robot = connect_robot()
+            print("[ROBOT] Connected! Moving arm to elevated START_POS (scan posture)...")
+            smooth_move(robot, _BASE, step_size=1.5, step_delay=0.03)
+            arm_live_joints = get_pos(robot)
+            print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.")
+        except Exception as e:
+            print(f"[WARN] Robot arm connection failed ({e}). Proceeding in vision-only observation mode.")
+            robot = None
+    elif args.no_arm:
+        print("[INFO] --no-arm specified: Operating in vision-only observation mode.")
+    else:
+        print(f"[INFO] Controller {PORT} not found. Operating in vision-only observation mode.")
+
     try:
         while True:
             # ── CAMERA FETCH (High-Speed Stream) ──────────────────────────────
@@ -1035,7 +1351,8 @@ def run_tiered_pipeline_benchmark(args):
 
                         if grasp_cand is not None:
                             # Step D: Analytical IK & Collision Check
-                            joint_sol, base_xyz, ik_lat = ik_solver.compute_joint_targets(grasp_cand)
+                            cur_j = get_pos(robot) if robot is not None else arm_live_joints
+                            joint_sol, base_xyz, ik_lat = ik_solver.compute_joint_targets(grasp_cand, current_joints=cur_j)
                             metrics_ik.append(ik_lat)
                             if joint_sol is not None:
                                 tier2_executed = True
@@ -1080,6 +1397,20 @@ def run_tiered_pipeline_benchmark(args):
                 cv2.drawMarker(vis, (gx, gy), (0, 0, 255), cv2.MARKER_CROSS, 25, 2)
                 cv2.circle(vis, (gx, gy), int(grasp_cand.jaw_opening_mm / 3.0), (0, 255, 0), 2)
 
+                # Optional physical grasp execution if requested
+                if args.execute_grasp and robot is not None:
+                    print("\n[GRASP] Executing physical grasp trajectory on target object...")
+                    pre_grasp = dict(joint_sol)
+                    pre_grasp["gripper.pos"] = 80.0
+                    smooth_move(robot, pre_grasp, step_size=1.5, step_delay=0.03)
+                    time.sleep(0.3)
+                    grip_cmd = dict(pre_grasp)
+                    grip_cmd["gripper.pos"] = joint_sol.get("gripper.pos", 50.0)
+                    smooth_move(robot, grip_cmd, step_size=2.0, step_delay=0.03)
+                    time.sleep(0.6)
+                    smooth_move(robot, _BASE, step_size=2.0, step_delay=0.03)
+                    print("[GRASP] Object successfully grasped and lifted to scan posture!\n")
+
             if not args.headless:
                 try:
                     cv2.imshow("Tiered Grasp Pipeline", vis)
@@ -1102,6 +1433,12 @@ def run_tiered_pipeline_benchmark(args):
 
     finally:
         cam.stop()
+        if robot is not None:
+            try:
+                print("\n[ROBOT] Disconnecting robot arm...")
+                robot.disconnect()
+            except Exception:
+                pass
         if not args.headless:
             try:
                 cv2.destroyAllWindows()
@@ -1152,6 +1489,8 @@ if __name__ == "__main__":
     parser.add_argument("--mock", action="store_true", help="Force synthetic 60 FPS mock camera stream")
     parser.add_argument("--headless", action="store_true", help="Run without X11 GUI window (for remote SSH/Jetson)")
     parser.add_argument("--frames", type=int, default=0, help="Exit after N frames (0 = infinite)")
+    parser.add_argument("--no-arm", action="store_true", help="Run without connecting to physical robot arm")
+    parser.add_argument("--execute-grasp", action="store_true", help="Physically execute grasp motion when object is confirmed")
     args = parser.parse_args()
 
     run_tiered_pipeline_benchmark(args)

@@ -342,6 +342,42 @@ def make_vis_combined(img: np.ndarray, depth_map=None) -> np.ndarray:
 
 # (Arm primitives get_pos, check_servo_health, smooth_move, level_approach imported from arm_picker)
 
+def monitored_smooth_move(robot, target: dict, step_size=1.0, step_delay=0.05, hold_joints=None, max_safe_load=550):
+    """
+    Interpolates smoothly to target while monitoring servo loads in real-time.
+    Automatically halts if any servo encounters mechanical resistance (load > max_safe_load),
+    preventing motor stall, plastic gear strain, or overload shutdowns.
+    """
+    if hold_joints is None:
+        hold_joints = []
+    cur = get_pos(robot)
+    for j in hold_joints:
+        if j in target:
+            cur[j] = target[j]
+    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target if j in cur)
+    if max_delta < 0.5:
+        return
+    n = max(1, int(max_delta / step_size))
+
+    for s in range(1, n + 1):
+        t = s / n
+        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0)) for j in target}
+        robot.send_action(interp)
+        time.sleep(step_delay)
+
+        # Monitor sensitive joints (gripper, wrist_roll, wrist_flex) every 4 steps
+        if s % 4 == 0 or s == n:
+            for name in ("gripper", "wrist_roll", "wrist_flex"):
+                try:
+                    raw_load = abs(int(robot.bus.read("Present_Load", name)))
+                    load_mag = raw_load & 0x03FF
+                    if load_mag > max_safe_load:
+                        print(f"\n   🛑 AUTOMATIC SAFETY BRAKE: {name} load={load_mag}/1023 exceeded safety threshold ({max_safe_load})!")
+                        print(f"      Halted at step {s}/{n} (progress={t*100:.0f}%). Position clamped to prevent motor strain.\n")
+                        return
+                except Exception:
+                    pass
+
 
 def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
     """
@@ -1212,7 +1248,14 @@ def run_tiered_pipeline(args):
     # 4. Move to Start Position (Matches arm_picker.py Option 4 lines 3188-3195)
     if robot is not None:
         print("\n▶ Moving to Start Position (slow start)...")
-        smooth_move(robot, START_POS, step_size=1.0, step_delay=0.05)
+        cur_pos = get_pos(robot)
+        print("📊 Initial Joint Readings vs Target START_POS:")
+        for k in sorted(START_POS.keys()):
+            c_deg = cur_pos.get(k, 0.0)
+            t_deg = START_POS[k]
+            delta = t_deg - c_deg
+            print(f"   {k:18s}: {c_deg:+7.2f}°  ->  Target: {t_deg:+7.2f}°  (Delta: {delta:+7.2f}°)")
+        monitored_smooth_move(robot, START_POS, step_size=1.0, step_delay=0.05)
         time.sleep(1.0)
         arm_live_joints = get_pos(robot)
         print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.\n")

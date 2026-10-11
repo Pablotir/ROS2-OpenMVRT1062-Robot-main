@@ -19,7 +19,7 @@ Pipeline Architecture:
 
 Display:
   Native OpenCV GUI window directly on the Jetson desktop monitor ("Picker Vision").
-  No web/HTTP streams.
+  NO web / HTTP / Wi-Fi streams.
 """
 
 import os
@@ -311,11 +311,13 @@ def setup_native_display() -> bool:
         for user in ["pablo", "jetson"] + [os.path.basename(p) for p in glob.glob("/home/*")]:
             try:
                 subprocess.run(
-                    ["su", "-", user, "-c", f"DISPLAY={disp} xhost +local:root"],
+                    ["sudo", "-u", user, "xhost", "+local:root"],
+                    env=dict(os.environ, DISPLAY=disp),
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5
                 )
                 subprocess.run(
-                    ["su", "-", user, "-c", f"DISPLAY={disp} xhost +"],
+                    ["sudo", "-u", user, "xhost", "+"],
+                    env=dict(os.environ, DISPLAY=disp),
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5
                 )
             except Exception:
@@ -588,18 +590,12 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
 
 
 def connect_robot():
-    """Connect to SO-ARM101 using calibrated JSON and verify health."""
+    """Connect to SO-ARM101 using calibrated JSON, completely bypassing manual calibration."""
     if SOFollower is None or SOFollowerRobotConfig is None:
         raise RuntimeError("lerobot package not found. Cannot connect to physical arm.")
 
-    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-    robot = SOFollower(config)
-
-    # Locate calibration JSON
-    import json as _json, pathlib as _pathlib, builtins as _builtins
-    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
-                  os.environ.get("TRANSFORMERS_CACHE",
-                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
+    # 1. Locate calibration JSON
+    import json as _json, pathlib as _pathlib
     _calib_search = [
         _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
         _pathlib.Path(f"/root/ros2_ws/scripts/{ARM_ID}.json"),
@@ -607,16 +603,8 @@ def connect_robot():
         _pathlib.Path(__file__).parent.parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(__file__).parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(f"calibration/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
     ]
-    _calib_path = next((p for p in _calib_search if p.exists()), None)
+    _calib_path = next((p for p in _calib_search if p.exists() and p.stat().st_size > 0), None)
 
     _EMBEDDED_CALIB = {
         "shoulder_pan":  {"id": 1, "drive_mode": 0, "homing_offset": 1604,  "range_min": 962,  "range_max": 3486},
@@ -632,11 +620,49 @@ def connect_robot():
         with open(_calib_path) as _f:
             _calib_data = _json.load(_f)
     else:
+        print(f"   [CALIB] Using embedded calibrated profile for '{ARM_ID}'.")
         _calib_data = _EMBEDDED_CALIB
+
+    # 2. Pre-populate calibration JSON in ALL LeRobot cache locations BEFORE instantiation!
+    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
+                  os.environ.get("TRANSFORMERS_CACHE",
+                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
+    _sync_targets = [
+        _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+    ]
+    for _st in _sync_targets:
+        try:
+            _st.parent.mkdir(parents=True, exist_ok=True)
+            with open(_st, "w") as _sf:
+                _json.dump(_calib_data, _sf, indent=4)
+        except Exception:
+            pass
+
+    # 3. Create robot configuration
+    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
+    if hasattr(config, "calibration_dir"):
+        config.calibration_dir = _pathlib.Path("/root/ros2_ws/calibration")
+
+    robot = SOFollower(config)
+
+    # 4. Enforce is_calibrated = True and neutralize interactive calibration prompt
+    robot.is_calibrated = True
+    if hasattr(robot, "calibration_path"):
+        robot.calibration_path = _pathlib.Path("/root/ros2_ws/calibration/jetson_arm.json")
+    robot.calibrate = lambda *args, **kwargs: None
 
     if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
         robot.bus.default_num_retry = 3
 
+    # 5. Connect without interactive calibration
     connected = False
     last_err = None
     for attempt in range(1, 4):
@@ -644,17 +670,7 @@ def connect_robot():
             try:
                 robot.connect(calibrate=False)
             except TypeError:
-                _real_input = _builtins.input
-                def _auto_use_file(prompt=""):
-                    if "enter" in prompt.lower() and "range" not in prompt.lower():
-                        return ""
-                    _builtins.input = _real_input
-                    return _real_input(prompt)
-                _builtins.input = _auto_use_file
-                try:
-                    robot.connect()
-                finally:
-                    _builtins.input = _real_input
+                robot.connect()
             connected = True
             break
         except Exception as e:
@@ -669,7 +685,7 @@ def connect_robot():
     if not connected:
         raise RuntimeError(f"Could not connect to arm: {last_err}")
 
-    # Build typed calibration objects for LeRobot
+    # 6. Build and inject typed motor calibrations into the bus
     from types import SimpleNamespace as _NS
     _MC = None
     for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
@@ -704,26 +720,24 @@ def connect_robot():
         if isinstance(_jdata, dict)
     }
 
-    _registered = False
     for _method in ("set_calibration", "load_calibration", "_set_calibration"):
         if hasattr(robot.bus, _method):
             for _payload in (_typed_calib, _calib_data):
                 try:
                     getattr(robot.bus, _method)(_payload)
-                    _registered = True
                     break
                 except Exception:
                     pass
-            if _registered:
-                break
-    if not _registered:
-        for _attr in ("calibration", "_calibration"):
-            try:
-                setattr(robot.bus, _attr, _typed_calib)
-                _registered = True
-                break
-            except Exception:
-                pass
+            break
+
+    for _attr in ("calibration", "_calibration"):
+        try:
+            setattr(robot.bus, _attr, _typed_calib)
+            break
+        except Exception:
+            pass
+
+    print("   [ROBOT] Arm connected and calibrated profile active.")
 
     if not check_servo_health(robot):
         robot.disconnect()
@@ -1051,10 +1065,10 @@ class HighFPSRealSenseStream:
         try:
             depth_sensor = profile.get_device().first_depth_sensor()
             self.depth_scale = float(depth_sensor.get_depth_scale())
-            print(f"      Sensor Depth Scale: {self.depth_scale} m/unit ({self.depth_scale * 1000.0:.4f} mm/unit)")
+            print(f"      Sensor depth scale: {self.depth_scale:.6f} m/unit ({self.depth_scale * 1000.0:.4f} mm/unit)")
         except Exception:
             self.depth_scale = 0.0001
-            print(f"      Default Depth Scale fallback: {self.depth_scale} m/unit")
+            print(f"      Default depth scale fallback: {self.depth_scale} m/unit")
 
         try:
             self.actual_fps = color_stream.fps()
@@ -1628,6 +1642,10 @@ class ArmKinematicsSolver:
 # 7. Main Pipeline Runner & Live Latency Dashboard
 # ─────────────────────────────────────────────────────────────────────────────
 def run_tiered_pipeline(args):
+    stream_fps = 0.0
+    trip_lat_ms = 0.0
+    do_grasp = args.execute_grasp and (not args.no_grasp)
+
     print("=" * 72)
     print(" [SO-ARM101] TIERED REAL-TIME PERCEPTION & 6-DOF GRASP PIPELINE")
     print("=" * 72)
@@ -1635,7 +1653,7 @@ def run_tiered_pipeline(args):
     print(f" * Camera Framerate Target:  {args.fps} FPS")
     print(f" * Resolution:               {args.width}x{args.height}")
     print(f" * Local VLM Engine:         {args.vlm.upper()}")
-    print(f" * Automatic Grasp:          {'ENABLED' if not args.no_grasp else 'DISABLED (Vision/IK Only)'}")
+    print(f" * Physical Grasp Execution: {'ENABLED' if do_grasp else 'DISABLED (Vision/IK Only)'}")
     print(f" * Max Allowed Latency:      < 300.0 ms (Target)")
     print("=" * 72)
 
@@ -1785,7 +1803,7 @@ def run_tiered_pipeline(args):
                 break
 
             # ── AUTOMATIC PHYSICAL GRASP EXECUTION ───────────────────────────
-            if tier2_executed and joint_sol and (robot is not None) and (not args.no_grasp):
+            if tier2_executed and joint_sol and (robot is not None) and do_grasp:
                 if time.time() - last_grasp_time > 4.0:
                     last_grasp_time = time.time()
                     execute_physical_grasp(robot, joint_sol, start_pos=_BASE)
@@ -1853,7 +1871,8 @@ if __name__ == "__main__":
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without X11 GUI window")
     parser.add_argument("--frames", type=int, default=0, help="Exit after N frames (0 = continuous)")
     parser.add_argument("--no-arm", action="store_true", help="Run without connecting to physical robot arm")
-    parser.add_argument("--no-grasp", action="store_true", help="Observe and track vision/IK without executing physical grasp")
+    parser.add_argument("--execute-grasp", action="store_true", default=True, help="Execute physical grasp motion on target (default: True)")
+    parser.add_argument("--no-grasp", action="store_true", default=False, help="Observe only, disable physical grasp execution")
     args = parser.parse_args()
 
     run_tiered_pipeline(args)

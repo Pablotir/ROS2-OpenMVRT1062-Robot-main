@@ -39,8 +39,12 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 #   rotating the roll to align with the claw opening.
 # ─────────────────────────────────────────────────────────────────────────────
 """
-import os, sys, yaml
+import os, sys, yaml, gc
+
 # ── JetPack / aarch64 CUDA Runtime & Memory Safety ───────────────────────────
+# Configure PyTorch expandable segments to eliminate CUDA virtual memory fragmentation on Jetson
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # On NVIDIA Jetson, torch MUST be imported before cv2 to properly initialize
 # the CUDA runtime and OpenMP memory allocators cleanly. Importing cv2 first
 # causes native glibc heap corruption ("corrupted size vs. prev_size").
@@ -359,6 +363,7 @@ SEARCH_SWEEP_RANGE = 80.0   # ° pan left/right from START_POS centre
 SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 
 # ── Alignment — closed-loop visual servoing ───────────────────────────────────
+ALIGN_MAX_FRAMES   = 150   # max frames to attempt visual alignment (~5-7s)
 ALIGN_THRESHOLD    = 30    # px   centred when dot within this many px of crosshair
 ALIGN_CENTRED_NEED = 4     # consecutive centred frames to confirm
 # NOTE (Review later): In low-light / dark conditions, YOLO detection can drop intermittently.
@@ -572,7 +577,9 @@ class RealSenseStream:
             except Exception as e:
                 if not self._running:
                     break
-                print(f"⚠️  RealSense frame error: {e}")
+                err_str = str(e)
+                if "within" not in err_str:
+                    print(f"⚠️  RealSense frame error: {e}")
                 time.sleep(0.05)
 
     def read(self, wait_new=False, timeout=0.05):
@@ -700,17 +707,23 @@ class RealSenseStream:
         if not self._running:
             return
         self._running = False
+        if hasattr(self, "_new_frame_event"):
+            self._new_frame_event.set()
         try:
             if hasattr(self, "_thread") and self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=1.5)
+                self._thread.join(timeout=2.0)
         except Exception:
             pass
-        try:
-            if self._pipeline is not None and hasattr(self, "_thread") and (not self._thread.is_alive()):
+        with self._lock:
+            self._depth_frame_raw = None
+            self._depth_img = None
+            self._color = None
+        if self._pipeline is not None:
+            try:
                 self._pipeline.stop()
-                self._pipeline = None
-        except Exception:
-            pass
+            except Exception:
+                pass
+            self._pipeline = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2568,8 +2581,22 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
     if model is None or frame is None or frame.size == 0:
         return [DetectionResult([])]
 
-    # Step 1: Normal upright inference
-    results = model(frame, verbose=False, conf=conf, iou=iou)
+    from contextlib import nullcontext
+    infer_ctx = torch.inference_mode() if (torch is not None and hasattr(torch, "inference_mode")) else (torch.no_grad() if torch is not None else nullcontext())
+
+    try:
+        with infer_ctx:
+            # Step 1: Normal upright inference
+            results = model(frame, verbose=False, conf=conf, iou=iou)
+    except Exception as e:
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        import gc; gc.collect()
+        print(f"⚠️ YOLO inference memory exception: {e} — CUDA cache cleared")
+        return [DetectionResult([])]
 
     target_found = False
     if results and len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
@@ -2595,17 +2622,26 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
     ]
 
     for rot_name, rot_fn in rotations:
-        rot_frame = rot_fn(frame)
-        res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
-        if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
-            has_match = False
-            for box in res_rot[0].boxes:
-                if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
-                    has_match = True
-                    break
-            if has_match:
-                derotated_res = derotate_detections(res_rot[0], rot_name, orig_w, orig_h)
-                return [derotated_res]
+        try:
+            rot_frame = rot_fn(frame)
+            with infer_ctx:
+                res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
+            if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
+                has_match = False
+                for box in res_rot[0].boxes:
+                    if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
+                        has_match = True
+                        break
+                if has_match:
+                    derotated_res = derotate_detections(res_rot[0], rot_name, orig_w, orig_h)
+                    return [derotated_res]
+        except Exception as e:
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            break
 
     return results
 
@@ -3214,6 +3250,7 @@ def main():
 
     # Refresh reference postures (in case taught recently)
     _load_reference_poses()
+    global START_POS, STOW
     START_POS = dict(_BASE)
     STOW      = dict(_STOW_BASE)
     print(f"📍 Start Position : Pan={START_POS.get('shoulder_pan.pos',0):+.1f}° Lift={START_POS.get('shoulder_lift.pos',0):+.1f}° Elb={START_POS.get('elbow_flex.pos',0):+.1f}°")
@@ -3348,6 +3385,13 @@ def main():
             results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
             t_yolo_ms = (time.perf_counter() - t_yolo_start) * 1000.0
             tier1_latencies.append(t_yolo_ms)
+
+            # Periodic GPU cache cleanup on Jetson to keep memory footprint bounded
+            if frame_count % 30 == 0 and torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             
             # ── Draw YOLO detections ──────────────────────────────────────────
             target_box     = None
@@ -3902,6 +3946,22 @@ def main():
             pass
         try:
             _destroy_windows()
+        except Exception:
+            pass
+        if 'model' in locals():
+            try:
+                del model
+            except Exception:
+                pass
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        try:
+            import gc
+            gc.collect()
         except Exception:
             pass
 

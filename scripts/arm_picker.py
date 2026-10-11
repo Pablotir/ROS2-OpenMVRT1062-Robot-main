@@ -359,6 +359,7 @@ SEARCH_SWEEP_RANGE = 80.0   # ° pan left/right from START_POS centre
 SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 
 # ── Alignment — closed-loop visual servoing ───────────────────────────────────
+ALIGN_MAX_FRAMES   = 150   # max frames to attempt visual alignment (~5-7s)
 ALIGN_THRESHOLD    = 30    # px   centred when dot within this many px of crosshair
 ALIGN_CENTRED_NEED = 4     # consecutive centred frames to confirm
 # NOTE (Review later): In low-light / dark conditions, YOLO detection can drop intermittently.

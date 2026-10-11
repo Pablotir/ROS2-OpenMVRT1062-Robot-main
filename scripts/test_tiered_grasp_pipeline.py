@@ -1137,17 +1137,6 @@ class ArmKinematicsSolver:
                 wrist_roll_deg=grasp.roll_deg
             )
 
-            if sol is None and grasp.pitch_deg is not None:
-                # If rigid approach pitch is unreachable, fall back to natural adaptive approach angle
-                sol = solve_ik(
-                    x_mm=arm_x,
-                    y_mm=arm_y,
-                    z_mm=arm_z,
-                    end_pitch_deg=None,
-                    current_joints=current_joints,
-                    wrist_roll_deg=grasp.roll_deg
-                )
-
             if sol is not None:
                 best_sol = sol
                 best_base_xyz = (arm_x, arm_y, arm_z)
@@ -1223,19 +1212,6 @@ def run_tiered_pipeline(args):
     # 4. Move to Start Position (Matches arm_picker.py Option 4 lines 3188-3195)
     if robot is not None:
         print("\n▶ Moving to Start Position (slow start)...")
-        cur_pos = get_pos(robot)
-        roll_delta = abs(START_POS.get("wrist_roll.pos", -68.62) - cur_pos.get("wrist_roll.pos", -68.62))
-        grip_delta = abs(START_POS.get("gripper.pos", 72.60) - cur_pos.get("gripper.pos", 72.60))
-
-        # Safe elevation guard: If arm was left in an unhomed or arbitrary pose where wrist_roll/gripper are offset,
-        # elevate the arm above the table FIRST without twisting the wrist or scraping open jaws on the desk!
-        if roll_delta > 10.0 or grip_delta > 15.0:
-            elevate_target = dict(START_POS)
-            elevate_target["wrist_roll.pos"] = cur_pos.get("wrist_roll.pos", START_POS["wrist_roll.pos"])
-            elevate_target["gripper.pos"]    = cur_pos.get("gripper.pos", START_POS["gripper.pos"])
-            smooth_move(robot, elevate_target, step_size=1.0, step_delay=0.05)
-            time.sleep(0.3)
-
         smooth_move(robot, START_POS, step_size=1.0, step_delay=0.05)
         time.sleep(1.0)
         arm_live_joints = get_pos(robot)

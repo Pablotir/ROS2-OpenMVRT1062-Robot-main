@@ -86,32 +86,6 @@ try:
 except Exception:
     pass
 
-# ── CRITICAL: Patch Ultralytics Profile class to prevent SIGABRT on Jetson ───
-# The crash "corrupted size vs. prev_size" at torch_utils.py:99 in disable()
-# is caused by Ultralytics' cProfile.Profile interacting with PyTorch's CUDA
-# allocator on the first inference. Replacing Profile with a no-op context
-# manager eliminates the heap corruption entirely.
-try:
-    import ultralytics.utils.torch_utils as _utu2
-    class _NoOpProfile:
-        """No-op replacement for Ultralytics Profile that avoids cProfile on Jetson."""
-        def __init__(self, *args, **kwargs): self.t = 0.0
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-        def __call__(self, func=None): return (lambda f: f)(func) if func else self
-        def __str__(self): return "0.0ms"
-        @property
-        def dt(self): return 0.0
-    _utu2.Profile = _NoOpProfile
-    import ultralytics.engine.model as _em
-    if hasattr(_em, "Profile"):
-        _em.Profile = _NoOpProfile
-    import ultralytics.engine.predictor as _ep
-    if hasattr(_ep, "Profile"):
-        _ep.Profile = _NoOpProfile
-except Exception:
-    pass
-
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 try:
@@ -308,8 +282,11 @@ MAX_GRAB_DEPTH_MM = 380.0
 GRASP_PENETRATION_MM = 20.0
 
 # Preferred gripper approach pitch (degrees relative to horizontal table).
-# 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
-PREFERRED_GRAB_PITCH_DEG = 0.0
+# 0.0° = perfectly parallel/horizontal to ground.
+# -45.0° = angled downward 45° — matches the scan posture's natural reach direction.
+# At scan pose (Lift=-52°, Elbow=+95°, Wrist=+26°) the gripper sits at ~-65° pitch;
+# using 0° forces a huge wrist retraction that causes the arm to fold inward.
+PREFERRED_GRAB_PITCH_DEG = -45.0
 
 
 # Lateral gripper offset (mm) along jaw opening axis.
@@ -355,10 +332,6 @@ def _build_T_cam_wrist() -> np.ndarray:
             try:
                 with open(p, 'r') as f:
                     calib = yaml.safe_load(f)
-                err = calib.get('reprojection_error', 0.0)
-                if err > 15.0:
-                    print(f"⚠️  {p} has excessive reprojection error ({err:.1f} mm > 15 mm) from old setup — skipping and using CAD mount matrix.")
-                    continue
                 R = np.array(calib['rotation_matrix'], dtype=np.float64)
                 t = np.array(calib['translation_mm'], dtype=np.float64).flatten()
                 T = np.eye(4)
@@ -1424,8 +1397,13 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     if end_pitch_deg is not None:
         if abs(preferred_pitch) < 1e-3:
             # Strictly horizontal approach (pitch = 0.0° parallel to ground)
-            # Confine deviations strictly to level orientations [-5.0° to +5.0°]
+            # First try level orientations [-5.0° to +5.0°]
             for offset in [0.0, 2.5, -2.5, 5.0, -5.0]:
+                cand = round(preferred_pitch + offset, 1)
+                if cand not in pitch_candidates:
+                    pitch_candidates.append(cand)
+            # Fallback to downward angled approaches if level approach is collapsed (D < 65mm) or unreachable
+            for offset in [-10.0, -15.0, -20.0, -25.0, -30.0, -35.0, -40.0, -45.0]:
                 cand = round(preferred_pitch + offset, 1)
                 if cand not in pitch_candidates:
                     pitch_candidates.append(cand)
@@ -1462,7 +1440,8 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
         # ── 2-link IK for J2 + J3 ────────────────────────────────────────────
         D = math.sqrt(wrist_x**2 + wrist_z**2)
         D_max = IK_L1 + IK_L2 - 1.0
-        D_min = abs(IK_L1 - IK_L2) + 1.0
+        # Prevent arm collapse inward: require wrist to extend at least 65mm from shoulder base
+        D_min = max(abs(IK_L1 - IK_L2) + 1.0, 65.0)
         
         if D > D_max or D < D_min:
             continue  # Try next pitch
@@ -2447,8 +2426,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         target_pitch = -85.0
         pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
     else:
-        target_pitch = 0.0
-        pose_desc = "STANDING UPRIGHT"
+        target_pitch = default_pitch
+        pose_desc = f"STANDING UPRIGHT (approach pitch={target_pitch:+.1f}°)"
 
     # Closed-form optimal wrist_roll and jaw axis J calculation:
     pan_rad = math.radians(pan_deg)
@@ -3260,22 +3239,11 @@ def main():
 
     # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
-    gc.collect()
-    if torch is not None:
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
     _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
     try:
-        if torch is not None:
-            with torch.inference_mode():
-                model(_dummy, verbose=False, conf=YOLO_CONF)
-        else:
-            model(_dummy, verbose=False, conf=YOLO_CONF)
+        model(_dummy, verbose=False, conf=YOLO_CONF)
     except Exception:
         pass
-    gc.collect()
     print("   ✅ YOLO warmup complete")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
@@ -4001,6 +3969,7 @@ def main():
             except Exception:
                 pass
         try:
+            import gc
             gc.collect()
         except Exception:
             pass
@@ -4033,7 +4002,6 @@ def main():
             budget_status = "PASS (<300ms)" if e2e < 300.0 else "EXCEEDS BUDGET (>300ms)"
             print(f" * End-to-End Latency:      {e2e:.1f} ms -> {budget_status}")
         print("=" * 70 + "\n")
-        os._exit(0)
 
 
 

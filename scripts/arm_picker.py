@@ -278,8 +278,11 @@ MAX_GRAB_DEPTH_MM = 380.0
 GRASP_PENETRATION_MM = 20.0
 
 # Preferred gripper approach pitch (degrees relative to horizontal table).
-# 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
-PREFERRED_GRAB_PITCH_DEG = 0.0
+# 0.0° = perfectly parallel/horizontal to ground.
+# -45.0° = angled downward 45° — matches the scan posture's natural reach direction.
+# At scan pose (Lift=-52°, Elbow=+95°, Wrist=+26°) the gripper sits at ~-65° pitch;
+# using 0° forces a huge wrist retraction that causes the arm to fold inward.
+PREFERRED_GRAB_PITCH_DEG = -45.0
 
 
 # Lateral gripper offset (mm) along jaw opening axis.
@@ -1356,8 +1359,13 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     if end_pitch_deg is not None:
         if abs(preferred_pitch) < 1e-3:
             # Strictly horizontal approach (pitch = 0.0° parallel to ground)
-            # Confine deviations strictly to level orientations [-5.0° to +5.0°]
+            # First try level orientations [-5.0° to +5.0°]
             for offset in [0.0, 2.5, -2.5, 5.0, -5.0]:
+                cand = round(preferred_pitch + offset, 1)
+                if cand not in pitch_candidates:
+                    pitch_candidates.append(cand)
+            # Fallback to downward angled approaches if level approach is collapsed (D < 65mm) or unreachable
+            for offset in [-10.0, -15.0, -20.0, -25.0, -30.0, -35.0, -40.0, -45.0]:
                 cand = round(preferred_pitch + offset, 1)
                 if cand not in pitch_candidates:
                     pitch_candidates.append(cand)
@@ -1394,7 +1402,8 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
         # ── 2-link IK for J2 + J3 ────────────────────────────────────────────
         D = math.sqrt(wrist_x**2 + wrist_z**2)
         D_max = IK_L1 + IK_L2 - 1.0
-        D_min = abs(IK_L1 - IK_L2) + 1.0
+        # Prevent arm collapse inward: require wrist to extend at least 65mm from shoulder base
+        D_min = max(abs(IK_L1 - IK_L2) + 1.0, 65.0)
         
         if D > D_max or D < D_min:
             continue  # Try next pitch
@@ -2379,8 +2388,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         target_pitch = -85.0
         pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
     else:
-        target_pitch = 0.0
-        pose_desc = "STANDING UPRIGHT"
+        target_pitch = default_pitch
+        pose_desc = f"STANDING UPRIGHT (approach pitch={target_pitch:+.1f}°)"
 
     # Closed-form optimal wrist_roll and jaw axis J calculation:
     pan_rad = math.radians(pan_deg)

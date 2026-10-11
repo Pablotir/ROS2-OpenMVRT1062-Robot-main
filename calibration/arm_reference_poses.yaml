@@ -1,16 +1,16 @@
 scan_base:
   joints:
-    shoulder_pan.pos: -5.76
-    shoulder_lift.pos: -57.71
-    elbow_flex.pos: 107.16
-    wrist_flex.pos: 36.62
-    wrist_roll.pos: -41.01
-    gripper.pos: 97.94
+    shoulder_pan.pos: -4.35
+    shoulder_lift.pos: -52.26
+    elbow_flex.pos: 94.95
+    wrist_flex.pos: 26.15
+    wrist_roll.pos: -36.53
+    gripper.pos: 99.77
 stow_base:
   joints:
-    shoulder_pan.pos: -5.76
-    shoulder_lift.pos: -58.07
-    elbow_flex.pos: 107.16
-    wrist_flex.pos: 77.05
-    wrist_roll.pos: -40.92
-    gripper.pos: 97.94
+    shoulder_pan.pos: -4.35
+    shoulder_lift.pos: -51.00
+    elbow_flex.pos: 94.95
+    wrist_flex.pos: 76.84
+    wrist_roll.pos: -36.53
+    gripper.pos: 99.77

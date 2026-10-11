@@ -372,23 +372,23 @@ ALIGN_MAX_WRIST_DEG = 5.0  # max wrist tilt speed (°/frame)
 ALIGN_MAX_LIFT_DEG = 2.5   # max shoulder lift speed (°/frame)
 
 # ── Arm Positions ─────────────────────────────────────────────────────────────
-# Default fallback scan posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
+# Default fallback scan posture (taught baseline: level wrist, table-facing camera)
 _BASE = {
-    "elbow_flex.pos":    107.16,
-    "gripper.pos":        97.94,
-    "shoulder_lift.pos": -57.71,
-    "shoulder_pan.pos":   -5.76,
-    "wrist_flex.pos":     36.62,
-    "wrist_roll.pos":    -41.01,
+    "shoulder_pan.pos":   -4.35,
+    "shoulder_lift.pos": -52.26,
+    "elbow_flex.pos":     94.95,
+    "wrist_flex.pos":     26.15,
+    "wrist_roll.pos":    -36.53,
+    "gripper.pos":        99.77,
 }
-# Default fallback stow posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
+# Default fallback stow posture (compact folded safe baseline)
 _STOW_BASE = {
-    "elbow_flex.pos":    107.16,
-    "gripper.pos":        97.94,
-    "shoulder_lift.pos": -58.07,
-    "shoulder_pan.pos":   -5.76,
-    "wrist_flex.pos":     77.05,
-    "wrist_roll.pos":    -40.92,
+    "shoulder_pan.pos":   -4.35,
+    "shoulder_lift.pos": -51.00,
+    "elbow_flex.pos":     94.95,
+    "wrist_flex.pos":     76.84,
+    "wrist_roll.pos":    -36.53,
+    "gripper.pos":        99.77,
 }
 
 
@@ -1067,14 +1067,14 @@ def connect_robot():
                   os.environ.get("TRANSFORMERS_CACHE",
                   str(_pathlib.Path.home() / ".cache" / "huggingface"))))
     _calib_search = [
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
         _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
         _pathlib.Path(f"/root/ros2_ws/scripts/{ARM_ID}.json"),
         _pathlib.Path(__file__).parent / f"{ARM_ID}.json",
         _pathlib.Path(__file__).parent.parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(__file__).parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(f"calibration/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
         _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
         _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
         _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
@@ -1085,12 +1085,12 @@ def connect_robot():
     _calib_path = next((p for p in _calib_search if p.exists()), None)
 
     _EMBEDDED_CALIB = {
-        "shoulder_pan":  {"id": 1, "drive_mode": 0, "homing_offset": 2023,  "range_min": 868,  "range_max": 3449},
-        "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset":  820,  "range_min": 788,  "range_max": 3187},
-        "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 3150,  "range_min": 916,  "range_max": 3154},
-        "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": 2193,  "range_min": 870,  "range_max": 3196},
-        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": 2346,  "range_min": 1547, "range_max": 4000},
-        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 2775,  "range_min": 1530, "range_max": 2779}
+        "shoulder_pan":  {"id": 1, "drive_mode": 0, "homing_offset": 1604,  "range_min": 962,  "range_max": 3486},
+        "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": -1498, "range_min": 814,  "range_max": 3207},
+        "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
+        "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
+        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 765,  "range_max": 3495},
+        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626}
     }
 
     if _calib_path is not None:

@@ -86,6 +86,32 @@ try:
 except Exception:
     pass
 
+# ── CRITICAL: Patch Ultralytics Profile class to prevent SIGABRT on Jetson ───
+# The crash "corrupted size vs. prev_size" at torch_utils.py:99 in disable()
+# is caused by Ultralytics' cProfile.Profile interacting with PyTorch's CUDA
+# allocator on the first inference. Replacing Profile with a no-op context
+# manager eliminates the heap corruption entirely.
+try:
+    import ultralytics.utils.torch_utils as _utu2
+    class _NoOpProfile:
+        """No-op replacement for Ultralytics Profile that avoids cProfile on Jetson."""
+        def __init__(self, *args, **kwargs): self.t = 0.0
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def __call__(self, func=None): return (lambda f: f)(func) if func else self
+        def __str__(self): return "0.0ms"
+        @property
+        def dt(self): return 0.0
+    _utu2.Profile = _NoOpProfile
+    import ultralytics.engine.model as _em
+    if hasattr(_em, "Profile"):
+        _em.Profile = _NoOpProfile
+    import ultralytics.engine.predictor as _ep
+    if hasattr(_ep, "Profile"):
+        _ep.Profile = _NoOpProfile
+except Exception:
+    pass
+
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 try:
@@ -3234,11 +3260,22 @@ def main():
 
     # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
+    gc.collect()
+    if torch is not None:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
     try:
-        model(_dummy, verbose=False, conf=YOLO_CONF)
+        if torch is not None:
+            with torch.inference_mode():
+                model(_dummy, verbose=False, conf=YOLO_CONF)
+        else:
+            model(_dummy, verbose=False, conf=YOLO_CONF)
     except Exception:
         pass
+    gc.collect()
     print("   ✅ YOLO warmup complete")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────

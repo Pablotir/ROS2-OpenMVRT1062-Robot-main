@@ -325,10 +325,6 @@ def _build_T_cam_wrist() -> np.ndarray:
             try:
                 with open(p, 'r') as f:
                     calib = yaml.safe_load(f)
-                err = calib.get('reprojection_error', 0.0)
-                if err > 15.0:
-                    print(f"⚠️  {p} has excessive reprojection error ({err:.1f} mm > 15 mm) from old setup — skipping and using CAD mount matrix.")
-                    continue
                 R = np.array(calib['rotation_matrix'], dtype=np.float64)
                 t = np.array(calib['translation_mm'], dtype=np.float64).flatten()
                 T = np.eye(4)
@@ -3826,7 +3822,6 @@ def main():
             _destroy_windows()
         except Exception:
             pass
-        os._exit(0)
 
 
 

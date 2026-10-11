@@ -442,12 +442,13 @@ def emergency_stow():
     cam = _ACTIVE_CAM[0]
     if robot is not None:
         try:
-            print("\n[ROBOT] ⏹️ Stowing arm smoothly to STOW posture...")
+            print("\n⚠️  Emergency stow triggered...")
             get_pos(robot)
-            smooth_move(robot, _STOW_BASE, step_size=1.0, step_delay=0.03)
+            smooth_move(robot, _STOW_BASE, step_size=0.8, step_delay=0.025)
+            time.sleep(0.3)
             print("[ROBOT] ✅ Arm safely stowed.")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"   Stow skipped (arm unreachable): {e}")
         try:
             robot.disconnect()
         except Exception:
@@ -1168,21 +1169,32 @@ def run_tiered_pipeline(args):
     if not args.headless:
         setup_native_display()
 
-    # 1. Connect physical robot and elevate to Start Position FIRST
-    # (Matches arm_picker.py: elevates arm so eye-in-hand D405 is overlooking tabletop before camera starts)
+    # 1. Warm up YOLO Tripwire & Perception Engines on GPU FIRST
+    # (Matches arm_picker.py lines 3141-3153: GPU warmup runs before arm connect so servos are not left unmonitored)
+    tripwire = TripwireScanner(target_label=args.target)
+    vlm = LocalVLMConfirmation(engine=args.vlm)
+    cropper = PointCloudCropper(max_points=2048)
+    grasp_planner = GraspPosePredictor()
+    ik_solver = ArmKinematicsSolver()
+
+    # 2. Connect physical SO-ARM101 robot (Matches arm_picker.py Option 4 lines 3155-3168)
     robot = None
-    arm_live_joints = dict(_BASE)
+    _load_reference_poses()
+    START_POS = dict(_BASE)
+    STOW = dict(_STOW_BASE)
 
     if not args.no_arm and os.path.exists(PORT) and SOFollower is not None:
         try:
             print(f"[ROBOT] Connecting to SO-ARM101 on {PORT}...")
             robot = connect_robot()
             _ACTIVE_ROBOT[0] = robot
-            print("\n▶ Moving to Start Position (slow start)...")
-            smooth_move(robot, _BASE, step_size=1.0, step_delay=0.05)
-            time.sleep(1.0)
-            arm_live_joints = get_pos(robot)
-            print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.\n")
+
+            # Refresh reference postures (in case taught recently)
+            _load_reference_poses()
+            START_POS = dict(_BASE)
+            STOW = dict(_STOW_BASE)
+            print(f"📍 Start Position : Pan={START_POS.get('shoulder_pan.pos',0):+.1f}° Lift={START_POS.get('shoulder_lift.pos',0):+.1f}° Elb={START_POS.get('elbow_flex.pos',0):+.1f}°")
+            print(f"📍 Stow Position  : Pan={STOW.get('shoulder_pan.pos',0):+.1f}° Lift={STOW.get('shoulder_lift.pos',0):+.1f}° Elb={STOW.get('elbow_flex.pos',0):+.1f}°")
         except Exception as e:
             print(f"[WARN] Robot arm connection failed ({e}). Operating in vision-only observation mode.")
             robot = None
@@ -1191,16 +1203,34 @@ def run_tiered_pipeline(args):
     else:
         print(f"[INFO] Controller {PORT} not found. Operating in vision-only observation mode.")
 
-    # 2. Start high-speed RealSense camera
+    # 3. Connect RealSense D405 (Matches arm_picker.py Option 4 lines 3183-3187)
+    print("📷 Connecting to RealSense D405...")
     cam = HighFPSRealSenseStream(target_fps=args.fps, width=args.width, height=args.height, use_mock=args.mock)
     _ACTIVE_CAM[0] = cam
+    time.sleep(2.0)  # let first frames arrive and intrinsics populate
 
-    # 3. Initialize Tiered Perception Components
-    tripwire = TripwireScanner(target_label=args.target)
-    vlm = LocalVLMConfirmation(engine=args.vlm)
-    cropper = PointCloudCropper(max_points=2048)
-    grasp_planner = GraspPosePredictor()
-    ik_solver = ArmKinematicsSolver()
+    # 4. Move to Start Position (Matches arm_picker.py Option 4 lines 3188-3195)
+    if robot is not None:
+        print("\n▶ Moving to Start Position (slow start)...")
+        cur_pos = get_pos(robot)
+        roll_delta = abs(START_POS.get("wrist_roll.pos", -68.62) - cur_pos.get("wrist_roll.pos", -68.62))
+        grip_delta = abs(START_POS.get("gripper.pos", 72.60) - cur_pos.get("gripper.pos", 72.60))
+
+        # Safe elevation guard: If arm was left in an unhomed or arbitrary pose where wrist_roll/gripper are offset,
+        # elevate the arm above the table FIRST without twisting the wrist or scraping open jaws on the desk!
+        if roll_delta > 10.0 or grip_delta > 15.0:
+            elevate_target = dict(START_POS)
+            elevate_target["wrist_roll.pos"] = cur_pos.get("wrist_roll.pos", START_POS["wrist_roll.pos"])
+            elevate_target["gripper.pos"]    = cur_pos.get("gripper.pos", START_POS["gripper.pos"])
+            smooth_move(robot, elevate_target, step_size=1.0, step_delay=0.05)
+            time.sleep(0.3)
+
+        smooth_move(robot, START_POS, step_size=1.0, step_delay=0.05)
+        time.sleep(1.0)
+        arm_live_joints = get_pos(robot)
+        print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.\n")
+    else:
+        arm_live_joints = dict(START_POS)
 
     iteration = 0
     t_last_report = time.time()
@@ -1316,7 +1346,7 @@ def run_tiered_pipeline(args):
             if tier2_executed and joint_sol and (robot is not None) and do_grasp:
                 if time.time() - last_grasp_time > 4.0:
                     last_grasp_time = time.time()
-                    execute_physical_grasp(robot, joint_sol, start_pos=_BASE)
+                    execute_physical_grasp(robot, joint_sol, start_pos=START_POS)
                     tripwire.tracker.lock_target = None
                     tripwire.tracker.smooth_box = None
 

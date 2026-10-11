@@ -238,7 +238,10 @@ def _handle_exit_signal(sig, frame):
     if not _SHUTDOWN_REQUESTED[0]:
         print("\n[INFO] Interrupt signal received (Ctrl+C). Cleanly exiting pipeline...")
         _SHUTDOWN_REQUESTED[0] = True
-    raise KeyboardInterrupt
+    else:
+        print("\n[INFO] Force exit requested...")
+        emergency_stow()
+        os._exit(0)
 
 signal.signal(signal.SIGINT, _handle_exit_signal)
 
@@ -446,10 +449,23 @@ def check_servo_health(robot) -> bool:
     return True
 
 
+_MOTOR_KEYS = {
+    "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
+    "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"
+}
+
+def _clean_action(d: dict) -> dict:
+    """Filter out non-motor telemetry keys (like pitch_deg) before sending to LeRobot."""
+    return {k: float(v) for k, v in d.items() if k in _MOTOR_KEYS}
+
+
 def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.03):
     """Interpolates motion smoothly between current pose and target pose."""
     cur = get_pos(robot)
-    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+    valid_targets = _clean_action(target)
+    if not valid_targets:
+        return
+    max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
     if max_delta < 0.5:
         return
     n = max(1, int(max_delta / step_size))
@@ -457,18 +473,21 @@ def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.03):
         if _SHUTDOWN_REQUESTED[0]:
             break
         t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0)) for j in target}
+        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets}
         robot.send_action(interp)
         time.sleep(step_delay)
 
 
-def level_approach(robot, target: dict, step_size=2.5, step_delay=0.03):
+def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
     """
     Coordinated multi-joint approach that continuously adjusts wrist_flex
     so the gripper maintains the desired approach pitch (e.g. 0.0° parallel to ground).
     """
     cur = get_pos(robot)
-    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+    valid_targets = _clean_action(target)
+    if not valid_targets:
+        return
+    max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
     if max_delta < 0.5:
         return
     n = max(1, int(max_delta / step_size))
@@ -480,9 +499,9 @@ def level_approach(robot, target: dict, step_size=2.5, step_delay=0.03):
     t2_0 = t1_0 - math.radians(cur_elb + 81.0)
     pitch_0 = math.degrees(t2_0 - math.radians(cur_wst + 5.0))
 
-    tgt_lift = target.get("shoulder_lift.pos", cur_lift)
-    tgt_elb  = target.get("elbow_flex.pos", cur_elb)
-    tgt_wst  = target.get("wrist_flex.pos", cur_wst)
+    tgt_lift = valid_targets.get("shoulder_lift.pos", cur_lift)
+    tgt_elb  = valid_targets.get("elbow_flex.pos", cur_elb)
+    tgt_wst  = valid_targets.get("wrist_flex.pos", cur_wst)
     t1_tgt = math.radians(90.0 - tgt_lift)
     t2_tgt = t1_tgt - math.radians(tgt_elb + 81.0)
     pitch_tgt = math.degrees(t2_tgt - math.radians(tgt_wst + 5.0))
@@ -491,14 +510,14 @@ def level_approach(robot, target: dict, step_size=2.5, step_delay=0.03):
         if _SHUTDOWN_REQUESTED[0]:
             break
         t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0)) for j in target}
+        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets}
         desired_pitch_deg = pitch_0 + t * (pitch_tgt - pitch_0)
         lift_now = interp.get("shoulder_lift.pos", 0.0)
         elb_now  = interp.get("elbow_flex.pos", 0.0)
         t1_rad = math.radians(90.0 - lift_now)
         t2_rad = t1_rad - math.radians(elb_now + 81.0)
         interp["wrist_flex.pos"] = math.degrees(t2_rad - math.radians(desired_pitch_deg)) - 5.0
-        robot.send_action(interp)
+        robot.send_action(_clean_action(interp))
         time.sleep(step_delay)
 
 
@@ -511,15 +530,15 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
       4. Release & return to scan posture
     """
     print("\n[ROBOT] 🦾 APPROACHING (level gripper, jaws wide open)...")
-    approach_pos = dict(joint_sol)
+    approach_pos = _clean_action(joint_sol)
     approach_pos["gripper.pos"] = 75.0
-    level_approach(robot, approach_pos, step_size=2.5, step_delay=0.03)
+    level_approach(robot, approach_pos, step_size=2.0, step_delay=0.03)
     time.sleep(0.3)
 
     print("[ROBOT] ✊ GRIPPING (Adaptive load-sensing brake)...")
     grip_pos = dict(approach_pos)
     grip_pos["gripper.pos"] = 0.7
-    robot.send_action(grip_pos)
+    robot.send_action(_clean_action(grip_pos))
 
     start_t = time.time()
     braked = False
@@ -547,7 +566,7 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
             except Exception:
                 current_g = 20.0
             grip_pos["gripper.pos"] = current_g
-            robot.send_action(grip_pos)
+            robot.send_action(_clean_action(grip_pos))
             print(f"[ROBOT]    🛑 Resistance felt (Load={load_mag}/1023)! Braked at {current_g:.1f}°")
             braked = True
             break
@@ -569,7 +588,7 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
         except Exception:
             current_g = 20.0
         grip_pos["gripper.pos"] = current_g
-        robot.send_action(grip_pos)
+        robot.send_action(_clean_action(grip_pos))
 
     time.sleep(0.5)
 
@@ -653,16 +672,25 @@ def connect_robot():
 
     robot = SOFollower(config)
 
-    # 4. Enforce is_calibrated = True and neutralize interactive calibration prompt
-    robot.is_calibrated = True
+    # 4. Safely ensure is_calibrated returns True and neutralize interactive calibration prompt
+    try:
+        type(robot).is_calibrated = property(lambda self: True)
+    except Exception:
+        pass
+    try:
+        robot.calibrate = lambda *args, **kwargs: None
+    except Exception:
+        pass
     if hasattr(robot, "calibration_path"):
-        robot.calibration_path = _pathlib.Path("/root/ros2_ws/calibration/jetson_arm.json")
-    robot.calibrate = lambda *args, **kwargs: None
+        try:
+            robot.calibration_path = _pathlib.Path("/root/ros2_ws/calibration/jetson_arm.json")
+        except Exception:
+            pass
 
     if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
         robot.bus.default_num_retry = 3
 
-    # 5. Connect without interactive calibration
+    # 5. Connect without interactive calibration (safe input fallback matching arm_picker.py)
     connected = False
     last_err = None
     for attempt in range(1, 4):
@@ -670,12 +698,27 @@ def connect_robot():
             try:
                 robot.connect(calibrate=False)
             except TypeError:
-                robot.connect()
+                _real_input = _builtins.input
+                def _auto_use_file(prompt=""):
+                    if "enter" in prompt.lower() and "range" not in prompt.lower():
+                        return ""
+                    _builtins.input = _real_input
+                    return _real_input(prompt)
+                _builtins.input = _auto_use_file
+                try:
+                    robot.connect()
+                finally:
+                    _builtins.input = _real_input
             connected = True
             break
         except Exception as e:
             last_err = e
             if hasattr(robot, "bus"):
+                try:
+                    if hasattr(robot.bus, "port_handler") and robot.bus.port_handler:
+                        robot.bus.port_handler.clearPort()
+                except Exception:
+                    pass
                 try:
                     robot.bus.disconnect()
                 except Exception:
@@ -1857,7 +1900,13 @@ def run_tiered_pipeline(args):
         if last_base_xyz:
             print(f" * Arm Base Coordinates: X={last_base_xyz[0]:+.1f}mm, Y={last_base_xyz[1]:+.1f}mm, Z={last_base_xyz[2]:+.1f}mm")
         print("=" * 72)
-        print("[OK] Pipeline shut down cleanly.")
+        print("[OK] Pipeline shut down cleanly.\n")
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 if __name__ == "__main__":

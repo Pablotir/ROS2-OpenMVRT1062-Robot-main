@@ -285,8 +285,8 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 
 # Lateral gripper offset (mm) along jaw opening axis.
 # Positive (+ve) = shifts claw to the LEFT (away from the static pincer)
-# Increased by 15mm (from 14.0mm to 29.0mm) to cleanly center open jaws and eliminate static pincer poke!
-GRAB_LATERAL_OFFSET_MM = 29.0
+# Increased by 10mm (from 29.0mm to 39.0mm) to add 1cm offset to the left
+GRAB_LATERAL_OFFSET_MM = 39.0
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:

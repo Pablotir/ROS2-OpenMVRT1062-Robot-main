@@ -4001,7 +4001,6 @@ def main():
             except Exception:
                 pass
         try:
-            import gc
             gc.collect()
         except Exception:
             pass

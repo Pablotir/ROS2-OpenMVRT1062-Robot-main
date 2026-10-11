@@ -1137,6 +1137,17 @@ class ArmKinematicsSolver:
                 wrist_roll_deg=grasp.roll_deg
             )
 
+            if sol is None and grasp.pitch_deg is not None:
+                # If rigid approach pitch is unreachable, fall back to natural adaptive approach angle
+                sol = solve_ik(
+                    x_mm=arm_x,
+                    y_mm=arm_y,
+                    z_mm=arm_z,
+                    end_pitch_deg=None,
+                    current_joints=current_joints,
+                    wrist_roll_deg=grasp.roll_deg
+                )
+
             if sol is not None:
                 best_sol = sol
                 best_base_xyz = (arm_x, arm_y, arm_z)

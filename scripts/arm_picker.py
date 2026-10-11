@@ -362,7 +362,7 @@ SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 ALIGN_THRESHOLD    = 30    # px   centred when dot within this many px of crosshair
 ALIGN_CENTRED_NEED = 4     # consecutive centred frames to confirm
 ALIGN_MAX_FRAMES   = 200   # give up after N frames (~10 s)
-ALIGN_LOST_GRACE   = 25    # consecutive not-found frames before abort
+ALIGN_LOST_GRACE   = 5     # consecutive not-found frames before abort
 
 ALIGN_PAN_OFFSET   = 0     # px: optical center (lateral claw offset handles claw clearance at grab time)
 
@@ -2795,8 +2795,9 @@ def align_arm(robot, cap: RealSenseStream, model,
         # Positive lift_err (obj_py > cy, object lower) -> wrist pitches down (wst increases)
         # Negative lift_err (obj_py < cy, object higher) -> wrist pitches up (wst decreases)
         wrist_cmd = float(np.clip(lift_err * ALIGN_WRIST_K * decay, -ALIGN_MAX_WRIST_DEG, ALIGN_MAX_WRIST_DEG))
-        # Negative lift_err (object higher) -> shoulder lifts up (lift becomes less negative, so + cmd)
-        lift_cmd  = float(np.clip(-lift_err * ALIGN_LIFT_K * decay, -ALIGN_MAX_LIFT_DEG, ALIGN_MAX_LIFT_DEG))
+        # Negative lift_err (object higher) -> shoulder lifts up (shoulder_lift becomes more negative)
+        # Positive lift_err (object lower) -> shoulder lowers down (shoulder_lift becomes more positive)
+        lift_cmd  = float(np.clip(lift_err * ALIGN_LIFT_K * decay, -ALIGN_MAX_LIFT_DEG, ALIGN_MAX_LIFT_DEG))
 
         cur = get_pos(robot)
         cur_pan  = cur.get("shoulder_pan.pos", start_pan)
@@ -2805,9 +2806,8 @@ def align_arm(robot, cap: RealSenseStream, model,
 
         next_pan  = float(np.clip(cur_pan + pan_cmd, PAN_MIN_DEG, PAN_MAX_DEG))
         next_wst  = float(np.clip(cur_wst + wrist_cmd, -35.0, 55.0))
-        # Safe bounds on shoulder_lift: avoid excessive backward lean (below start_lift - 5.0)
-        # while allowing upward reach (up to start_lift + 22.0)
-        next_lift = float(np.clip(cur_lift + lift_cmd, start_lift - 5.0, start_lift + 22.0))
+        # Symmetric safe bounds on shoulder_lift around start_lift
+        next_lift = float(np.clip(cur_lift + lift_cmd, start_lift - 22.0, start_lift + 22.0))
 
         centred_pan  = abs(pan_err) < ALIGN_THRESHOLD
         centred_lift = abs(lift_err) < ALIGN_THRESHOLD

@@ -232,16 +232,13 @@ _ARM_IS_STOWED = [False]
 
 def _handle_exit_signal(sig, frame):
     """
-    SIGINT handler — sets flag and stows arm smoothly.
-    Prevents glibc heap aborts (corrupted size vs. prev_size) when interrupting C extensions.
+    SIGINT handler — sets flag and raises KeyboardInterrupt so main thread
+    exits cleanly through try/finally and stows arm smoothly.
     """
     if not _SHUTDOWN_REQUESTED[0]:
         print("\n[INFO] Interrupt signal received (Ctrl+C). Cleanly exiting pipeline...")
         _SHUTDOWN_REQUESTED[0] = True
-    else:
-        print("\n[INFO] Force exit requested...")
-        emergency_stow()
-        os._exit(0)
+    raise KeyboardInterrupt
 
 signal.signal(signal.SIGINT, _handle_exit_signal)
 
@@ -401,7 +398,16 @@ def get_pos(robot) -> dict:
 
 
 def check_servo_health(robot) -> bool:
-    """Read error status from every servo BEFORE issuing motion."""
+    """
+    Read error status from every servo BEFORE issuing any motion.
+    Tries Hardware_Error_Status first (direct overload flag), then falls back
+    to Present_Load as a proxy (high load = stalled/overloaded).
+    Returns True if all servos appear healthy, False if any are faulted.
+    STS3215 overload protection clears on power-cycle only.
+    """
+    print("🩺 Checking servo health...")
+
+    # ── Step 1: find a working error-status register name ─────────────────
     err_reg = None
     for candidate in _ERR_REG_CANDIDATES:
         try:
@@ -411,6 +417,7 @@ def check_servo_health(robot) -> bool:
         except Exception:
             continue
 
+    # ── Step 2: if error register found, read all motors ──────────────────
     if err_reg is not None:
         all_ok = True
         for name in _MOTOR_NAMES:
@@ -418,12 +425,22 @@ def check_servo_health(robot) -> bool:
                 val = int(robot.bus.read(err_reg, name))
                 if val != 0:
                     flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
-                    print(f"   [ERR]  {name}: error=0x{val:02X}  ({', '.join(flags)})")
+                    print(f"   ❌  {name}: error=0x{val:02X}  ({', '.join(flags)})")
                     all_ok = False
-            except Exception:
-                pass
+                else:
+                    print(f"   ✅  {name}: OK")
+            except Exception as e:
+                print(f"   ⚠️  {name}: read failed ({e})")
+        if not all_ok:
+            print("\n   ⛔  One or more servos are in an error/overload state.")
+            print("   ⛔  Power-cycle the arm (unplug and replug the power supply),")
+            print("   ⛔  then re-run the script.")
+            print("   ⛔  Do NOT attempt to move the arm while in this state.\n")
+        else:
+            print("   ✅ All servos healthy — safe to move.\n")
         return all_ok
 
+    # ── Step 3: fallback — use Present_Load as a stall proxy ─────────────
     load_reg = None
     for candidate in _LOAD_REG_CANDIDATES:
         try:
@@ -440,12 +457,22 @@ def check_servo_health(robot) -> bool:
                 raw_val = abs(int(robot.bus.read(load_reg, name)))
                 load_mag = raw_val & 0x03FF
                 if load_mag > _LOAD_STALL_THRESHOLD:
-                    print(f"   [ERR]  {name}: high load ({load_mag}/1023)")
+                    print(f"   ❌  {name}: high load ({load_mag}/1023) — may be stalled (raw={raw_val})")
                     all_ok = False
-            except Exception:
-                pass
+                else:
+                    print(f"   ✅  {name}: load={load_mag}/1023")
+            except Exception as e:
+                print(f"   ⚠️  {name}: load read failed ({e})")
+        if not all_ok:
+            print("\n   ⛔  One or more servos show high load — possible overload state.")
+            print("   ⛔  Power-cycle the arm, then re-run.\n")
+        else:
+            print("   ✅ All servos healthy (load check) — safe to move.\n")
         return all_ok
 
+    # ── Step 4: nothing worked — warn and proceed ─────────────────────────
+    print("   ⚠️  Health check unavailable (register names not found in control table).")
+    print("   ⚠️  Proceeding — if arm loses power immediately, power-cycle it.\n")
     return True
 
 
@@ -454,15 +481,17 @@ _MOTOR_KEYS = {
     "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"
 }
 
-def _clean_action(d: dict) -> dict:
-    """Filter out non-motor telemetry keys (like pitch_deg) before sending to LeRobot."""
-    return {k: float(v) for k, v in d.items() if k in _MOTOR_KEYS}
 
-
-def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.03):
-    """Interpolates motion smoothly between current pose and target pose."""
+def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
+                hold_joints=None):
+    if hold_joints is None:
+        hold_joints = []
     cur = get_pos(robot)
-    valid_targets = _clean_action(target)
+    # Freeze hold_joints at their target immediately
+    for j in hold_joints:
+        if j in target:
+            cur[j] = target[j]
+    valid_targets = {k: float(v) for k, v in target.items() if k in cur}
     if not valid_targets:
         return
     max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
@@ -472,19 +501,24 @@ def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.03):
     for s in range(1, n + 1):
         if _SHUTDOWN_REQUESTED[0]:
             break
-        t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets}
+        t      = s / n
+        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0))
+                  for j in valid_targets}
         robot.send_action(interp)
         time.sleep(step_delay)
 
 
 def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
     """
-    Coordinated multi-joint approach that continuously adjusts wrist_flex
-    so the gripper maintains the desired approach pitch (e.g. 0.0° parallel to ground).
+    Move all joints simultaneously toward *target* at uniform speed while
+    continuously adjusting wrist_flex so the gripper smoothly tracks the
+    desired approach pitch along the reach trajectory (pitch = 0° for horizontal,
+    or steep/angled down for tilted or tabletop objects).
+
+    All servos move at the same rate without staging.
     """
     cur = get_pos(robot)
-    valid_targets = _clean_action(target)
+    valid_targets = {k: float(v) for k, v in target.items() if k in cur}
     if not valid_targets:
         return
     max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
@@ -492,6 +526,7 @@ def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
         return
     n = max(1, int(max_delta / step_size))
 
+    # Calculate initial and target pitch relative to horizontal
     cur_lift = cur.get("shoulder_lift.pos", 0.0)
     cur_elb  = cur.get("elbow_flex.pos", 0.0)
     cur_wst  = cur.get("wrist_flex.pos", 0.0)
@@ -510,40 +545,45 @@ def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
         if _SHUTDOWN_REQUESTED[0]:
             break
         t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets}
+        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0))
+                  for j in valid_targets}
+
+        # Desired pitch smoothly transitions from initial pitch to target pitch
         desired_pitch_deg = pitch_0 + t * (pitch_tgt - pitch_0)
+
         lift_now = interp.get("shoulder_lift.pos", 0.0)
         elb_now  = interp.get("elbow_flex.pos", 0.0)
         t1_rad = math.radians(90.0 - lift_now)
         t2_rad = t1_rad - math.radians(elb_now + 81.0)
+
+        # Exact wrist_flex motor angle for the interpolated approach pitch
         interp["wrist_flex.pos"] = math.degrees(t2_rad - math.radians(desired_pitch_deg)) - 5.0
-        robot.send_action(_clean_action(interp))
+
+        robot.send_action(interp)
         time.sleep(step_delay)
 
 
 def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
     """
-    Executes complete 4-stage pick routine:
+    Executes complete 4-stage pick routine matching arm_picker.py:
       1. Level approach with wide open jaws
       2. Gripping with load-sensing resistance brake (prevents servo stall)
-      3. Smooth lift back to scan posture
+      3. Return to elevated start position holding object
       4. Release & return to scan posture
     """
     print("\n[ROBOT] 🦾 APPROACHING (level gripper, jaws wide open)...")
-    approach_pos = _clean_action(joint_sol)
-    approach_pos["gripper.pos"] = 75.0
-    level_approach(robot, approach_pos, step_size=2.0, step_delay=0.03)
-    time.sleep(0.3)
+    grab_pos = {k: float(v) for k, v in joint_sol.items() if k in _MOTOR_KEYS}
+    grab_pos["gripper.pos"] = max(75.0, start_pos.get("gripper.pos", 72.6))
+    level_approach(robot, grab_pos, step_size=3.0, step_delay=0.03)
+    time.sleep(0.4)
 
     print("[ROBOT] ✊ GRIPPING (Adaptive load-sensing brake)...")
-    grip_pos = dict(approach_pos)
-    grip_pos["gripper.pos"] = 0.7
-    robot.send_action(_clean_action(grip_pos))
+    grab_pos["gripper.pos"] = 0.7
+    robot.send_action({k: float(v) for k, v in grab_pos.items() if k in _MOTOR_KEYS})
 
-    start_t = time.time()
-    braked = False
+    start_t  = time.time()
+    braked   = False
     current_g = 20.0
-
     while time.time() - start_t < 1.5:
         if _SHUTDOWN_REQUESTED[0]:
             break
@@ -558,6 +598,7 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
             except Exception:
                 pass
 
+        # Mask direction bit 10 (0x400 = 1024) to get true load magnitude (0-1023)
         load_mag = abs(int(load)) & 0x03FF
         if (time.time() - start_t > 0.15) and load_mag > 150:
             try:
@@ -565,8 +606,8 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
                 current_g = max(current_g - 15.0, 0.7)
             except Exception:
                 current_g = 20.0
-            grip_pos["gripper.pos"] = current_g
-            robot.send_action(_clean_action(grip_pos))
+            grab_pos["gripper.pos"] = current_g
+            robot.send_action({k: float(v) for k, v in grab_pos.items() if k in _MOTOR_KEYS})
             print(f"[ROBOT]    🛑 Resistance felt (Load={load_mag}/1023)! Braked at {current_g:.1f}°")
             braked = True
             break
@@ -574,11 +615,11 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
         try:
             if get_pos(robot).get("gripper.pos", 60.0) <= 2.0:
                 current_g = 0.7
-                braked = True
+                braked    = True
                 break
         except Exception:
             pass
-        time.sleep(0.005)
+        time.sleep(0.002)
 
     if not braked:
         print("[ROBOT]    ⚠️ Grip timeout reached — holding current position")
@@ -587,21 +628,22 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
             current_g = max(current_g - 15.0, 0.7)
         except Exception:
             current_g = 20.0
-        grip_pos["gripper.pos"] = current_g
-        robot.send_action(_clean_action(grip_pos))
+        grab_pos["gripper.pos"] = current_g
+        robot.send_action({k: float(v) for k, v in grab_pos.items() if k in _MOTOR_KEYS})
 
     time.sleep(0.5)
 
-    print("[ROBOT] 🏠 LIFTING (Holding object)...")
-    lift_pos = dict(start_pos)
-    lift_pos["gripper.pos"] = current_g
-    smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03)
-    time.sleep(0.6)
+    print("[ROBOT] 🏠 RETURNING (Holding object)...")
+    drop_pos = dict(start_pos)
+    drop_pos["gripper.pos"] = current_g
+    smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
+                hold_joints=["gripper.pos"])
+    time.sleep(0.8)
 
     print("[ROBOT] 🖐 DROPPING...")
-    lift_pos["gripper.pos"] = 65.0
-    smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03)
-    time.sleep(0.8)
+    drop_pos["gripper.pos"] = 60.0
+    smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03)
+    time.sleep(0.5)
 
     print("[ROBOT] 🔄 Returning to neutral scan posture...")
     smooth_move(robot, start_pos, step_size=2.0, step_delay=0.03)
@@ -609,12 +651,23 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
 
 
 def connect_robot():
-    """Connect to SO-ARM101 using calibrated JSON, completely bypassing manual calibration."""
+    """
+    Connect to the SO-ARM101 follower arm using calibrated profile,
+    with automatic retries, port clear on failure, and health checks.
+    Exact implementation matching arm_picker.py.
+    """
     if SOFollower is None or SOFollowerRobotConfig is None:
         raise RuntimeError("lerobot package not found. Cannot connect to physical arm.")
 
-    # 1. Locate calibration JSON
-    import json as _json, pathlib as _pathlib
+    print("🔌 Connecting to SO-ARM101...")
+    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
+    robot  = SOFollower(config)
+
+    # Locate calibration JSON
+    import json as _json, pathlib as _pathlib, builtins as _builtins
+    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
+                  os.environ.get("TRANSFORMERS_CACHE",
+                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
     _calib_search = [
         _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
         _pathlib.Path(f"/root/ros2_ws/scripts/{ARM_ID}.json"),
@@ -622,6 +675,14 @@ def connect_robot():
         _pathlib.Path(__file__).parent.parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(__file__).parent / "calibration" / f"{ARM_ID}.json",
         _pathlib.Path(f"calibration/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
+        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
+        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
     ]
     _calib_path = next((p for p in _calib_search if p.exists() and p.stat().st_size > 0), None)
 
@@ -635,62 +696,40 @@ def connect_robot():
     }
 
     if _calib_path is not None:
-        print(f"   [CALIB] Calibration: {_calib_path}")
+        print(f"   📂 Calibration: {_calib_path}")
         with open(_calib_path) as _f:
             _calib_data = _json.load(_f)
     else:
-        print(f"   [CALIB] Using embedded calibrated profile for '{ARM_ID}'.")
+        print(f"   📂 Calibration file not found on disk — using embedded calibrated profile for '{ARM_ID}'.")
         _calib_data = _EMBEDDED_CALIB
-
-    # 2. Pre-populate calibration JSON in ALL LeRobot cache locations BEFORE instantiation!
-    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
-                  os.environ.get("TRANSFORMERS_CACHE",
-                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
-    _sync_targets = [
-        _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-    ]
-    for _st in _sync_targets:
+        # Auto-persist to /root/ros2_ws/calibration/jetson_arm.json
         try:
-            _st.parent.mkdir(parents=True, exist_ok=True)
-            with open(_st, "w") as _sf:
-                _json.dump(_calib_data, _sf, indent=4)
+            _persist_p = _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json")
+            _persist_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(_persist_p, "w") as _pf:
+                _json.dump(_calib_data, _pf, indent=4)
+            print(f"   💾 Auto-persisted calibration profile to: {_persist_p}")
         except Exception:
             pass
 
-    # 3. Create robot configuration
-    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-    if hasattr(config, "calibration_dir"):
-        config.calibration_dir = _pathlib.Path("/root/ros2_ws/calibration")
+    # Check degenerate
+    if "start_pos" in _calib_data:
+        _s, _e = _calib_data["start_pos"], _calib_data["end_pos"]
+        _is_degenerate = bool(_s) and all(a == b for a, b in zip(_s, _e))
+    else:
+        _ranges = [(v["range_min"], v["range_max"])
+                   for v in _calib_data.values()
+                   if isinstance(v, dict) and "range_min" in v]
+        _is_degenerate = bool(_ranges) and all(mn == mx for mn, mx in _ranges)
 
-    robot = SOFollower(config)
+    if _is_degenerate:
+        raise RuntimeError("Degenerate calibration file — all ranges are identical. Delete and re-calibrate.")
 
-    # 4. Safely ensure is_calibrated returns True and neutralize interactive calibration prompt
-    try:
-        type(robot).is_calibrated = property(lambda self: True)
-    except Exception:
-        pass
-    try:
-        robot.calibrate = lambda *args, **kwargs: None
-    except Exception:
-        pass
-    if hasattr(robot, "calibration_path"):
-        try:
-            robot.calibration_path = _pathlib.Path("/root/ros2_ws/calibration/jetson_arm.json")
-        except Exception:
-            pass
-
+    # Configure retry count on motor bus to make half-duplex UART robust against jitter
     if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
         robot.bus.default_num_retry = 3
 
-    # 5. Connect without interactive calibration (safe input fallback matching arm_picker.py)
+    # Connect with automatic retries and port reset
     connected = False
     last_err = None
     for attempt in range(1, 4):
@@ -711,8 +750,9 @@ def connect_robot():
                     _builtins.input = _real_input
             connected = True
             break
-        except Exception as e:
-            last_err = e
+        except ConnectionError as ce:
+            last_err = ce
+            print(f"   ⚠️  Connection attempt {attempt}/3 failed: {ce}")
             if hasattr(robot, "bus"):
                 try:
                     if hasattr(robot.bus, "port_handler") and robot.bus.port_handler:
@@ -723,12 +763,32 @@ def connect_robot():
                     robot.bus.disconnect()
                 except Exception:
                     pass
-            time.sleep(0.5)
+            time.sleep(0.6)
+        except Exception as e:
+            last_err = e
+            print(f"   ⚠️  Connection attempt {attempt}/3 error: {e}")
+            if hasattr(robot, "bus"):
+                try:
+                    robot.bus.disconnect()
+                except Exception:
+                    pass
+            time.sleep(0.6)
 
     if not connected:
+        print("\n" + "═"*65)
+        print(" ⛔ ROBOT CONNECTION FAILED (Servo Communication / Overload Error)")
+        print(f" ⚠️  Error details: {last_err}")
+        print(" 🔧 Quick Recovery Steps:")
+        print("    1. POWER CYCLE ARM: Unplug the arm power supply (barrel jack),")
+        print("       wait 5 seconds, and plug it back in. STS3215 internal overload")
+        print("       protection only clears on a power cycle!")
+        print("    2. SUPPORT ARM: Gently support the arm by hand so Motor 2")
+        print("       (shoulder_lift) is not strained against gravity during startup.")
+        print("    3. USB CHECK: Ensure the arm controller USB cable is firmly plugged in.")
+        print("═"*65 + "\n")
         raise RuntimeError(f"Could not connect to arm: {last_err}")
 
-    # 6. Build and inject typed motor calibrations into the bus
+    # Build typed calibration objects for LeRobot _normalize attribute access
     from types import SimpleNamespace as _NS
     _MC = None
     for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
@@ -763,25 +823,30 @@ def connect_robot():
         if isinstance(_jdata, dict)
     }
 
+    _registered = False
     for _method in ("set_calibration", "load_calibration", "_set_calibration"):
         if hasattr(robot.bus, _method):
             for _payload in (_typed_calib, _calib_data):
                 try:
                     getattr(robot.bus, _method)(_payload)
+                    _registered = True
                     break
                 except Exception:
                     pass
-            break
+            if _registered:
+                break
+    if not _registered:
+        for _attr in ("calibration", "_calibration"):
+            try:
+                setattr(robot.bus, _attr, _typed_calib)
+                _registered = True
+                break
+            except Exception:
+                pass
 
-    for _attr in ("calibration", "_calibration"):
-        try:
-            setattr(robot.bus, _attr, _typed_calib)
-            break
-        except Exception:
-            pass
+    print("   ✅ Arm connected and calibration registered")
 
-    print("   [ROBOT] Arm connected and calibrated profile active.")
-
+    # Servo health check
     if not check_servo_health(robot):
         robot.disconnect()
         raise RuntimeError("Servo health check failed — power cycle arm.")
@@ -1219,9 +1284,15 @@ class HighFPSRealSenseStream:
 
     def stop(self):
         self.running = False
+        if hasattr(self, "thread") and self.thread is not None and self.thread.is_alive():
+            try:
+                self.thread.join(timeout=1.5)
+            except Exception:
+                pass
         if self.pipeline:
             try:
                 self.pipeline.stop()
+                self.pipeline = None
             except Exception:
                 pass
 
@@ -1736,10 +1807,11 @@ def run_tiered_pipeline(args):
             print(f"[ROBOT] Connecting to SO-ARM101 on {PORT}...")
             robot = connect_robot()
             _ACTIVE_ROBOT[0] = robot
-            print("[ROBOT] Connected! Moving arm to elevated START_POS (scan posture)...")
-            smooth_move(robot, _BASE, step_size=1.5, step_delay=0.03)
+            print("\n▶ Moving to Start Position (slow start)...")
+            smooth_move(robot, _BASE, step_size=1.0, step_delay=0.05)
+            time.sleep(1.0)
             arm_live_joints = get_pos(robot)
-            print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.")
+            print("[ROBOT] Arm elevated at scan posture. Eye-in-hand D405 is viewing tabletop.\n")
         except Exception as e:
             print(f"[WARN] Robot arm connection failed ({e}). Operating in vision-only observation mode.")
             robot = None
@@ -1906,7 +1978,7 @@ def run_tiered_pipeline(args):
             sys.stderr.flush()
         except Exception:
             pass
-        os._exit(0)
+        sys.exit(0)
 
 
 if __name__ == "__main__":

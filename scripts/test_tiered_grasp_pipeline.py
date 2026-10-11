@@ -86,32 +86,6 @@ try:
 except Exception:
     pass
 
-# ── CRITICAL: Patch Ultralytics Profile class to prevent SIGABRT on Jetson ───
-# The crash "corrupted size vs. prev_size" at torch_utils.py:99 in disable()
-# is caused by Ultralytics' cProfile.Profile interacting with PyTorch's CUDA
-# allocator on the first inference. Replacing Profile with a no-op context
-# manager eliminates the heap corruption entirely.
-try:
-    import ultralytics.utils.torch_utils as _utu2
-    class _NoOpProfile:
-        """No-op replacement for Ultralytics Profile that avoids cProfile on Jetson."""
-        def __init__(self, *args, **kwargs): self.t = 0.0
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-        def __call__(self, func=None): return (lambda f: f)(func) if func else self
-        def __str__(self): return "0.0ms"
-        @property
-        def dt(self): return 0.0
-    _utu2.Profile = _NoOpProfile
-    import ultralytics.engine.model as _em
-    if hasattr(_em, "Profile"):
-        _em.Profile = _NoOpProfile
-    import ultralytics.engine.predictor as _ep
-    if hasattr(_ep, "Profile"):
-        _ep.Profile = _NoOpProfile
-except Exception:
-    pass
-
 import cv2, time, signal, base64, math, threading, atexit
 import numpy as np
 try:
@@ -355,10 +329,6 @@ def _build_T_cam_wrist() -> np.ndarray:
             try:
                 with open(p, 'r') as f:
                     calib = yaml.safe_load(f)
-                err = calib.get('reprojection_error', 0.0)
-                if err > 15.0:
-                    print(f"⚠️  {p} has excessive reprojection error ({err:.1f} mm > 15 mm) from old setup — skipping and using CAD mount matrix.")
-                    continue
                 R = np.array(calib['rotation_matrix'], dtype=np.float64)
                 t = np.array(calib['translation_mm'], dtype=np.float64).flatten()
                 T = np.eye(4)
@@ -3260,22 +3230,11 @@ def main():
 
     # ── YOLO GPU warmup BEFORE arm connect ───────────────────────────────────
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
-    gc.collect()
-    if torch is not None:
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
     _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
     try:
-        if torch is not None:
-            with torch.inference_mode():
-                model(_dummy, verbose=False, conf=YOLO_CONF)
-        else:
-            model(_dummy, verbose=False, conf=YOLO_CONF)
+        model(_dummy, verbose=False, conf=YOLO_CONF)
     except Exception:
         pass
-    gc.collect()
     print("   ✅ YOLO warmup complete")
 
     # ── Robot arm ─────────────────────────────────────────────────────────────
@@ -3870,9 +3829,7 @@ def main():
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
                 print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
-                # Open gripper safely to calibrated open angle (capped at 60.0° to protect motor)
-                open_gripper_deg = min(60.0, max(40.0, START_POS.get("gripper.pos", 55.0)))
-                grab_pos["gripper.pos"] = open_gripper_deg
+                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)
@@ -4001,6 +3958,7 @@ def main():
             except Exception:
                 pass
         try:
+            import gc
             gc.collect()
         except Exception:
             pass
@@ -4033,7 +3991,6 @@ def main():
             budget_status = "PASS (<300ms)" if e2e < 300.0 else "EXCEEDS BUDGET (>300ms)"
             print(f" * End-to-End Latency:      {e2e:.1f} ms -> {budget_status}")
         print("=" * 70 + "\n")
-        os._exit(0)
 
 
 

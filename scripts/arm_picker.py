@@ -244,9 +244,10 @@ WS_X_MIN_MM  = -140.0   # behind the robot
 WS_X_MAX_MM  =  390.0   # max forward reach (calibrated limit with 153mm gripper assembly)
 WS_Y_MAX_MM  =  280.0   # max lateral left
 WS_Y_MIN_MM  = -280.0   # max lateral right
-WS_Z_MIN_MM  = -250.0   # lowest reachable height below shoulder pivot
+WS_Z_MIN_MM  = -380.0   # lowest reachable height below shoulder pivot (rover chassis ground reach)
 WS_Z_MAX_MM  =  300.0   # highest point straight up
 WS_RHO_MAX_MM =  390.0  # max horizontal extension from shoulder pivot (405mm theoretical minus margin)
+TABLE_FLOOR_Z_MM = -380.0  # lowest safe floor/ground level below arm base in rover mount frame
 
 # ── RealSense D405 — Eye-in-Hand Calibration (T_cam_wrist) ──────────────────
 # Static 4×4 homogeneous transform: how the D405 is physically bolted to the wrist.
@@ -314,11 +315,13 @@ def _build_T_cam_wrist() -> np.ndarray:
     """
     import os, yaml
     calib_paths = [
+        "/root/ros2_ws/scripts/hand_eye_calibration.yaml",
         "/root/ros2_ws/calibration/hand_eye_calibration.yaml",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_eye_calibration.yaml"),
         os.path.join(os.path.dirname(__file__), "..", "calibration", "hand_eye_calibration.yaml"),
         os.path.join(os.path.dirname(__file__), "calibration", "hand_eye_calibration.yaml"),
         "calibration/hand_eye_calibration.yaml",
-        "hand_eye_calibration.yaml"
+        "hand_eye_calibration.yaml",
     ]
     for p in calib_paths:
         if os.path.exists(p):
@@ -337,18 +340,11 @@ def _build_T_cam_wrist() -> np.ndarray:
             except Exception as e:
                 print(f"⚠️ Failed reading {p}: {e}")
 
-    print("⚠️  hand_eye_calibration.yaml not found — using CAD mount matrix fallback.")
-    alpha = math.radians(CAM_PITCH_DEG)
-    sin_a, cos_a = math.sin(alpha), math.cos(alpha)
-    R = np.array([
-        [ 0.0, -sin_a,  cos_a],
-        [ 0.0,  cos_a,  sin_a],
-        [-1.0,   0.0,    0.0 ],
-    ])
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3]  = [CAM_Z_OFFSET_MM, -CAM_Y_OFFSET_MM, CAM_X_OFFSET_MM]
-    return T
+    # CAD fallback completely removed per user specification
+    raise RuntimeError(
+        "CRITICAL ERROR: hand_eye_calibration.yaml not found! "
+        "The CAD fallback has been completely removed. Ensure hand_eye_calibration.yaml exists in /root/ros2_ws/scripts/ or /root/ros2_ws/calibration/."
+    )
 
 # Precompute at import time
 T_CAM_WRIST: np.ndarray = None   # set in main() after math module is loaded
@@ -359,10 +355,12 @@ SEARCH_SWEEP_RANGE = 80.0   # ° pan left/right from START_POS centre
 SEARCH_SWEEP_SPEED = 0.5    # ° per YOLO throttle tick (~5 fps = 2.5°/s)
 
 # ── Alignment — closed-loop visual servoing ───────────────────────────────────
+ALIGN_MAX_FRAMES   = 150   # max frames to attempt visual alignment (~5-7s)
 ALIGN_THRESHOLD    = 30    # px   centred when dot within this many px of crosshair
 ALIGN_CENTRED_NEED = 4     # consecutive centred frames to confirm
-ALIGN_MAX_FRAMES   = 200   # give up after N frames (~10 s)
-ALIGN_LOST_GRACE   = 25    # consecutive not-found frames before abort
+# NOTE (Review later): In low-light / dark conditions, YOLO detection can drop intermittently.
+# Reduced grace period from 25 to 5 frames to fail fast instead of stalling.
+ALIGN_LOST_GRACE   = 5     # consecutive not-found frames before abort (reduced from 25)
 
 ALIGN_PAN_OFFSET   = 0     # px: optical center (lateral claw offset handles claw clearance at grab time)
 
@@ -1090,7 +1088,7 @@ def connect_robot():
         "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": -1498, "range_min": 814,  "range_max": 3207},
         "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
         "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
-        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 0,    "range_max": 4095},
+        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 765,  "range_max": 3495},
         "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626}
     }
 
@@ -1354,19 +1352,27 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
     if end_pitch_deg is not None:
         if abs(preferred_pitch) < 1e-3:
             # Strictly horizontal approach (pitch = 0.0° parallel to ground)
-            # Confine deviations strictly to level orientations [-5.0° to +5.0°]
+            # Try level orientations first [-5.0° to +5.0°]
             for offset in [0.0, 2.5, -2.5, 5.0, -5.0]:
                 cand = round(preferred_pitch + offset, 1)
                 if cand not in pitch_candidates:
                     pitch_candidates.append(cand)
+            # If level approach cannot reach (e.g. object is lower than shoulder pivot on table/floor),
+            # search downward angled approaches [-10° to -85°] so arm can lunge and grasp naturally:
+            for down_pitch in [-10.0, -15.0, -20.0, -25.0, -30.0, -35.0, -40.0, -45.0, -50.0, -55.0, -60.0, -65.0, -70.0, -75.0, -80.0, -85.0]:
+                if down_pitch not in pitch_candidates:
+                    pitch_candidates.append(down_pitch)
         elif preferred_pitch <= -80.0:
             # Strictly top-down vertical approach (perpendicular to ground)
             for offset in [0.0, 2.5, -2.5, 5.0, -5.0, 7.5, -7.5]:
                 cand = round(preferred_pitch + offset, 1)
                 if -90.0 <= cand <= -70.0 and cand not in pitch_candidates:
                     pitch_candidates.append(cand)
+            for down_pitch in [-65.0, -60.0, -55.0, -50.0, -45.0, -40.0, -35.0]:
+                if down_pitch not in pitch_candidates:
+                    pitch_candidates.append(down_pitch)
         else:
-            for offset in [0.0, 2.5, -2.5, 5.0, -5.0, 7.5, -7.5, 10.0, -10.0, -15.0, 15.0, -20.0, 20.0, -25.0, 25.0, -30.0, -35.0]:
+            for offset in [0.0, 2.5, -2.5, 5.0, -5.0, 7.5, -7.5, 10.0, -10.0, -15.0, 15.0, -20.0, 20.0, -25.0, 25.0, -30.0, -35.0, -40.0, -45.0, -50.0, -55.0, -60.0, -65.0, -70.0, -75.0, -80.0]:
                 cand = round(preferred_pitch + offset, 1)
                 if -90.0 <= cand <= 30.0 and cand not in pitch_candidates:
                     pitch_candidates.append(cand)
@@ -1422,6 +1428,10 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
             # Lift = -90° means pointing horizontally backwards.
             if m_lift < -90.0: continue
 
+            # For forward reaching and grasping, reject configurations where the elbow
+            # remains folded tightly backward against the upper arm (m_elbow > 45° is a stow fold, not a reach)
+            if m_elbow > 45.0: continue
+
             valid_candidates.append({
                 "shoulder_pan.pos":  pan_deg,
                 "shoulder_lift.pos": m_lift,
@@ -1437,17 +1447,19 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 print(f"   ✅ IK matched at pitch {test_pitch:.1f}°")
                 return c
                 
-            # Otherwise find the lowest cost move
+            # Prefer natural forward reaching posture (unfolded elbow: negative m_elbow)
+            elbow_fold_penalty = 100.0 if c["elbow_flex.pos"] > 20.0 else 0.0
             cost = (3.0 * abs(c["shoulder_lift.pos"] - current_joints.get("shoulder_lift.pos", 0)) +
-                    2.0 * abs(c["elbow_flex.pos"] - current_joints.get("elbow_flex.pos", 0)) +
-                    1.0 * abs(c["wrist_flex.pos"] - current_joints.get("wrist_flex.pos", 0)))
+                    1.5 * abs(c["elbow_flex.pos"] - current_joints.get("elbow_flex.pos", 0)) +
+                    1.0 * abs(c["wrist_flex.pos"] - current_joints.get("wrist_flex.pos", 0)) +
+                    elbow_fold_penalty)
             if cost < best_cost:
                 best_cost = cost
                 best_solution = c
 
         if best_solution is not None:
             # Found a valid configuration for this pitch
-            print(f"   ✅ IK matched at pitch {test_pitch:.1f}°")
+            print(f"   ✅ IK matched at pitch {test_pitch:.1f}° (Lift={best_solution['shoulder_lift.pos']:+.1f}°, Elb={best_solution['elbow_flex.pos']:+.1f}°, Wst={best_solution['wrist_flex.pos']:+.1f}°)")
             return best_solution
 
     print(f"   ⚠️  IK reject: Target geometrically unreachable at any pitch.")
@@ -2402,11 +2414,12 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
 
     closest_sample = min(valid_samples, key=lambda s: math.hypot(s[0] - target_px, s[1] - target_py))
     midpoint_cam = closest_sample[2]
-    table_floor_z = -135.0
+    table_floor_z = TABLE_FLOOR_Z_MM
 
     if is_upright:
-        # Upright bottle: grasp at the slim neck (72% height above table)
-        neck_z = max(mid_z_b + 35.0, table_floor_z + 0.72 * max(v_span, 160.0))
+        # Upright bottle: grasp at the slim neck (+35mm to +45mm above mid-height, within safe reach)
+        neck_offset = min(45.0, 0.25 * max(v_span, 140.0))
+        neck_z = max(mid_z_b + neck_offset, table_floor_z + 20.0)
         midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
     else:
         # Lying flat bottle: shift 25% along V towards the slimmer neck
@@ -3574,7 +3587,7 @@ def main():
                     mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
                     arm_x = mid_x
                     arm_y = mid_y
-                    table_floor_z = -135.0
+                    table_floor_z = TABLE_FLOOR_Z_MM
 
                     if orient_3d["is_lying_flat"]:
                         # Lying flat: descend towards cylinder midline from above
@@ -3622,7 +3635,7 @@ def main():
 
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface
-                table_floor_z = -135.0
+                table_floor_z = TABLE_FLOOR_Z_MM
                 min_safe_z = (table_floor_z + 15.0) if (orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal")) else table_floor_z
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.0f}mm (< {min_safe_z:.0f}mm) → elevating to {min_safe_z:.0f}mm")

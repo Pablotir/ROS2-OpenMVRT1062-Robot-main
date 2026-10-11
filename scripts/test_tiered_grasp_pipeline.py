@@ -104,125 +104,79 @@ except ImportError:
     AutoModelForCausalLM = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Physical Hardware & Kinematic Constants (SO-ARM101 + D405 Eye-in-Hand)
+# Import Proven SO-ARM101 Motion Primitives & Hardware Controllers from arm_picker
+# (Eliminates code divergence, guarantees correct motor normalization & STS3215 bus safety)
 # ─────────────────────────────────────────────────────────────────────────────
-IK_L1 = 115.0               # Shoulder pivot → Elbow pivot (mm)
-IK_L2 = 137.5               # Elbow pivot → Wrist flex pivot (mm)
-IK_L3 = 153.0               # Wrist flex pivot → Gripper fingertips (mm)
-IK_SHOULDER_HEIGHT_MM = 135.0
-
-PAN_ZERO_OFFSET_DEG = -4.6
-PAN_MIN_DEG         = -113.8
-PAN_MAX_DEG         =  113.8
-
-WS_X_MIN_MM  = -140.0
-WS_X_MAX_MM  =  390.0
-WS_Y_MAX_MM  =  280.0
-WS_Y_MIN_MM  = -280.0
-WS_Z_MIN_MM  = -250.0
-WS_Z_MAX_MM  =  300.0
-WS_RHO_MAX_MM = 390.0
-
-D405_MIN_RANGE_MM      = 70.0
-MAX_GRAB_DEPTH_MM      = 400.0
-GRASP_PENETRATION_MM   = 20.0
-GRAB_LATERAL_OFFSET_MM = 29.0   # +29mm shifts claw to LEFT, eliminating static pincer poke
-
-# Eye-in-hand default mounting parameters
-CAM_X_OFFSET_MM = 0.0
-CAM_Y_OFFSET_MM = 50.0
-CAM_Z_OFFSET_MM = 0.0
-CAM_PITCH_DEG   = 45.0
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+for _p in [
+    _scripts_dir,
+    os.path.join(_scripts_dir, ".."),
+    os.path.join(_scripts_dir, "..", "scripts"),
+    "/root/ros2_ws/scripts",
+    "/root/ros2_ws",
+    os.getcwd(),
+]:
+    if os.path.exists(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 try:
-    from lerobot.robots.so101_follower.so101_follower import SO101Follower as SOFollower
-    from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig as SOFollowerRobotConfig
-except (ImportError, ModuleNotFoundError):
-    try:
-        from lerobot.robots.so_follower.so_follower import SOFollower
-        from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
-    except (ImportError, ModuleNotFoundError):
-        try:
-            from lerobot.common.robot_devices.robots.feetech import SO100Follower as SOFollower
-            from lerobot.common.robot_devices.robots.configs import SO100FollowerConfig as SOFollowerRobotConfig
-        except (ImportError, ModuleNotFoundError):
-            SOFollower = None
-            SOFollowerRobotConfig = None
+    from arm_picker import (
+        connect_robot, get_pos, check_servo_health, smooth_move, level_approach,
+        forward_kinematics, solve_ik, _build_T_cam_wrist, _set_torque,
+        _load_reference_poses, _BASE, _STOW_BASE,
+        PORT, ARM_ID, SOFollower, SOFollowerRobotConfig,
+        IK_L1, IK_L2, IK_L3, IK_SHOULDER_HEIGHT_MM,
+        PAN_ZERO_OFFSET_DEG, PAN_MIN_DEG, PAN_MAX_DEG,
+        WS_X_MIN_MM, WS_X_MAX_MM, WS_Y_MAX_MM, WS_Y_MIN_MM,
+        WS_Z_MIN_MM, WS_Z_MAX_MM, WS_RHO_MAX_MM,
+        D405_MIN_RANGE_MM, MAX_GRAB_DEPTH_MM, GRASP_PENETRATION_MM,
+        GRAB_LATERAL_OFFSET_MM, CAM_X_OFFSET_MM, CAM_Y_OFFSET_MM,
+        CAM_Z_OFFSET_MM, CAM_PITCH_DEG
+    )
+except ImportError:
+    # Standalone mock fallbacks if arm_picker is not found
+    SOFollower = None
+    SOFollowerRobotConfig = None
+    PORT = "/dev/arm_controller"
+    ARM_ID = "jetson_arm"
+    IK_L1, IK_L2, IK_L3 = 115.0, 137.5, 153.0
+    IK_SHOULDER_HEIGHT_MM = 135.0
+    PAN_ZERO_OFFSET_DEG = -4.6
+    PAN_MIN_DEG, PAN_MAX_DEG = -113.8, 113.8
+    WS_X_MIN_MM, WS_X_MAX_MM = -140.0, 390.0
+    WS_Y_MIN_MM, WS_Y_MAX_MM = -280.0, 280.0
+    WS_Z_MIN_MM, WS_Z_MAX_MM = -250.0, 300.0
+    WS_RHO_MAX_MM = 390.0
+    D405_MIN_RANGE_MM = 70.0
+    MAX_GRAB_DEPTH_MM = 400.0
+    GRASP_PENETRATION_MM = 20.0
+    GRAB_LATERAL_OFFSET_MM = 29.0
+    CAM_X_OFFSET_MM, CAM_Y_OFFSET_MM, CAM_Z_OFFSET_MM = 0.0, 50.0, 0.0
+    CAM_PITCH_DEG = 45.0
+    _BASE = {
+        "shoulder_pan.pos": -14.95, "shoulder_lift.pos": -104.22,
+        "elbow_flex.pos": 98.29, "wrist_flex.pos": 18.02,
+        "wrist_roll.pos": -68.62, "gripper.pos": 72.60
+    }
+    _STOW_BASE = dict(_BASE)
+    def connect_robot(): return None
+    def get_pos(r): return dict(_BASE)
+    def check_servo_health(r): return True
+    def smooth_move(r, t, **kw): pass
+    def level_approach(r, t, **kw): pass
+    def forward_kinematics(q): return np.eye(4)
+    def solve_ik(*args, **kw): return None
+    def _build_T_cam_wrist(): return np.eye(4)
+    def _set_torque(r, en): return True
 
-PORT   = "/dev/arm_controller"
-ARM_ID = "jetson_arm"
-
-_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex",
-                "wrist_flex", "wrist_roll", "gripper"]
-_HW_ERR_BITS = {
-    0x01: "Input Voltage Error",
-    0x02: "Motor Overheat",
-    0x04: "Overload Error",
-    0x08: "ElectricalShock Error",
-    0x10: "Overheated Error",
-    0x20: "Instruction Error",
-}
-_ERR_REG_CANDIDATES = [
-    "Hardware_Error_Status",
-    "hardware_error_status",
-    "Hw_Error_Status",
-    "HW_Error_Status",
-]
-_LOAD_REG_CANDIDATES = ["Present_Load", "present_load", "Load"]
-_LOAD_STALL_THRESHOLD = 800
-
-# Reference scan & stow postures (loaded from arm_reference_poses.yaml)
-_BASE = {
-    "shoulder_pan.pos":   -14.95,
-    "shoulder_lift.pos": -104.22,
-    "elbow_flex.pos":      98.29,
-    "wrist_flex.pos":      18.02,
-    "wrist_roll.pos":     -68.62,
-    "gripper.pos":         72.60,
-}
-_STOW_BASE = {
-    "shoulder_pan.pos":   -15.03,
-    "shoulder_lift.pos": -100.00,
-    "elbow_flex.pos":      98.20,
-    "wrist_flex.pos":      76.84,
-    "wrist_roll.pos":     -68.62,
-    "gripper.pos":         72.60,
-}
-
-def load_reference_poses():
-    """Load calibrated scan_base and stow_base postures from YAML if available."""
-    import yaml
-    search_paths = [
-        "/root/ros2_ws/calibration/arm_reference_poses.yaml",
-        os.path.join(os.path.dirname(__file__), "..", "calibration", "arm_reference_poses.yaml"),
-        os.path.join(os.path.dirname(__file__), "calibration", "arm_reference_poses.yaml"),
-        os.path.join(os.path.dirname(__file__), "arm_reference_poses.yaml"),
-        "calibration/arm_reference_poses.yaml",
-        "arm_reference_poses.yaml",
-    ]
-    for p in search_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r") as f:
-                    data = yaml.safe_load(f)
-                if not data:
-                    continue
-                scan = data.get("scan_base", {}).get("joints")
-                stow = data.get("stow_base", {}).get("joints")
-                if scan:
-                    for k, v in scan.items():
-                        _BASE[k] = round(float(v), 2)
-                    print(f"[POSE] Loaded scan_base posture from: {p}")
-                if stow:
-                    for k, v in stow.items():
-                        _STOW_BASE[k] = round(float(v), 2)
-                return p
-            except Exception as e:
-                print(f"[WARN] Failed reading {p}: {e}")
-    return None
-
-load_reference_poses()
 DEFAULT_SCAN_JOINTS = dict(_BASE)
+T_CAM_WRIST = _build_T_cam_wrist()
+
+_MOTOR_KEYS = {
+    "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
+    "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"
+}
+
 
 # ── Global Shutdown & Clean Signal Exit ───────────────────────────────────────
 _SHUTDOWN_REQUESTED = [False]
@@ -386,181 +340,7 @@ def make_vis_combined(img: np.ndarray, depth_map=None) -> np.ndarray:
     return img
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Robot Hardware Communication & Kinematics
-# ─────────────────────────────────────────────────────────────────────────────
-def get_pos(robot) -> dict:
-    """Reads current joint positions from the physical arm."""
-    obs = robot.get_observation()
-    joints = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
-              "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
-    return {k: v for k, v in obs.items() if k in joints}
-
-
-def check_servo_health(robot) -> bool:
-    """
-    Read error status from every servo BEFORE issuing any motion.
-    Tries Hardware_Error_Status first (direct overload flag), then falls back
-    to Present_Load as a proxy (high load = stalled/overloaded).
-    Returns True if all servos appear healthy, False if any are faulted.
-    STS3215 overload protection clears on power-cycle only.
-    """
-    print("🩺 Checking servo health...")
-
-    # ── Step 1: find a working error-status register name ─────────────────
-    err_reg = None
-    for candidate in _ERR_REG_CANDIDATES:
-        try:
-            robot.bus.read(candidate, _MOTOR_NAMES[0])
-            err_reg = candidate
-            break
-        except Exception:
-            continue
-
-    # ── Step 2: if error register found, read all motors ──────────────────
-    if err_reg is not None:
-        all_ok = True
-        for name in _MOTOR_NAMES:
-            try:
-                val = int(robot.bus.read(err_reg, name))
-                if val != 0:
-                    flags = [desc for bit, desc in _HW_ERR_BITS.items() if val & bit]
-                    print(f"   ❌  {name}: error=0x{val:02X}  ({', '.join(flags)})")
-                    all_ok = False
-                else:
-                    print(f"   ✅  {name}: OK")
-            except Exception as e:
-                print(f"   ⚠️  {name}: read failed ({e})")
-        if not all_ok:
-            print("\n   ⛔  One or more servos are in an error/overload state.")
-            print("   ⛔  Power-cycle the arm (unplug and replug the power supply),")
-            print("   ⛔  then re-run the script.")
-            print("   ⛔  Do NOT attempt to move the arm while in this state.\n")
-        else:
-            print("   ✅ All servos healthy — safe to move.\n")
-        return all_ok
-
-    # ── Step 3: fallback — use Present_Load as a stall proxy ─────────────
-    load_reg = None
-    for candidate in _LOAD_REG_CANDIDATES:
-        try:
-            robot.bus.read(candidate, _MOTOR_NAMES[0])
-            load_reg = candidate
-            break
-        except Exception:
-            continue
-
-    if load_reg is not None:
-        all_ok = True
-        for name in _MOTOR_NAMES:
-            try:
-                raw_val = abs(int(robot.bus.read(load_reg, name)))
-                load_mag = raw_val & 0x03FF
-                if load_mag > _LOAD_STALL_THRESHOLD:
-                    print(f"   ❌  {name}: high load ({load_mag}/1023) — may be stalled (raw={raw_val})")
-                    all_ok = False
-                else:
-                    print(f"   ✅  {name}: load={load_mag}/1023")
-            except Exception as e:
-                print(f"   ⚠️  {name}: load read failed ({e})")
-        if not all_ok:
-            print("\n   ⛔  One or more servos show high load — possible overload state.")
-            print("   ⛔  Power-cycle the arm, then re-run.\n")
-        else:
-            print("   ✅ All servos healthy (load check) — safe to move.\n")
-        return all_ok
-
-    # ── Step 4: nothing worked — warn and proceed ─────────────────────────
-    print("   ⚠️  Health check unavailable (register names not found in control table).")
-    print("   ⚠️  Proceeding — if arm loses power immediately, power-cycle it.\n")
-    return True
-
-
-_MOTOR_KEYS = {
-    "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
-    "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"
-}
-
-
-def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
-                hold_joints=None):
-    if hold_joints is None:
-        hold_joints = []
-    cur = get_pos(robot)
-    # Freeze hold_joints at their target immediately
-    for j in hold_joints:
-        if j in target:
-            cur[j] = target[j]
-    valid_targets = {k: float(v) for k, v in target.items() if k in cur}
-    if not valid_targets:
-        return
-    max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
-    if max_delta < 0.5:
-        return
-    n = max(1, int(max_delta / step_size))
-    for s in range(1, n + 1):
-        if _SHUTDOWN_REQUESTED[0]:
-            break
-        t      = s / n
-        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0))
-                  for j in valid_targets}
-        robot.send_action(interp)
-        time.sleep(step_delay)
-
-
-def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
-    """
-    Move all joints simultaneously toward *target* at uniform speed while
-    continuously adjusting wrist_flex so the gripper smoothly tracks the
-    desired approach pitch along the reach trajectory (pitch = 0° for horizontal,
-    or steep/angled down for tilted or tabletop objects).
-
-    All servos move at the same rate without staging.
-    """
-    cur = get_pos(robot)
-    valid_targets = {k: float(v) for k, v in target.items() if k in cur}
-    if not valid_targets:
-        return
-    max_delta = max((abs(valid_targets[j] - cur.get(j, 0.0)) for j in valid_targets), default=0.0)
-    if max_delta < 0.5:
-        return
-    n = max(1, int(max_delta / step_size))
-
-    # Calculate initial and target pitch relative to horizontal
-    cur_lift = cur.get("shoulder_lift.pos", 0.0)
-    cur_elb  = cur.get("elbow_flex.pos", 0.0)
-    cur_wst  = cur.get("wrist_flex.pos", 0.0)
-    t1_0 = math.radians(90.0 - cur_lift)
-    t2_0 = t1_0 - math.radians(cur_elb + 81.0)
-    pitch_0 = math.degrees(t2_0 - math.radians(cur_wst + 5.0))
-
-    tgt_lift = valid_targets.get("shoulder_lift.pos", cur_lift)
-    tgt_elb  = valid_targets.get("elbow_flex.pos", cur_elb)
-    tgt_wst  = valid_targets.get("wrist_flex.pos", cur_wst)
-    t1_tgt = math.radians(90.0 - tgt_lift)
-    t2_tgt = t1_tgt - math.radians(tgt_elb + 81.0)
-    pitch_tgt = math.degrees(t2_tgt - math.radians(tgt_wst + 5.0))
-
-    for s in range(1, n + 1):
-        if _SHUTDOWN_REQUESTED[0]:
-            break
-        t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (valid_targets[j] - cur.get(j, 0.0))
-                  for j in valid_targets}
-
-        # Desired pitch smoothly transitions from initial pitch to target pitch
-        desired_pitch_deg = pitch_0 + t * (pitch_tgt - pitch_0)
-
-        lift_now = interp.get("shoulder_lift.pos", 0.0)
-        elb_now  = interp.get("elbow_flex.pos", 0.0)
-        t1_rad = math.radians(90.0 - lift_now)
-        t2_rad = t1_rad - math.radians(elb_now + 81.0)
-
-        # Exact wrist_flex motor angle for the interpolated approach pitch
-        interp["wrist_flex.pos"] = math.degrees(t2_rad - math.radians(desired_pitch_deg)) - 5.0
-
-        robot.send_action(interp)
-        time.sleep(step_delay)
+# (Arm primitives get_pos, check_servo_health, smooth_move, level_approach imported from arm_picker)
 
 
 def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
@@ -650,208 +430,7 @@ def execute_physical_grasp(robot, joint_sol: dict, start_pos=_BASE):
     print("[ROBOT] ✅ Grasp sequence completed successfully!\n")
 
 
-def connect_robot():
-    """
-    Connect to the SO-ARM101 follower arm using calibrated profile,
-    with automatic retries, port clear on failure, and health checks.
-    Exact implementation matching arm_picker.py.
-    """
-    if SOFollower is None or SOFollowerRobotConfig is None:
-        raise RuntimeError("lerobot package not found. Cannot connect to physical arm.")
-
-    print("🔌 Connecting to SO-ARM101...")
-    config = SOFollowerRobotConfig(port=PORT, id=ARM_ID, use_degrees=True)
-    robot  = SOFollower(config)
-
-    # Locate calibration JSON
-    import json as _json, pathlib as _pathlib, builtins as _builtins
-    _hf_home = _pathlib.Path(os.environ.get("HF_HOME",
-                  os.environ.get("TRANSFORMERS_CACHE",
-                  str(_pathlib.Path.home() / ".cache" / "huggingface"))))
-    _calib_search = [
-        _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json"),
-        _pathlib.Path(f"/root/ros2_ws/scripts/{ARM_ID}.json"),
-        _pathlib.Path(__file__).parent / f"{ARM_ID}.json",
-        _pathlib.Path(__file__).parent.parent / "calibration" / f"{ARM_ID}.json",
-        _pathlib.Path(__file__).parent / "calibration" / f"{ARM_ID}.json",
-        _pathlib.Path(f"calibration/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/data/models/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _hf_home / f"lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _hf_home / f"lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json"),
-        _pathlib.Path(f"/root/.cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json"),
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so101_follower/{ARM_ID}.json",
-        _pathlib.Path.home() / f".cache/huggingface/lerobot/calibration/robots/so_follower/{ARM_ID}.json",
-    ]
-    _calib_path = next((p for p in _calib_search if p.exists() and p.stat().st_size > 0), None)
-
-    _EMBEDDED_CALIB = {
-        "shoulder_pan":  {"id": 1, "drive_mode": 0, "homing_offset": 1604,  "range_min": 962,  "range_max": 3486},
-        "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": -1498, "range_min": 814,  "range_max": 3207},
-        "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
-        "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
-        "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 0,    "range_max": 4095},
-        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626}
-    }
-
-    if _calib_path is not None:
-        print(f"   📂 Calibration: {_calib_path}")
-        with open(_calib_path) as _f:
-            _calib_data = _json.load(_f)
-    else:
-        print(f"   📂 Calibration file not found on disk — using embedded calibrated profile for '{ARM_ID}'.")
-        _calib_data = _EMBEDDED_CALIB
-        # Auto-persist to /root/ros2_ws/calibration/jetson_arm.json
-        try:
-            _persist_p = _pathlib.Path(f"/root/ros2_ws/calibration/{ARM_ID}.json")
-            _persist_p.parent.mkdir(parents=True, exist_ok=True)
-            with open(_persist_p, "w") as _pf:
-                _json.dump(_calib_data, _pf, indent=4)
-            print(f"   💾 Auto-persisted calibration profile to: {_persist_p}")
-        except Exception:
-            pass
-
-    # Check degenerate
-    if "start_pos" in _calib_data:
-        _s, _e = _calib_data["start_pos"], _calib_data["end_pos"]
-        _is_degenerate = bool(_s) and all(a == b for a, b in zip(_s, _e))
-    else:
-        _ranges = [(v["range_min"], v["range_max"])
-                   for v in _calib_data.values()
-                   if isinstance(v, dict) and "range_min" in v]
-        _is_degenerate = bool(_ranges) and all(mn == mx for mn, mx in _ranges)
-
-    if _is_degenerate:
-        raise RuntimeError("Degenerate calibration file — all ranges are identical. Delete and re-calibrate.")
-
-    # Configure retry count on motor bus to make half-duplex UART robust against jitter
-    if hasattr(robot, "bus") and hasattr(robot.bus, "default_num_retry"):
-        robot.bus.default_num_retry = 3
-
-    # Connect with automatic retries and port reset
-    connected = False
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            try:
-                robot.connect(calibrate=False)
-            except TypeError:
-                _real_input = _builtins.input
-                def _auto_use_file(prompt=""):
-                    if "enter" in prompt.lower() and "range" not in prompt.lower():
-                        return ""
-                    _builtins.input = _real_input
-                    return _real_input(prompt)
-                _builtins.input = _auto_use_file
-                try:
-                    robot.connect()
-                finally:
-                    _builtins.input = _real_input
-            connected = True
-            break
-        except ConnectionError as ce:
-            last_err = ce
-            print(f"   ⚠️  Connection attempt {attempt}/3 failed: {ce}")
-            if hasattr(robot, "bus"):
-                try:
-                    if hasattr(robot.bus, "port_handler") and robot.bus.port_handler:
-                        robot.bus.port_handler.clearPort()
-                except Exception:
-                    pass
-                try:
-                    robot.bus.disconnect()
-                except Exception:
-                    pass
-            time.sleep(0.6)
-        except Exception as e:
-            last_err = e
-            print(f"   ⚠️  Connection attempt {attempt}/3 error: {e}")
-            if hasattr(robot, "bus"):
-                try:
-                    robot.bus.disconnect()
-                except Exception:
-                    pass
-            time.sleep(0.6)
-
-    if not connected:
-        print("\n" + "═"*65)
-        print(" ⛔ ROBOT CONNECTION FAILED (Servo Communication / Overload Error)")
-        print(f" ⚠️  Error details: {last_err}")
-        print(" 🔧 Quick Recovery Steps:")
-        print("    1. POWER CYCLE ARM: Unplug the arm power supply (barrel jack),")
-        print("       wait 5 seconds, and plug it back in. STS3215 internal overload")
-        print("       protection only clears on a power cycle!")
-        print("    2. SUPPORT ARM: Gently support the arm by hand so Motor 2")
-        print("       (shoulder_lift) is not strained against gravity during startup.")
-        print("    3. USB CHECK: Ensure the arm controller USB cable is firmly plugged in.")
-        print("═"*65 + "\n")
-        raise RuntimeError(f"Could not connect to arm: {last_err}")
-
-    # Build typed calibration objects for LeRobot _normalize attribute access
-    from types import SimpleNamespace as _NS
-    _MC = None
-    for _mc_mod in ("lerobot.motors.motors_bus", "lerobot.motors.feetech",
-                    "lerobot.common.robot_devices.motors.feetech"):
-        try:
-            import importlib as _il
-            _mod = _il.import_module(_mc_mod)
-            for _cname in ("MotorCalibration", "CalibrationData", "Calibration"):
-                if hasattr(_mod, _cname):
-                    _MC = getattr(_mod, _cname)
-                    break
-            if _MC:
-                break
-        except Exception:
-            pass
-
-    def _make_motor_calib(d: dict):
-        if _MC is not None:
-            try:
-                import dataclasses as _dc
-                if _dc.is_dataclass(_MC):
-                    _fields = {f.name for f in _dc.fields(_MC)}
-                    return _MC(**{k: v for k, v in d.items() if k in _fields})
-                return _MC(**d)
-            except Exception:
-                pass
-        return _NS(**d)
-
-    _typed_calib = {
-        _motor: _make_motor_calib(_jdata)
-        for _motor, _jdata in _calib_data.items()
-        if isinstance(_jdata, dict)
-    }
-
-    _registered = False
-    for _method in ("set_calibration", "load_calibration", "_set_calibration"):
-        if hasattr(robot.bus, _method):
-            for _payload in (_typed_calib, _calib_data):
-                try:
-                    getattr(robot.bus, _method)(_payload)
-                    _registered = True
-                    break
-                except Exception:
-                    pass
-            if _registered:
-                break
-    if not _registered:
-        for _attr in ("calibration", "_calibration"):
-            try:
-                setattr(robot.bus, _attr, _typed_calib)
-                _registered = True
-                break
-            except Exception:
-                pass
-
-    print("   ✅ Arm connected and calibration registered")
-
-    # Servo health check
-    if not check_servo_health(robot):
-        robot.disconnect()
-        raise RuntimeError("Servo health check failed — power cycle arm.")
-
-    return robot
+# (connect_robot imported directly from arm_picker)
 
 
 def emergency_stow():
@@ -883,193 +462,7 @@ def emergency_stow():
 atexit.register(emergency_stow)
 
 
-def build_T_cam_wrist() -> np.ndarray:
-    """Build or load 4x4 eye-in-hand calibration matrix T_cam_wrist."""
-    import yaml
-    calib_paths = [
-        "/root/ros2_ws/calibration/hand_eye_calibration.yaml",
-        os.path.join(os.path.dirname(__file__), "..", "calibration", "hand_eye_calibration.yaml"),
-        os.path.join(os.path.dirname(__file__), "calibration", "hand_eye_calibration.yaml"),
-        "calibration/hand_eye_calibration.yaml",
-        "hand_eye_calibration.yaml"
-    ]
-    for p in calib_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, 'r') as f:
-                    calib = yaml.safe_load(f)
-                R = np.array(calib['rotation_matrix'], dtype=np.float64)
-                t = np.array(calib['translation_mm'], dtype=np.float64).flatten()
-                T = np.eye(4)
-                T[:3, :3] = R
-                T[:3, 3] = t
-                print(f"[CALIB] Loaded calibrated T_cam_wrist from: {p}")
-                return T
-            except Exception:
-                pass
-
-    # Fallback CAD transform
-    alpha = math.radians(CAM_PITCH_DEG)
-    sin_a, cos_a = math.sin(alpha), math.cos(alpha)
-    R = np.array([
-        [ 0.0, -sin_a,  cos_a],
-        [ 0.0,  cos_a,  sin_a],
-        [-1.0,   0.0,    0.0 ],
-    ])
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3]  = [CAM_Z_OFFSET_MM, -CAM_Y_OFFSET_MM, CAM_X_OFFSET_MM]
-    return T
-
-T_CAM_WRIST = build_T_cam_wrist()
-
-
-def forward_kinematics(q: dict) -> np.ndarray:
-    """Computes 4x4 T_wrist_base from current servo positions."""
-    pan  = math.radians(-q.get("shoulder_pan.pos", 0.0) - PAN_ZERO_OFFSET_DEG)
-    lift = q.get("shoulder_lift.pos", 0.0)
-    elb  = q.get("elbow_flex.pos", 0.0)
-    wst  = q.get("wrist_flex.pos", 0.0)
-    roll = math.radians(-q.get("wrist_roll.pos", 0.0))
-
-    t1 = math.radians(90.0 - lift)
-    t2 = t1 - math.radians(elb + 81.0)
-    t3 = t2 - math.radians(wst + 5.0)
-
-    rho_w = IK_L1 * math.cos(t1) + IK_L2 * math.cos(t2)
-    z_w   = IK_L1 * math.sin(t1) + IK_L2 * math.sin(t2)
-
-    wx = rho_w * math.cos(pan)
-    wy = rho_w * math.sin(pan)
-    wz = z_w
-
-    ax = math.cos(t3) * math.cos(pan)
-    ay = math.cos(t3) * math.sin(pan)
-    az = math.sin(t3)
-
-    zx = -math.sin(pan)
-    zy =  math.cos(pan)
-    zz = 0.0
-
-    yx = zy * az - zz * ay
-    yy = zz * ax - zx * az
-    yz = zx * ay - zy * ax
-
-    R_base = np.array([
-        [ax, yx, zx],
-        [ay, yy, zy],
-        [az, yz, zz]
-    ])
-
-    R_roll = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, math.cos(roll), -math.sin(roll)],
-        [0.0, math.sin(roll),  math.cos(roll)]
-    ])
-
-    R_final = R_base @ R_roll
-    T = np.eye(4)
-    T[:3, :3] = R_final
-    T[:3, 3] = [wx, wy, wz]
-    return T
-
-
-def solve_ik(x_mm: float, y_mm: float, z_mm: float,
-             end_pitch_deg: float | None = None,
-             current_joints: dict | None = None,
-             wrist_roll_deg: float = -68.62) -> dict | None:
-    """Analytical closed-form IK solver for SO-ARM101."""
-    pan_rad = math.atan2(y_mm, x_mm)
-    pan_deg = -(math.degrees(pan_rad) + PAN_ZERO_OFFSET_DEG)
-
-    if pan_deg < PAN_MIN_DEG or pan_deg > PAN_MAX_DEG:
-        return None
-
-    rho = math.sqrt(x_mm**2 + y_mm**2)
-
-    if end_pitch_deg is None:
-        natural_pitch = math.degrees(math.atan2(z_mm, rho))
-        preferred_pitch = float(np.clip(natural_pitch, -85.0, -5.0))
-    else:
-        preferred_pitch = end_pitch_deg
-
-    pitch_candidates = [preferred_pitch]
-    if end_pitch_deg is not None:
-        if abs(preferred_pitch) < 1e-3:
-            for offset in [0.0, 2.5, -2.5, 5.0, -5.0]:
-                c = round(preferred_pitch + offset, 1)
-                if c not in pitch_candidates:
-                    pitch_candidates.append(c)
-        elif preferred_pitch <= -80.0:
-            for offset in [0.0, 2.5, -2.5, 5.0, -5.0, 7.5, -7.5]:
-                c = round(preferred_pitch + offset, 1)
-                if -90.0 <= c <= -70.0 and c not in pitch_candidates:
-                    pitch_candidates.append(c)
-        else:
-            for offset in [0.0, 5.0, -5.0, 10.0, -10.0, 15.0, -15.0, 20.0, -20.0]:
-                c = round(preferred_pitch + offset, 1)
-                if -90.0 <= c <= 30.0 and c not in pitch_candidates:
-                    pitch_candidates.append(c)
-    else:
-        for p in np.arange(preferred_pitch, -90.0, -5.0):
-            pitch_candidates.append(round(float(p), 1))
-
-    best_solution = None
-    best_cost = float('inf')
-
-    for test_pitch in pitch_candidates:
-        pitch_rad = math.radians(test_pitch)
-        wrist_x = rho - IK_L3 * math.cos(pitch_rad)
-        wrist_z = z_mm - IK_L3 * math.sin(pitch_rad)
-
-        D = math.sqrt(wrist_x**2 + wrist_z**2)
-        D_max = IK_L1 + IK_L2 - 1.0
-        D_min = abs(IK_L1 - IK_L2) + 1.0
-        if D > D_max or D < D_min:
-            continue
-
-        cos_t2 = (D**2 - IK_L1**2 - IK_L2**2) / (2.0 * IK_L1 * IK_L2)
-        cos_t2 = float(np.clip(cos_t2, -1.0, 1.0))
-        alpha = math.atan2(wrist_z, wrist_x)
-
-        for sign in (-1.0, +1.0):
-            t2 = sign * math.acos(cos_t2)
-            beta = math.atan2(IK_L2 * math.sin(t2), IK_L1 + IK_L2 * math.cos(t2))
-            t1 = alpha - beta
-
-            m_lift = 90.0 - math.degrees(t1)
-            m_elbow = -math.degrees(t2) - 81.0
-            m_wrist = math.degrees(t1 + t2 - pitch_rad) - 5.0
-
-            if not (-110 <= m_lift <= 150): continue
-            if not (-120 <= m_elbow <= 120): continue
-            if not (-120 <= m_wrist <= 120): continue
-            if m_lift < -90.0: continue
-
-            sol = {
-                "shoulder_pan.pos": round(pan_deg, 2),
-                "shoulder_lift.pos": round(m_lift, 2),
-                "elbow_flex.pos": round(m_elbow, 2),
-                "wrist_flex.pos": round(m_wrist, 2),
-                "wrist_roll.pos": round(wrist_roll_deg, 2),
-                "gripper.pos": 75.0,
-                "pitch_deg": test_pitch
-            }
-
-            if current_joints is None:
-                return sol
-
-            cost = (3.0 * abs(m_lift - current_joints.get("shoulder_lift.pos", 0)) +
-                    2.0 * abs(m_elbow - current_joints.get("elbow_flex.pos", 0)) +
-                    1.0 * abs(m_wrist - current_joints.get("wrist_flex.pos", 0)))
-            if cost < best_cost:
-                best_cost = cost
-                best_solution = sol
-
-        if best_solution is not None:
-            return best_solution
-
-    return None
+# (Kinematics forward_kinematics, solve_ik, and _build_T_cam_wrist imported from arm_picker)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1775,30 +1168,8 @@ def run_tiered_pipeline(args):
     if not args.headless:
         setup_native_display()
 
-    # Initialize components
-    cam = HighFPSRealSenseStream(target_fps=args.fps, width=args.width, height=args.height, use_mock=args.mock)
-    _ACTIVE_CAM[0] = cam
-
-    tripwire = TripwireScanner(target_label=args.target)
-    vlm = LocalVLMConfirmation(engine=args.vlm)
-    cropper = PointCloudCropper(max_points=2048)
-    grasp_planner = GraspPosePredictor()
-    ik_solver = ArmKinematicsSolver()
-
-    iteration = 0
-    t_last_report = time.time()
-    last_grasp_time = 0.0
-
-    metrics_tier1 = []
-    metrics_vlm = []
-    metrics_pc = []
-    metrics_grasp = []
-    metrics_ik = []
-    metrics_tier2_total = []
-    last_joint_sol = None
-    last_base_xyz = None
-
-    # Connect to physical SO-ARM101 robot
+    # 1. Connect physical robot and elevate to Start Position FIRST
+    # (Matches arm_picker.py: elevates arm so eye-in-hand D405 is overlooking tabletop before camera starts)
     robot = None
     arm_live_joints = dict(_BASE)
 
@@ -1819,6 +1190,30 @@ def run_tiered_pipeline(args):
         print("[INFO] --no-arm specified: Operating in vision-only observation mode.")
     else:
         print(f"[INFO] Controller {PORT} not found. Operating in vision-only observation mode.")
+
+    # 2. Start high-speed RealSense camera
+    cam = HighFPSRealSenseStream(target_fps=args.fps, width=args.width, height=args.height, use_mock=args.mock)
+    _ACTIVE_CAM[0] = cam
+
+    # 3. Initialize Tiered Perception Components
+    tripwire = TripwireScanner(target_label=args.target)
+    vlm = LocalVLMConfirmation(engine=args.vlm)
+    cropper = PointCloudCropper(max_points=2048)
+    grasp_planner = GraspPosePredictor()
+    ik_solver = ArmKinematicsSolver()
+
+    iteration = 0
+    t_last_report = time.time()
+    last_grasp_time = 0.0
+
+    metrics_tier1 = []
+    metrics_vlm = []
+    metrics_pc = []
+    metrics_grasp = []
+    metrics_ik = []
+    metrics_tier2_total = []
+    last_joint_sol = None
+    last_base_xyz = None
 
     try:
         while not _SHUTDOWN_REQUESTED[0]:
@@ -1900,7 +1295,7 @@ def run_tiered_pipeline(args):
                 cv2.putText(vis, f"{hud_line1} -> {budget_status}", (20, args.height - 92), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0) if total_tier2_ms < 300 else (0, 0, 255), 2)
 
-                j_str = f"Pan: {joint_sol['shoulder_pan.pos']:.1f}° | Lift: {joint_sol['shoulder_lift.pos']:.1f}° | Elbow: {joint_sol['elbow_flex.pos']:.1f}° | Pitch: {joint_sol['pitch_deg']:.1f}°"
+                j_str = f"Pan: {joint_sol['shoulder_pan.pos']:.1f}° | Lift: {joint_sol['shoulder_lift.pos']:.1f}° | Elbow: {joint_sol['elbow_flex.pos']:.1f}° | Pitch: {joint_sol.get('pitch_deg', grasp_cand.pitch_deg):.1f}°"
                 cv2.putText(vis, f"IK TARGETS: {j_str}", (20, args.height - 62), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
 
                 b_str = f"Base: X={base_xyz[0]:+.0f}mm, Y={base_xyz[1]:+.0f}mm, Z={base_xyz[2]:+.0f}mm | Grip Width: {grasp_cand.jaw_opening_mm:.0f}mm"
@@ -1966,7 +1361,7 @@ def run_tiered_pipeline(args):
             print(f"   Pan:   {last_joint_sol['shoulder_pan.pos']:+6.1f} deg")
             print(f"   Lift:  {last_joint_sol['shoulder_lift.pos']:+6.1f} deg")
             print(f"   Elbow: {last_joint_sol['elbow_flex.pos']:+6.1f} deg")
-            print(f"   Wrist: {last_joint_sol['wrist_flex.pos']:+6.1f} deg (Pitch: {last_joint_sol['pitch_deg']:+5.1f} deg)")
+            print(f"   Wrist: {last_joint_sol['wrist_flex.pos']:+6.1f} deg (Pitch: {last_joint_sol.get('pitch_deg', 0.0):+5.1f} deg)")
             print(f"   Roll:  {last_joint_sol['wrist_roll.pos']:+6.1f} deg")
             print(f"   Claw:  {last_joint_sol['gripper.pos']:+6.1f} (Grip Target)")
         if last_base_xyz:

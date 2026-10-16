@@ -437,7 +437,7 @@ def _load_reference_poses():
     for p in search_paths:
         if os.path.exists(p):
             try:
-                with open(p, "r") as f:
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
                     data = yaml.safe_load(f)
                 if not data:
                     continue
@@ -446,14 +446,14 @@ def _load_reference_poses():
                 if scan:
                     for k, v in scan.items():
                         _BASE[k] = round(float(v), 2)
-                    print(f"📖 Loaded scan_base posture from: {p}")
+                    print(f"Loaded scan_base posture from: {p}")
                 if stow:
                     for k, v in stow.items():
                         _STOW_BASE[k] = round(float(v), 2)
-                    print(f"📖 Loaded stow_base posture from: {p}")
+                    print(f"Loaded stow_base posture from: {p}")
                 return p
             except Exception as e:
-                print(f"⚠️ Failed reading {p}: {e}")
+                print(f"[!] Failed reading {p}: {e}")
     return None
 
 # Load at import time if file exists
@@ -1435,7 +1435,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 cand = round(preferred_pitch + offset, 1)
                 if -90.0 <= cand <= -70.0 and cand not in pitch_candidates:
                     pitch_candidates.append(cand)
-            for down_pitch in [-65.0, -60.0, -55.0, -50.0, -45.0, -40.0, -35.0]:
+            for down_pitch in [-65.0, -60.0, -55.0, -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -20.0, -15.0, -10.0, -5.0, 0.0]:
                 if down_pitch not in pitch_candidates:
                     pitch_candidates.append(down_pitch)
         else:
@@ -2443,28 +2443,47 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     while rel_table_deg < -90.0:
         rel_table_deg += 180.0
 
-    # Classification:
-    # A bottle is standing upright if its 2D aspect ratio is roughly square-or-taller (accounting
-    # for perspective foreshortening from 45° downward camera pitch: cos(45°) ≈ 0.707)
-    # and its 2D tilt is not heavily sideways.
-    is_clearly_flat = (w_box >= int(h_box * 1.35) and abs(tilt_deg) >= 45.0) or (abs(tilt_deg) >= 60.0)
-    is_upright = not is_clearly_flat and (
-        (abs(tilt_deg) <= 35.0 and h_box >= int(w_box * 0.75)) or
-        (elev_deg >= 35.0) or
-        (v_span > h_span)
-    )
-    if not is_clearly_flat and not is_upright:
-        # Default to upright for upright target objects (bottles, cups, cans) unless clearly flat
+    # ── 3D Geometric Classification ──────────────────────────────────────────
+    # Prioritize 3D physical cloud metrics from RealSense D405 over 2D foreshortened boxes:
+    # - Upright bottle: principal cylinder axis V points steeply upward (elev_deg >= 55°),
+    #   or vertical height v_span is notably larger than horizontal width (v_span >= h_span * 1.1 and elev >= 35°).
+    # - Tipped-over / Lying flat bottle: principal axis V lies along horizontal table (elev_deg <= 28°),
+    #   and horizontal length h_span is clearly greater than vertical diameter v_span (h_span >= v_span + 15mm or h_span >= v_span * 1.25).
+    # - 3D Diagonal: cylinder is propped up at an intermediate angle (28° < elev_deg < 55°).
+    if elev_deg <= 28.0 and (h_span >= v_span + 15.0 or h_span >= v_span * 1.25):
+        is_lying_flat = True
+        is_upright = False
+        is_3d_diagonal = False
+    elif elev_deg >= 55.0 or (v_span >= h_span * 1.1 and elev_deg >= 35.0):
         is_upright = True
-    is_lying_flat = not is_upright
-    is_3d_diagonal = False
+        is_lying_flat = False
+        is_3d_diagonal = False
+    elif 28.0 < elev_deg < 55.0:
+        is_3d_diagonal = True
+        is_upright = False
+        is_lying_flat = False
+    else:
+        # Fallback to 2D aspect ratio and tilt if 3D span is ambiguous
+        is_clearly_flat_2d = (w_box >= int(h_box * 1.25) and abs(tilt_deg) >= 40.0) or (abs(tilt_deg) >= 55.0)
+        if is_clearly_flat_2d:
+            is_lying_flat = True
+            is_upright = False
+            is_3d_diagonal = False
+        else:
+            is_upright = True
+            is_lying_flat = False
+            is_3d_diagonal = False
 
     # Approach pitch calculation:
     # - Upright bottle: 0.0° (strictly parallel to ground)
-    # - Lying flat bottle: -85.0° (perpendicular to ground, grabbing from above)
+    # - Lying flat bottle: -30.0° (downward angled approach reachable at tabletop distance 300-380mm)
+    # - 3D diagonal bottle: -(90° - elev_deg)
     if is_lying_flat:
-        target_pitch = -85.0
+        target_pitch = -30.0
         pose_desc = f"LYING FLAT (tabletop angle={rel_table_deg:+.1f}°)"
+    elif is_3d_diagonal:
+        target_pitch = -float(np.clip(90.0 - elev_deg, 15.0, 45.0))
+        pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, yaw={rel_table_deg:+.1f}°)"
     else:
         target_pitch = 0.0
         pose_desc = "STANDING UPRIGHT"
@@ -2475,7 +2494,7 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         target_roll = base_roll
         delta_roll = 0.0
         J_vec = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0], dtype=np.float64)
-    elif abs(rel_table_deg) < 15.0:
+    elif abs(rel_table_deg) < 25.0:
         # Radial flat (pointing towards or away from arm): jaws horizontal across bottle
         target_roll = base_roll
         delta_roll = 0.0
@@ -2483,6 +2502,20 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     else:
         target_roll, J_vec, err = solve_optimal_roll(pan_deg, target_pitch, V, base_roll)
         delta_roll = target_roll - base_roll
+        # For objects lying flat on a tabletop, clamp roll tilt to +/-30°
+        # so the lower finger never strikes or digs into the tabletop surface!
+        if is_lying_flat and abs(delta_roll) > 30.0:
+            delta_roll = float(np.clip(delta_roll, -30.0, 30.0))
+            target_roll = base_roll + delta_roll
+            X_w, Y_w, Z_w = compute_wrist_basis(pan_deg, target_pitch)
+            d_rad = math.radians(delta_roll)
+            J_vec = math.cos(d_rad) * Z_w - math.sin(d_rad) * Y_w
+            norm_J = np.linalg.norm(J_vec)
+            if norm_J > 1e-6:
+                J_vec /= norm_J
+            left_ref = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0])
+            if float(np.dot(J_vec, left_ref)) < 0.0:
+                J_vec = -J_vec
 
     # Slimmer neck identification and 3D grasp location
     target_px, target_py = (cx, cy)
@@ -2499,12 +2532,14 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         neck_z = max(mid_z_b + neck_offset, table_floor_z + 20.0)
         midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
     else:
-        # Lying flat bottle: shift 25% along V towards the slimmer neck
+        # Lying flat bottle: shift 20% along V towards the slimmer neck/cap
         u_neck = float(np.dot(closest_sample[3] - midpoint_b, V))
         s_neck_sign = 1.0 if u_neck >= 0 else -1.0
-        shift_dist = 0.25 * max(h_span, 120.0)
+        shift_dist = 0.20 * max(h_span, 120.0)
         target_3d = midpoint_b + s_neck_sign * shift_dist * V
-        safe_z_b = max(table_floor_z + 15.0, float(target_3d[2]))
+        # Center directly on cylinder body midline with tabletop clearance
+        est_table_z = float(target_3d[2]) - max(15.0, v_span / 2.0)
+        safe_z_b = max(est_table_z + 8.0, float(target_3d[2]))
         midpoint_base = (float(target_3d[0]), float(target_3d[1]), safe_z_b)
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
@@ -3745,19 +3780,20 @@ def main():
                     arm_y = mid_y
                     table_floor_z = TABLE_FLOOR_Z_MM
 
-                    if orient_3d["is_lying_flat"]:
-                        # Lying flat: descend towards cylinder midline from above
-                        arm_z = max(table_floor_z + 15.0, mid_z - pen_mm)
-                    elif orient_3d.get("is_3d_diagonal"):
-                        # 3D diagonal: approach along pitch angle towards cylinder center
+                    if orient_3d["is_lying_flat"] or orient_3d.get("is_3d_diagonal"):
+                        # Lying flat or 3D diagonal: penetrate along approach vector towards cylinder center
                         pitch_rad = math.radians(target_pitch)
                         pan_rad = math.atan2(arm_y, arm_x)
                         ax = math.cos(pitch_rad) * math.cos(pan_rad)
                         ay = math.cos(pitch_rad) * math.sin(pan_rad)
                         az = math.sin(pitch_rad)
-                        arm_x += pen_mm * ax
-                        arm_y += pen_mm * ay
-                        arm_z = max(table_floor_z + 15.0, mid_z + pen_mm * az)
+                        arm_x = mid_x + pen_mm * ax
+                        arm_y = mid_y + pen_mm * ay
+                        arm_z = mid_z + pen_mm * az
+                        # Dynamic tabletop clearance: ensure claw stays above table surface
+                        v_dia = orient_3d.get("v_span_mm", 44.0)
+                        est_table_z = mid_z - max(15.0, v_dia / 2.0)
+                        arm_z = max(est_table_z + 8.0, arm_z)
                     else:
                         # Upright: target via depth_to_arm_target with penetration
                         target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
@@ -3777,19 +3813,26 @@ def main():
                     arm_x, arm_y, arm_z = target
 
                 # ── Apply true 3D lateral claw offset along jaw opening vector J ──
-                # Shifts claw to the LEFT (away from static pincer) so jaws center cleanly over object
+                # Shifts claw to the LEFT (away from static pincer) so jaws center cleanly over object.
+                # Strictly applied in the horizontal (X, Y) plane so lateral shift NEVER corrupts grasp elevation Z!
                 lat_offset = getattr(args, "lateral_offset", GRAB_LATERAL_OFFSET_MM)
                 if abs(lat_offset) > 0.01:
                     J = orient_3d.get("J_vec")
                     if J is not None:
-                        arm_x += lat_offset * float(J[0])
-                        arm_y += lat_offset * float(J[1])
-                        arm_z += lat_offset * float(J[2])
+                        norm_j_xy = math.hypot(float(J[0]), float(J[1]))
+                        if norm_j_xy > 1e-4:
+                            jx_norm = float(J[0]) / norm_j_xy
+                            jy_norm = float(J[1]) / norm_j_xy
+                        else:
+                            pan_t = math.atan2(arm_y, arm_x)
+                            jx_norm, jy_norm = -math.sin(pan_t), math.cos(pan_t)
+                        arm_x += lat_offset * jx_norm
+                        arm_y += lat_offset * jy_norm
                     else:
                         pan_t = math.atan2(arm_y, arm_x)
                         arm_x += -lat_offset * math.sin(pan_t)
                         arm_y +=  lat_offset * math.cos(pan_t)
-                    print(f"   📐 Applied lateral grasp offset: {lat_offset:+.1f}mm (LEFT claw clearance shift)")
+                    print(f"   📐 Applied lateral grasp offset: {lat_offset:+.1f}mm (LEFT claw clearance shift in XY plane)")
 
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface

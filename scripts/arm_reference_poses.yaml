@@ -1,15 +1,15 @@
 # ==============================================================================
-# ⚠️ CRITICAL HARDWARE CONFIGURATION — DO NOT TOUCH / DO NOT EDIT CASUALLY ⚠️
+# [CRITICAL HARDWARE CONFIGURATION - DO NOT TOUCH / DO NOT EDIT CASUALLY]
 # ==============================================================================
 # These reference postures match the ACTIVE physical motor calibration (jetson_arm.json):
-#   - shoulder_lift: homing_offset -1498 (horizontal scan angle ≈ -104.92°)
-#   - wrist_roll:    homing_offset -1120 (neutral horizontal angle ≈ +29.27°)
+#   - shoulder_lift: homing_offset -1498 (horizontal scan angle approx -104.92 deg)
+#   - wrist_roll:    homing_offset -1120 (neutral horizontal angle approx +29.27 deg)
 #
-# 🛑 WHY YOU MUST NOT CHANGE THESE BLINDLY:
-# Setting shoulder_lift to -52° or -57° will force the arm to violently lift +52°
-# into the air on startup and twist its wrist sideways by -65°!
+# [WHY YOU MUST NOT CHANGE THESE BLINDLY]:
+# Setting shoulder_lift to -52 deg or -57 deg will force the arm to violently lift +52 deg
+# into the air on startup and twist its wrist sideways by -65 deg!
 #
-# 🛠️ HOW TO SAFELY MODIFY IN THE FUTURE:
+# [HOW TO SAFELY MODIFY IN THE FUTURE]:
 # 1. NEVER manually guess or type arbitrary angles into this file.
 # 2. Run: `python3 live_joint_angles.py` on the Jetson (cuts torque immediately).
 # 3. Position the arm gently by hand in your exact desired tabletop scan posture.

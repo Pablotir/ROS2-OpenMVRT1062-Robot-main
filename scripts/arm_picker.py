@@ -283,10 +283,17 @@ GRASP_PENETRATION_MM = 20.0
 PREFERRED_GRAB_PITCH_DEG = 0.0
 
 
-# Lateral gripper offset (mm) along jaw opening axis.
+# ==============================================================================
+# 🦀 GRASP LATERAL OFFSET (LEFT/RIGHT CLEARANCE) — DO NOT REMOVE
 # Positive (+ve) = shifts claw to the LEFT (away from the static pincer)
-# Increased by 10mm (from 29.0mm to 39.0mm) to add 1cm offset to the left
-GRAB_LATERAL_OFFSET_MM = 39.0
+# Negative (-ve) = shifts claw to the RIGHT
+#
+# 🛠️ HOW TO MODIFY IF ARM POKES OBJECT:
+# - If the STATIC (right) claw pokes the object on approach: INCREASE this value (+5mm to +10mm).
+# - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
+# - Current value: 49.0mm (39.0mm + 10.0mm re-added 1cm left offset to eliminate pokes)
+# ==============================================================================
+GRAB_LATERAL_OFFSET_MM = 49.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -376,7 +383,22 @@ ALIGN_MAX_PAN_DEG  = 5.0   # max pan speed (°/frame)
 ALIGN_MAX_WRIST_DEG = 5.0  # max wrist tilt speed (°/frame)
 ALIGN_MAX_LIFT_DEG = 2.5   # max shoulder lift speed (°/frame)
 
-# ── Arm Positions ─────────────────────────────────────────────────────────────
+# ==============================================================================
+# ⚠️ CRITICAL REFERENCE POSTURES — DO NOT TOUCH / DO NOT EDIT CASUALLY ⚠️
+# ==============================================================================
+# These match the active physical motor calibration (jetson_arm.json):
+#   - shoulder_lift: homing_offset -1498 (horizontal scan angle ≈ -104.92°)
+#   - wrist_roll:    homing_offset -1120 (neutral horizontal angle ≈ +29.27°)
+#
+# 🛑 DO NOT set shoulder_lift to -52° or -57°: this will cause the arm to violently
+# lift +52° into the air on startup and twist its wrist sideways by -65°!
+#
+# 🛠️ HOW TO SAFELY MODIFY IN THE FUTURE:
+# 1. Run `python3 live_joint_angles.py` on the Jetson (cuts torque immediately).
+# 2. Position the arm gently by hand into your exact desired tabletop scan posture.
+# 3. Read the live angles printed on screen for shoulder_lift, wrist_roll, etc.
+# 4. Only update these dictionaries (and arm_reference_poses.yaml) with live measured angles!
+# ==============================================================================
 # Default fallback scan posture (taught baseline: level wrist, table-facing camera)
 _BASE = {
     "shoulder_pan.pos":   -11.60,
@@ -3648,6 +3670,7 @@ def main():
                         pan_t = math.atan2(arm_y, arm_x)
                         arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
                         arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
+                    print(f"   📐 Applied lateral grasp offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw clearance shift)")
 
                 # ── Tabletop Safeguard ───────────────
                 # Prevents claw from sinking into the table/floor surface

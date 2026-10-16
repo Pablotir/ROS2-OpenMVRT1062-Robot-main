@@ -289,9 +289,9 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 GRAB_LATERAL_OFFSET_MM = 39.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
-# In previous run, +6.8° was slightly loose. -5.0° closes the claw firmly on the bottle.
-GRIPPER_CLOSED_POS_DEG = -5.0   # °: Target angle when closing the claw (was 0.7°; range_min now allows down to -39°)
-GRIPPER_OPEN_POS_DEG   = 99.77  # °: Fully open jaws
+# Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
+GRIPPER_CLOSED_POS_DEG = 4.14   # °: Target angle when closing the claw (1585 ticks)
+GRIPPER_OPEN_POS_DEG   = 91.58  # °: Fully open jaws (2748 ticks)
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
@@ -384,7 +384,7 @@ _BASE = {
     "elbow_flex.pos":     94.95,
     "wrist_flex.pos":     26.15,
     "wrist_roll.pos":    -36.53,
-    "gripper.pos":        99.77,
+    "gripper.pos":        91.58,
 }
 # Default fallback stow posture (compact folded safe baseline)
 _STOW_BASE = {
@@ -393,7 +393,7 @@ _STOW_BASE = {
     "elbow_flex.pos":     94.95,
     "wrist_flex.pos":     76.84,
     "wrist_roll.pos":    -36.53,
-    "gripper.pos":        99.77,
+    "gripper.pos":        91.58,
 }
 
 
@@ -3732,7 +3732,7 @@ def main():
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
                 print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
-                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
+                grab_pos["gripper.pos"] = START_POS.get("gripper.pos", GRIPPER_OPEN_POS_DEG)
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)

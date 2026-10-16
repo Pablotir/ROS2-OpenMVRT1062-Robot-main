@@ -289,8 +289,8 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 GRAB_LATERAL_OFFSET_MM = 39.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
-# Negative value allows the claw to close firmly past 0° to clamp objects securely.
-GRIPPER_CLOSED_POS_DEG = -15.0  # °: Target angle when closing the claw (was 0.7°; negative allows firm squeeze)
+# In previous run, +6.8° was slightly loose. -5.0° closes the claw firmly on the bottle.
+GRIPPER_CLOSED_POS_DEG = -5.0   # °: Target angle when closing the claw (was 0.7°; range_min now allows down to -39°)
 GRIPPER_OPEN_POS_DEG   = 99.77  # °: Fully open jaws
 
 
@@ -3738,68 +3738,14 @@ def main():
                 time.sleep(0.4)
 
     
-                print("✊ GRIPPING (Adaptive Maximum Speed)...")
+                print(f"✊ GRIPPING (closing jaws firmly to {GRIPPER_CLOSED_POS_DEG:.1f}°)...")
                 grab_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
-                robot.send_action(grab_pos)
-    
-                start_t  = time.time()
-                braked   = False
-                current_g = GRIPPER_CLOSED_POS_DEG
-                while time.time() - start_t < 1.5:
-                    load = 0
-                    try:
-                        load = robot.bus.read("Present_Load", "gripper")
-                        if isinstance(load, (list, tuple)):
-                            load = load[0]
-                    except Exception:
-                        try:
-                            for arm_obj in getattr(robot, "follower_arms", {}).values():
-                                if "gripper" in arm_obj.motor_names:
-                                    load = arm_obj.bus.read("Present_Load", "gripper")
-                                    if isinstance(load, (list, tuple)):
-                                        load = load[0]
-                        except Exception:
-                            pass
+                smooth_move(robot, grab_pos, step_size=3.0, step_delay=0.02, hold_joints=[])
+                time.sleep(0.6)
 
-                    # Mask direction bit 10 (0x400 = 1024) to get true load magnitude (0-1023)
-                    load_mag = abs(int(load)) & 0x03FF
-                    if (time.time() - start_t > 0.15) and load_mag > 200:
-                        try:
-                            current_g = get_pos(robot).get("gripper.pos", GRIPPER_CLOSED_POS_DEG)
-                            # Squeeze extra 5° to lock firm grip without stalling servo
-                            current_g = max(current_g - 5.0, GRIPPER_CLOSED_POS_DEG)
-                        except Exception:
-                            current_g = GRIPPER_CLOSED_POS_DEG
-                        grab_pos["gripper.pos"] = current_g
-                        robot.send_action(grab_pos)
-                        print(f"   🛑 Resistance felt (Load={load_mag}/1023)! Firm grip locked at {current_g:.1f}°")
-                        braked = True
-                        break
-    
-                    try:
-                        if get_pos(robot).get("gripper.pos", 60.0) <= (GRIPPER_CLOSED_POS_DEG + 1.5):
-                            current_g = GRIPPER_CLOSED_POS_DEG
-                            braked    = True
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.005)
-    
-                if not braked:
-                    print(f"   ⚠️  Grip timeout — locking at closed position ({GRIPPER_CLOSED_POS_DEG:.1f}°)")
-                    try:
-                        current_g = get_pos(robot).get("gripper.pos", GRIPPER_CLOSED_POS_DEG)
-                        current_g = max(current_g - 5.0, GRIPPER_CLOSED_POS_DEG)
-                    except Exception:
-                        current_g = GRIPPER_CLOSED_POS_DEG
-                    grab_pos["gripper.pos"] = current_g
-                    robot.send_action(grab_pos)
-    
-                time.sleep(0.5)
-    
                 print("🏠 RETURNING...")
                 drop_pos = dict(START_POS)
-                drop_pos["gripper.pos"] = current_g
+                drop_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
                 smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
                             hold_joints=["gripper.pos"])
                 time.sleep(0.8)

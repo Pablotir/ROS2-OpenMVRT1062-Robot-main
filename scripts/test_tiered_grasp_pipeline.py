@@ -384,21 +384,21 @@ ALIGN_MAX_LIFT_DEG = 2.5   # max shoulder lift speed (°/frame)
 # Default fallback scan posture (freshly taught; also loaded from arm_reference_poses.yaml if present)
 # Default fallback scan posture (taught baseline: level wrist, table-facing camera)
 _BASE = {
-    "shoulder_pan.pos":   -4.35,
-    "shoulder_lift.pos": -52.26,
-    "elbow_flex.pos":     94.95,
-    "wrist_flex.pos":     26.15,
-    "wrist_roll.pos":    -36.53,
-    "gripper.pos":        91.58,
+    "shoulder_pan.pos":   -11.60,
+    "shoulder_lift.pos": -104.92,
+    "elbow_flex.pos":      96.09,
+    "wrist_flex.pos":      32.53,
+    "wrist_roll.pos":      29.27,
+    "gripper.pos":         91.58,
 }
 # Default fallback stow posture (compact folded safe baseline)
 _STOW_BASE = {
-    "shoulder_pan.pos":   -4.35,
-    "shoulder_lift.pos": -51.00,
-    "elbow_flex.pos":     94.95,
-    "wrist_flex.pos":     76.84,
-    "wrist_roll.pos":    -36.53,
-    "gripper.pos":        91.58,
+    "shoulder_pan.pos":   -11.60,
+    "shoulder_lift.pos": -100.00,
+    "elbow_flex.pos":      96.09,
+    "wrist_flex.pos":      76.84,
+    "wrist_roll.pos":      29.27,
+    "gripper.pos":         91.58,
 }
 
 
@@ -1367,7 +1367,7 @@ def teach_postures(robot=None):
 def solve_ik(x_mm: float, y_mm: float, z_mm: float,
              end_pitch_deg: float | None = None,
              current_joints: dict | None = None,
-             wrist_roll_deg: float = -68.62) -> dict | None:
+             wrist_roll_deg: float = 29.27) -> dict | None:
     """
     Closed-form analytical IK for SO-ARM101.
     Target (x_mm, y_mm, z_mm) is in the ARM BASE frame.
@@ -2019,7 +2019,7 @@ def size_up_object(frame: np.ndarray | None,
         crop_mask = cv2.morphologyEx(cv2.bitwise_or(edges, thresh), cv2.MORPH_CLOSE, kernel)
 
     # Baseline defaults
-    base_roll = START_POS.get("wrist_roll.pos", -68.62) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", -68.62)
+    base_roll = START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27)
     tilt_deg = 0.0
     recommended_roll = base_roll
     recommended_pitch = PREFERRED_GRAB_PITCH_DEG
@@ -2224,12 +2224,12 @@ def compute_wrist_basis(pan_deg: float, pitch_deg: float):
     return X_wrist, Y_wrist, Z_wrist
 
 
-def solve_optimal_roll(pan_deg: float, pitch_deg: float, V_obj: np.ndarray, base_roll_deg: float = -68.62) -> tuple[float, np.ndarray, float]:
+def solve_optimal_roll(pan_deg: float, pitch_deg: float, V_obj: np.ndarray, base_roll_deg: float = 29.27) -> tuple[float, np.ndarray, float]:
     """
     Analytically solves the closed-form wrist_roll servo angle such that the
     gripper jaw opening axis J is strictly perpendicular to the 3D object axis V (J . V = 0).
     Also ensures J points toward the LEFT (away from the static pincer).
-    Calibrated to physical robot hardware where base_roll_deg (-68.62°) is horizontally level.
+    Calibrated to physical robot hardware where base_roll_deg (+29.27°) is horizontally level.
     """
     X_w, Y_w, Z_w = compute_wrist_basis(pan_deg, pitch_deg)
     norm = np.linalg.norm(V_obj)
@@ -2300,7 +2300,7 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     cy = (y1 + y2) // 2
 
     # Baseline defaults
-    base_roll = START_POS.get("wrist_roll.pos", -68.62) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", -68.62)
+    base_roll = START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27)
     default_pitch = sizing.get("recommended_pitch_deg", PREFERRED_GRAB_PITCH_DEG) if sizing else PREFERRED_GRAB_PITCH_DEG
     default_roll  = sizing.get("recommended_roll_deg", base_roll) if sizing else base_roll
     default_delta = sizing.get("delta_roll_deg", 0.0) if sizing else 0.0
@@ -3698,7 +3698,7 @@ def main():
             final_target = None
             current_j = get_pos(robot)
             target_pitch = PREFERRED_GRAB_PITCH_DEG  # Preferred parallel-to-ground pitch (0.0° = horizontal)
-            target_roll = START_POS.get("wrist_roll.pos", -68.62)
+            target_roll = START_POS.get("wrist_roll.pos", 29.27)
             delta_roll = 0.0
 
             if sizing is not None:

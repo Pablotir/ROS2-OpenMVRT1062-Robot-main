@@ -29,7 +29,7 @@ CALIBRATED_BASELINE = {
     "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
     "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
     "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 765,  "range_max": 3495},
-    "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626},
+    "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 1500, "range_max": 3626},
 }
 
 def main():

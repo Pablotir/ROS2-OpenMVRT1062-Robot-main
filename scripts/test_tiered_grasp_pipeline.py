@@ -292,6 +292,11 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # Increased by 10mm (from 29.0mm to 39.0mm) to add 1cm offset to the left
 GRAB_LATERAL_OFFSET_MM = 39.0
 
+# ── Gripper Jaw Angles ────────────────────────────────────────────────────────
+# Negative value allows the claw to close firmly past 0° to clamp objects securely.
+GRIPPER_CLOSED_POS_DEG = -15.0  # °: Target angle when closing the claw (was 0.7°; negative allows firm squeeze)
+GRIPPER_OPEN_POS_DEG   = 99.77  # °: Fully open jaws
+
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:
     """
@@ -1129,7 +1134,7 @@ def connect_robot():
         "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
         "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
         "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 765,  "range_max": 3495},
-        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 2024, "range_max": 3626}
+        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 1500, "range_max": 3626}
     }
 
     if _calib_path is not None:
@@ -3859,54 +3864,59 @@ def main():
 
     
                 print("✊ GRIPPING (Adaptive Maximum Speed)...")
-                grab_pos["gripper.pos"] = 0.7
+                grab_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
                 robot.send_action(grab_pos)
     
                 start_t  = time.time()
                 braked   = False
-                current_g = 20.0
+                current_g = GRIPPER_CLOSED_POS_DEG
                 while time.time() - start_t < 1.5:
                     load = 0
                     try:
-                        load = robot.bus.read("Present_Load", ["gripper"])[0]
+                        load = robot.bus.read("Present_Load", "gripper")
+                        if isinstance(load, (list, tuple)):
+                            load = load[0]
                     except Exception:
                         try:
                             for arm_obj in getattr(robot, "follower_arms", {}).values():
                                 if "gripper" in arm_obj.motor_names:
-                                    load = arm_obj.bus.read("Present_Load", ["gripper"])[0]
+                                    load = arm_obj.bus.read("Present_Load", "gripper")
+                                    if isinstance(load, (list, tuple)):
+                                        load = load[0]
                         except Exception:
                             pass
 
                     # Mask direction bit 10 (0x400 = 1024) to get true load magnitude (0-1023)
                     load_mag = abs(int(load)) & 0x03FF
-                    if (time.time() - start_t > 0.15) and load_mag > 150:
+                    if (time.time() - start_t > 0.15) and load_mag > 200:
                         try:
-                            current_g = get_pos(robot).get("gripper.pos", 20.0)
-                            current_g = max(current_g - 15.0, 0.7)
+                            current_g = get_pos(robot).get("gripper.pos", GRIPPER_CLOSED_POS_DEG)
+                            # Squeeze extra 5° to lock firm grip without stalling servo
+                            current_g = max(current_g - 5.0, GRIPPER_CLOSED_POS_DEG)
                         except Exception:
-                            current_g = 20.0
+                            current_g = GRIPPER_CLOSED_POS_DEG
                         grab_pos["gripper.pos"] = current_g
                         robot.send_action(grab_pos)
-                        print(f"   🛑 Resistance felt (Load={load_mag}/1023)! Braked at {current_g:.1f}°")
+                        print(f"   🛑 Resistance felt (Load={load_mag}/1023)! Firm grip locked at {current_g:.1f}°")
                         braked = True
                         break
     
                     try:
-                        if get_pos(robot).get("gripper.pos", 60.0) <= 2.0:
-                            current_g = 0.7
+                        if get_pos(robot).get("gripper.pos", 60.0) <= (GRIPPER_CLOSED_POS_DEG + 1.5):
+                            current_g = GRIPPER_CLOSED_POS_DEG
                             braked    = True
                             break
                     except Exception:
                         pass
-                    time.sleep(0.002)
+                    time.sleep(0.005)
     
                 if not braked:
-                    print("   ⚠️  Grip timeout — locking at current position")
+                    print(f"   ⚠️  Grip timeout — locking at closed position ({GRIPPER_CLOSED_POS_DEG:.1f}°)")
                     try:
-                        current_g = get_pos(robot).get("gripper.pos", 20.0)
-                        current_g = max(current_g - 15.0, 0.7)
+                        current_g = get_pos(robot).get("gripper.pos", GRIPPER_CLOSED_POS_DEG)
+                        current_g = max(current_g - 5.0, GRIPPER_CLOSED_POS_DEG)
                     except Exception:
-                        current_g = 20.0
+                        current_g = GRIPPER_CLOSED_POS_DEG
                     grab_pos["gripper.pos"] = current_g
                     robot.send_action(grab_pos)
     
@@ -3969,22 +3979,6 @@ def main():
             _destroy_windows()
         except Exception:
             pass
-        if 'model' in locals():
-            try:
-                del model
-            except Exception:
-                pass
-        if torch is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
-        try:
-            import gc
-            gc.collect()
-        except Exception:
-            pass
 
         # ── Latency Benchmark Profile Summary ──────────────────────────────────
         print("\n" + "=" * 70)
@@ -4014,6 +4008,15 @@ def main():
             budget_status = "PASS (<300ms)" if e2e < 300.0 else "EXCEEDS BUDGET (>300ms)"
             print(f" * End-to-End Latency:      {e2e:.1f} ms -> {budget_status}")
         print("=" * 70 + "\n")
+
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # Immediate clean exit prevents C++ shared library static destructor collision
+        # between librealsense2 and PyTorch CUDA runtime on Jetson glibc
+        os._exit(0)
 
 
 

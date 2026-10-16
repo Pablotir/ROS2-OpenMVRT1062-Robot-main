@@ -294,7 +294,7 @@ GRAB_LATERAL_OFFSET_MM = 39.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
-GRIPPER_CLOSED_POS_DEG = 4.14   # °: Target angle when closing the claw (1585 ticks)
+GRIPPER_CLOSED_POS_DEG = 4.14   # °: Target angle when closing the claw (1585 ticks, firm clamp on bottle)
 GRIPPER_OPEN_POS_DEG   = 91.58  # °: Fully open jaws (2748 ticks)
 
 
@@ -1134,7 +1134,7 @@ def connect_robot():
         "elbow_flex":    {"id": 3, "drive_mode": 0, "homing_offset": 1619,  "range_min": 882,  "range_max": 3138},
         "wrist_flex":    {"id": 4, "drive_mode": 0, "homing_offset": -1885, "range_min": 887,  "range_max": 3243},
         "wrist_roll":    {"id": 5, "drive_mode": 0, "homing_offset": -1120, "range_min": 765,  "range_max": 3495},
-        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 1500, "range_max": 3626}
+        "gripper":       {"id": 6, "drive_mode": 0, "homing_offset": 1947,  "range_min": 1530, "range_max": 2860}
     }
 
     if _calib_path is not None:
@@ -3859,7 +3859,7 @@ def main():
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
                 print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
-                grab_pos["gripper.pos"] = START_POS.get("gripper.pos", GRIPPER_OPEN_POS_DEG)
+                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)

@@ -38,7 +38,7 @@
         "id": 6,
         "drive_mode": 0,
         "homing_offset": 1947,
-        "range_min": 1500,
-        "range_max": 3626
+        "range_min": 1530,
+        "range_max": 2860
     }
 }

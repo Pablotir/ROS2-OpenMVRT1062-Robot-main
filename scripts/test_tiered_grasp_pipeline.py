@@ -295,10 +295,10 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # 🛠️ HOW TO MODIFY IF ARM POKES OBJECT:
 # - If the STATIC (right) claw pokes the object on approach: INCREASE this value (+5mm to +10mm).
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
-# - Current value: 49.0mm (39.0mm + 10.0mm re-added 1cm left offset to eliminate pokes)
+# - Current value: 59.0mm (re-added 1cm left offset to eliminate static claw pokes)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 49.0
+GRAB_LATERAL_OFFSET_MM = 59.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -2528,12 +2528,15 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         # Enforce safe grasp height for top-down grasp:
         # Bottle top is at table_floor_z + cyl_dia.
         # Fingertips are 45mm below the gripper servo face.
-        # Setting fingertips to (z_bottle_top - 35mm) places the servo face
-        # at (z_bottle_top + 10mm) -> a 10mm clear air cushion above the bottle top,
-        # while fingertips firmly grip 35mm of the bottle's sides!
-        cyl_dia = max(45.0, min(80.0, v_span if v_span > 10.0 else 72.0))
+        # Setting fingertips to (z_bottle_top - 30mm) places the servo face
+        # at (z_bottle_top + 15mm) -> a 15mm clear air cushion above the bottle top,
+        # while fingertips firmly grip 30mm of the bottle's sides and stay >= 25mm above tabletop!
+        body_w = 70.0
+        if sizing is not None:
+            body_w = sizing.get("grasp_width_mm", sizing.get("body_width_mm", 70.0))
+        cyl_dia = float(np.clip(body_w, 45.0, 85.0))
         z_bottle_top = table_floor_z + cyl_dia
-        safe_z_b = max(table_floor_z + 20.0, z_bottle_top - 35.0)
+        safe_z_b = max(table_floor_z + 25.0, z_bottle_top - 30.0)
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
@@ -3836,7 +3839,7 @@ def main():
                 table_floor_z = getattr(args, "table_z", TABLE_FLOOR_Z_MM)
                 droll_actual = target_roll - (START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27))
                 jaw_droop_mm = 45.0 * abs(math.sin(math.radians(droll_actual))) * math.cos(math.radians(target_pitch))
-                min_safe_z = table_floor_z + jaw_droop_mm + 8.0
+                min_safe_z = table_floor_z + jaw_droop_mm + 13.0
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.1f}mm (< {min_safe_z:+.1f}mm with {jaw_droop_mm:.1f}mm jaw droop) → elevating to {min_safe_z:+.1f}mm")
                     arm_z = min_safe_z

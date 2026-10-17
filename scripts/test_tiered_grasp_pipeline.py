@@ -2457,12 +2457,15 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     # Approach pitch calculation:
     # - Upright bottle: 0.0° (strictly parallel to ground)
     # - Lying flat bottle: -20.0° (shallow, relaxed downward approach angle that reaches across tabletop without diving)
-    # - 3D diagonal bottle: -(90° - elev_deg), clamped strictly to [-30°, -15°]
+    # Approach pitch calculation:
+    # - Upright bottle: 0.0° (strictly parallel to ground, horizontal level approach)
+    # - Lying flat bottle: -85.0° (steep top-down grasp from directly above, claw perpendicular to tabletop)
+    # - 3D diagonal bottle: -(90° - elev_deg), clamped strictly to [-85.0°, -45.0°]
     if is_lying_flat:
-        target_pitch = -20.0
-        pose_desc = f"LYING FLAT (tabletop tilt={tilt_deg:+.1f}°, yaw={rel_table_deg:+.1f}°)"
+        target_pitch = -85.0
+        pose_desc = f"LYING FLAT (top-down grasp, tabletop tilt={tilt_deg:+.1f}°, yaw={rel_table_deg:+.1f}°)"
     elif is_3d_diagonal:
-        target_pitch = -float(np.clip(90.0 - elev_deg, 15.0, 30.0))
+        target_pitch = -float(np.clip(90.0 - elev_deg, 45.0, 85.0))
         pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, yaw={rel_table_deg:+.1f}°)"
     else:
         target_pitch = 0.0
@@ -2476,10 +2479,10 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         J_vec = np.array([-math.sin(pan_rad), math.cos(pan_rad), 0.0], dtype=np.float64)
     else:
         # For objects lying flat or diagonal on the tabletop:
-        # 2D contour tilt (tilt_deg) directly measures the object's body angle relative to camera vertical.
+        # In a top-down grasp, wrist_roll rotates the jaws in the horizontal tabletop plane.
         # Rotating wrist_roll by -tilt_deg aligns the gripper jaws perpendicular to the object.
-        # Clamp delta_roll to +/-40.0° so jaws match diagonal objects while preserving safe table clearance.
-        delta_roll = float(np.clip(-tilt_deg, -40.0, 40.0))
+        # Clamped to +/-65.0° for full rotational alignment with diagonal objects.
+        delta_roll = float(np.clip(-tilt_deg, -65.0, 65.0))
         target_roll = base_roll + delta_roll
 
         # Compute true 3D jaw vector J in the robot base frame
@@ -2522,9 +2525,15 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         shift_dist = 0.20 * max(h_span, 120.0)
         target_xy = midpoint_b[:2] + s_neck_sign * shift_dist * V_horiz[:2]
 
-        # Enforce safe grasp centerline height above tabletop (cylinder radius + table level)
-        cyl_radius = max(20.0, min(45.0, v_span / 2.0))
-        safe_z_b = max(table_floor_z + cyl_radius, float(midpoint_b[2]))
+        # Enforce safe grasp height for top-down grasp:
+        # Bottle top is at table_floor_z + cyl_dia.
+        # Fingertips are 45mm below the gripper servo face.
+        # Setting fingertips to (z_bottle_top - 35mm) places the servo face
+        # at (z_bottle_top + 10mm) -> a 10mm clear air cushion above the bottle top,
+        # while fingertips firmly grip 35mm of the bottle's sides!
+        cyl_dia = max(45.0, min(80.0, v_span if v_span > 10.0 else 72.0))
+        z_bottle_top = table_floor_z + cyl_dia
+        safe_z_b = max(table_floor_z + 20.0, z_bottle_top - 35.0)
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
@@ -3734,12 +3743,18 @@ def main():
             # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
             # securely between the rubber gripper pads (~17mm clearance from rear servo face).
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
-            penetration_candidates = [
-                GRASP_PENETRATION_MM,         # 20.0mm: ~17mm clearance from rear servo face
-                GRASP_PENETRATION_MM - 4.0,   # 16.0mm: ~21mm clearance
-                GRASP_PENETRATION_MM - 8.0,   # 12.0mm: ~25mm clearance
-                8.0,                          # 8.0mm: firm pad grip
-            ]
+            if orient_3d.get("is_lying_flat"):
+                # Top-down grasp from directly above:
+                # Use minimal penetration (0mm centers directly over bottle) to keep servo face safely elevated
+                penetration_candidates = [0.0, 4.0, -4.0]
+            else:
+                # Upright bottle: level horizontal approach with full pad penetration
+                penetration_candidates = [
+                    GRASP_PENETRATION_MM,         # 20.0mm: ~17mm clearance from rear servo face
+                    GRASP_PENETRATION_MM - 4.0,   # 16.0mm: ~21mm clearance
+                    GRASP_PENETRATION_MM - 8.0,   # 12.0mm: ~25mm clearance
+                    8.0,                          # 8.0mm: firm pad grip
+                ]
             grab_pos = None
             final_target = None
             current_j = get_pos(robot)

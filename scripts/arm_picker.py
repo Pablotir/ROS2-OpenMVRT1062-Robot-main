@@ -291,9 +291,9 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # 🛠️ HOW TO MODIFY IF ARM POKES OBJECT:
 # - If the STATIC (right) claw pokes the object on approach: INCREASE this value (+5mm to +10mm).
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
-# - Current value: 59.0mm (re-added 1cm left offset to eliminate static claw pokes)
+# - Current value: 50.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 59.0
+GRAB_LATERAL_OFFSET_MM = 50.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -2500,7 +2500,7 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
-    print(f"   🎯 Grasp Command: Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}° | Left Offset=+{GRAB_LATERAL_OFFSET_MM:.1f}mm along J=[{J_vec[0]:+.2f},{J_vec[1]:+.2f},{J_vec[2]:+.2f}]")
+    print(f"   🎯 Grasp Command: Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}° | Left Offset=+{GRAB_LATERAL_OFFSET_MM:.1f}mm (perpendicular to reach)")
 
     return {
         "is_lying_flat": is_lying_flat,
@@ -3689,26 +3689,14 @@ def main():
                         continue
                     arm_x, arm_y, arm_z = target
 
-                # ── Apply true 3D lateral claw offset along jaw opening vector J ──
-                # Shifts claw to the LEFT (away from static pincer) so jaws center cleanly over object.
-                # Strictly applied in the horizontal (X, Y) plane so lateral shift NEVER corrupts grasp elevation Z!
+                # ── Apply true lateral claw offset (strictly perpendicular to reach line) ──
+                # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
+                # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
                 if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
-                    J = orient_3d.get("J_vec")
-                    if J is not None:
-                        norm_j_xy = math.hypot(float(J[0]), float(J[1]))
-                        if norm_j_xy > 1e-4:
-                            jx_norm = float(J[0]) / norm_j_xy
-                            jy_norm = float(J[1]) / norm_j_xy
-                        else:
-                            pan_t = math.atan2(arm_y, arm_x)
-                            jx_norm, jy_norm = -math.sin(pan_t), math.cos(pan_t)
-                        arm_x += GRAB_LATERAL_OFFSET_MM * jx_norm
-                        arm_y += GRAB_LATERAL_OFFSET_MM * jy_norm
-                    else:
-                        pan_t = math.atan2(arm_y, arm_x)
-                        arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
-                        arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
-                    print(f"   📐 Applied lateral grasp offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw clearance shift in XY plane)")
+                    pan_t = math.atan2(arm_y, arm_x)
+                    arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
+                    arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
+                    print(f"   📐 Applied lateral grasp offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw clearance shift perpendicular to reach)")
 
                 # ── Dynamic Tabletop Safeguard with Jaw Droop Protection ───────────
                 # When wrist is pitched and rolled, lower jaw tip hangs lower than wrist/grasp centerline.

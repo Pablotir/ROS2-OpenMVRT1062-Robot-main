@@ -303,7 +303,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 48.0            # 48.0mm default (verified perfect for vertical flat)
+GRAB_LATERAL_OFFSET_MM = 63.0            # 63.0mm default (48.0mm + 15.0mm extra left offset requested for vertical flat)
 GRAB_LATERAL_OFFSET_STANDING_MM = 76.2   # ~3.0 inches (76.2mm) for standing bottle
 GRAB_LATERAL_OFFSET_RIGHT_MM = 76.2      # ~3.0 inches (76.2mm) for pointed-right flat bottle
 
@@ -2564,8 +2564,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         # For objects lying flat or diagonal on the tabletop:
         # In a top-down grasp, wrist_roll rotates the jaws in the horizontal tabletop plane.
         # Rotating wrist_roll by -tilt_deg aligns the gripper jaws perpendicular to the object.
-        # Clamped to +/-65.0° for full rotational alignment with diagonal objects.
-        delta_roll = float(np.clip(-tilt_deg, -65.0, 65.0))
+        # Clamped to +/-95.0° for full rotational alignment with diagonal and horizontal objects (enables full 90° roll).
+        delta_roll = float(np.clip(-tilt_deg, -95.0, 95.0))
         target_roll = base_roll + delta_roll
 
         # Compute true 3D jaw vector J in the robot base frame
@@ -3934,7 +3934,7 @@ def main():
                     elif tilt_val <= -20.0:
                         lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM     # ~3.0 inches (76.2mm)
                     else:
-                        lat_offset = GRAB_LATERAL_OFFSET_MM           # 48.0mm (verified perfect)
+                        lat_offset = GRAB_LATERAL_OFFSET_MM           # 63.0mm (48.0mm + 15.0mm extra left offset for vertical flat)
 
                 if abs(lat_offset) > 0.01:
                     pan_t = math.atan2(arm_y, arm_x)

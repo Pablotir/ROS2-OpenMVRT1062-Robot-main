@@ -303,7 +303,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 15.0
+GRAB_LATERAL_OFFSET_MM = 48.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)

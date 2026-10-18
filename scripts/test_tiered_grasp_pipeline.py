@@ -298,7 +298,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 20.0
+GRAB_LATERAL_OFFSET_MM = 0.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -2505,8 +2505,14 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     if sizing is not None and "opt_px" in sizing:
         target_px, target_py = sizing["opt_px"]
 
+    # Direct 3D query at optimal grasp point (target_px, target_py):
+    xyz_opt = cap.get_xyz(target_px, target_py, search_w=20, search_h=20)
+    pt_opt_b = None
+    if xyz_opt is not None and 70.0 < xyz_opt[2] <= MAX_GRAB_DEPTH_MM:
+        pt_opt_b = depth_to_arm_target(xyz_opt, robot, penetration_mm=0.0, verbose=False)
+
     closest_sample = min(valid_samples, key=lambda s: math.hypot(s[0] - target_px, s[1] - target_py))
-    midpoint_cam = closest_sample[2]
+    midpoint_cam = xyz_opt if (xyz_opt is not None and 70.0 < xyz_opt[2] <= MAX_GRAB_DEPTH_MM) else closest_sample[2]
 
     # ── Live Table Floor Estimation from Real 3D Camera Depth ──────────────
     # Uses actual 3D points on the object resting on the table rather than a hardcoded height.
@@ -2527,7 +2533,9 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     else:
         # Lying flat / diagonal bottle:
         # Target the slimmer cone/cap section identified by size_up_object:
-        if sizing is not None and "opt_px" in sizing:
+        if pt_opt_b is not None:
+            target_xy = (float(pt_opt_b[0]), float(pt_opt_b[1]))
+        elif sizing is not None and "opt_px" in sizing:
             target_xy = (float(closest_sample[3][0]), float(closest_sample[3][1]))
         else:
             target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))

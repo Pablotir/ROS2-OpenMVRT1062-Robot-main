@@ -303,7 +303,8 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 63.0            # 63.0mm default (48.0mm + 15.0mm extra left offset requested for vertical flat)
+GRAB_LATERAL_OFFSET_MM = 78.0            # 78.0mm default (63.0mm + 15.0mm extra left offset for vertical flat)
+GRAB_LATERAL_OFFSET_HORIZONTAL_MM = 91.2 # 91.2mm default (76.2mm + 15.0mm extra left offset for horizontal flat)
 GRAB_LATERAL_OFFSET_STANDING_MM = 76.2   # ~3.0 inches (76.2mm) for standing bottle
 GRAB_LATERAL_OFFSET_RIGHT_MM = 76.2      # ~3.0 inches (76.2mm) for pointed-right flat bottle
 
@@ -3868,12 +3869,14 @@ def main():
                     0.0,                       # neutral zero fallback
                 ]
             else:
-                # Upright bottle: level horizontal approach with full pad penetration
+                # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
+                # Base penetration: +5.0mm (was +20.0mm; backed up by 15mm to prevent crowding or toppling close bottles)
                 penetration_candidates = [
-                    GRASP_PENETRATION_MM,         # 20.0mm: ~17mm clearance from rear servo face
-                    GRASP_PENETRATION_MM - 4.0,   # 16.0mm: ~21mm clearance
-                    GRASP_PENETRATION_MM - 8.0,   # 12.0mm: ~25mm clearance
-                    8.0,                          # 8.0mm: firm pad grip
+                    5.0,                          # +5.0mm: fingertips/pads clamp securely with ~32mm servo clearance
+                    2.0,                          # +2.0mm: close bottle fallback
+                    0.0,                          #  0.0mm: exact surface edge
+                    -5.0,                         # -5.0mm: light pullback for very close bottles
+                    8.0,                          # +8.0mm: deeper grip fallback
                 ]
             grab_pos = None
             final_target = None
@@ -3930,11 +3933,13 @@ def main():
                 if lat_offset is None:
                     tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
                     if orient_3d.get("is_upright"):
-                        lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM  # ~3.0 inches (76.2mm)
+                        lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM   # ~3.0 inches (76.2mm)
+                    elif abs(tilt_val) >= 55.0:
+                        lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 91.2mm (76.2mm + 15.0mm extra left offset for horizontal flat)
                     elif tilt_val <= -20.0:
-                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM     # ~3.0 inches (76.2mm)
+                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 76.2mm (tested and verified benchmark for angled)
                     else:
-                        lat_offset = GRAB_LATERAL_OFFSET_MM           # 63.0mm (48.0mm + 15.0mm extra left offset for vertical flat)
+                        lat_offset = GRAB_LATERAL_OFFSET_MM            # 78.0mm (63.0mm + 15.0mm extra left offset for vertical flat)
 
                 if abs(lat_offset) > 0.01:
                     pan_t = math.atan2(arm_y, arm_x)

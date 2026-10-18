@@ -291,9 +291,9 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # 🛠️ HOW TO MODIFY IF ARM POKES OBJECT:
 # - If the STATIC (right) claw pokes the object on approach: INCREASE this value (+5mm to +10mm).
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
-# - Current value: 50.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
+# - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 50.0
+GRAB_LATERAL_OFFSET_MM = 20.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -2096,18 +2096,13 @@ def size_up_object(frame: np.ndarray | None,
                 opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1], y1 + 2, y2 - 2))
                 recommended_pitch = 0.0  # Level horizontal approach (strictly parallel to ground)
             else:
-                # Lying flat bottle: pick the end with smaller median width
-                if w1 <= w2:
-                    s_grasp = s_min + 0.25 * L_px
-                    thinnest_width_mm = w1
-                    grasp_width_mm = w1
-                else:
-                    s_grasp = s_max - 0.25 * L_px
-                    thinnest_width_mm = w2
-                    grasp_width_mm = w2
+                # Lying flat bottle: always target the mid-body centroid for stable, balanced clamping
+                s_grasp = 0.0
+                thinnest_width_mm = min(w1, w2, body_width_mm)
+                grasp_width_mm = body_width_mm
                 height_pct = 50.0
-                opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0], x1 + 2, x2 - 2))
-                opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1], y1 + 2, y2 - 2))
+                opt_x = int(np.clip(x1 + c_x, x1 + 2, x2 - 2))
+                opt_y = int(np.clip(y1 + c_y, y1 + 2, y2 - 2))
                 recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
         else:
             # Non-bottle objects: target centroid along major/minor axes
@@ -2481,12 +2476,10 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
     else:
         # Lying flat / diagonal bottle:
-        # If sizing detected a specific narrower section (cap/neck), target that sample's 3D position directly;
-        # otherwise use the true 3D centroid of the bottle.
-        if sizing is not None and "opt_px" in sizing:
-            target_xy = (float(closest_sample[3][0]), float(closest_sample[3][1]))
-        else:
-            target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
+        # Always target the true 3D centroid of the bottle cylinder in arm base frame!
+        # This ensures a balanced, rock-solid clamp directly on the center of mass,
+        # preventing tipping, bottom-grabbing, or sliding off the edges.
+        target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
 
         # Live vertical grasp height:
         # Center gripper at live measured vertical center of bottle (mid_z_b)
@@ -3623,9 +3616,9 @@ def main():
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
             if orient_3d.get("is_lying_flat"):
                 # Forward reach penetration along approach vector:
-                # 16mm centers object deeply between rubber pads (~21mm clearance from rear servo face).
-                # Fall back gracefully to 12mm, 8mm, 4mm, or 0mm if reaching limits.
-                penetration_candidates = [16.0, 12.0, 8.0, 4.0, 0.0]
+                # Backed up to gentle penetration (5mm -> 2.5mm -> 0.0mm) so the claws
+                # gently encircle the resting bottle without colliding with or pushing it.
+                penetration_candidates = [5.0, 2.5, 0.0]
             else:
                 # Upright bottle: level horizontal approach with full pad penetration
                 penetration_candidates = [
@@ -3783,8 +3776,8 @@ def main():
                 print("\n🔍 Search loop resumed\n")
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
-                print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
-                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
+                print(f"\n🦾 APPROACHING (level gripper, jaws wide open to {GRIPPER_OPEN_POS_DEG:.1f}°)...")
+                grab_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)

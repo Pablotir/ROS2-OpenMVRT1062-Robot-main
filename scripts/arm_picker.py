@@ -2566,7 +2566,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         # Upright bottle: grasp at the slim neck (+35mm to +45mm above mid-height, within safe reach)
         neck_offset = min(45.0, 0.25 * max(v_span, 140.0))
         neck_z = max(mid_z_b + neck_offset, -90.0)
-        midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
+        safe_z_b = float(neck_z)
+        midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
     else:
         # Lying flat / diagonal bottle:
         # Target the slimmer cone/cap section identified by size_up_object:
@@ -2603,6 +2604,7 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         "midpoint_base": midpoint_base,
         "midpoint_cam": midpoint_cam,
         "live_table_z": round(live_table_z, 1),
+        "safe_z_b": round(safe_z_b, 1),
         "V_axis": V,
         "J_vec": J_vec,
         "confidence": "high_3d_span"
@@ -3717,25 +3719,22 @@ def main():
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
             if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
                 # Table-resting objects (top-down or steep approach):
-                # Table-resting objects (top-down or steep approach):
-                # Target the physical sweet spot (Dist ~ 248-254mm) where -85° top-down grasp is rigidly reachable.
-                # If raw deprojected distance exceeds 250mm due to 45° camera perspective slant, pull back
-                # towards 248mm (scaled by transverse angle). Never pull back below 248mm so it never falls short!
+                # Pull back along the reach line so the gripper pads land squarely
+                # over the resting bottle neck without overshooting past it into empty air.
+                # Base pullback of 15.0mm aligns the rubber pads (which sit behind the fingertips) with the bottle.
+                # Farther bottles (raw_dist > 260mm) receive proportional extra pullback to keep reach inside
+                # the ~255-260mm physical sweet spot where steep (-85°) top-down grasp is reachable.
                 mid_base = orient_3d.get("midpoint_base")
                 raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 250.0
 
-                tilt_val = sizing.get("tilt_deg", 90.0) if sizing is not None else 90.0
-                transverse_scale = float(abs(math.sin(math.radians(tilt_val))))
+                base_pullback = 15.0
+                excess_dist = max(0.0, raw_dist - 260.0)
+                needed_pullback = base_pullback + excess_dist
+                scaled_pullback = float(np.clip(needed_pullback, 15.0, 50.0))
 
-                if raw_dist > 250.0:
-                    needed_pullback = (raw_dist - 248.0) * transverse_scale
-                else:
-                    needed_pullback = 0.0
-
-                scaled_pullback = float(np.clip(needed_pullback, 0.0, 55.0))
                 flat_rad_offset = -scaled_pullback
                 penetration_candidates = [
-                    flat_rad_offset,           # Optimal pullback into [248, 254]mm sweet spot
+                    flat_rad_offset,           # Optimal pullback into sweet spot
                     flat_rad_offset + 5.0,     # fallback
                     flat_rad_offset + 10.0,    # fallback
                     flat_rad_offset + 15.0,    # fallback
@@ -3786,17 +3785,11 @@ def main():
                         arm_y = mid_y + pen_mm * math.sin(pan_rad)
                         arm_z = mid_z
                     else:
-                        # Upright: target via depth_to_arm_target with penetration
-                        target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
-                        if target is not None:
-                            arm_x, arm_y, arm_z = target
-                        else:
-                            pan_rad = math.atan2(arm_y, arm_x)
-                            arm_x = mid_x + pen_mm * math.cos(pan_rad)
-                            arm_y = mid_y + pen_mm * math.sin(pan_rad)
-                            arm_z = mid_z
-                        # Enforce neck height for upright bottles so it never grabs the lower 1/3rd!
-                        arm_z = max(arm_z, mid_z)
+                        # Upright bottle: level horizontal approach directly into neck cylinder
+                        pan_rad = math.atan2(mid_y, mid_x)
+                        arm_x = mid_x + pen_mm * math.cos(pan_rad)
+                        arm_y = mid_y + pen_mm * math.sin(pan_rad)
+                        arm_z = mid_z
                 else:
                     target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
                     if target is None:

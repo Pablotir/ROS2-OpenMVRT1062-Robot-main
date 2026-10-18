@@ -3779,6 +3779,7 @@ def main():
                 if orient_3d.get("confidence") == "high_3d_span" and orient_3d.get("midpoint_base") is not None:
                     mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
                     arm_x = mid_x
+                    arm_y = mid_y
                     live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
                     table_floor_z = live_tbl_z if live_tbl_z is not None else getattr(args, "table_z", TABLE_FLOOR_Z_MM)
 

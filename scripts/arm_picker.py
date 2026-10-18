@@ -3721,9 +3721,17 @@ def main():
                     depth_val = float(xyz[2])
                 extra_pullback = max(0.0, (depth_val - 190.0) * 0.65)
                 base_pullback = abs(GRASP_FLAT_RADIAL_OFFSET_MM) + extra_pullback
-                flat_rad_offset = -base_pullback
+
+                # Scale pullback by transverse component:
+                # - Horizontal bottle (|tilt| >= 45°): reach line is perpendicular to bottle axis -> full pullback across cylinder
+                # - Vertical flat bottle (|tilt| < 20°): reach line is parallel to bottle axis -> minimal pullback (grasp point is already at neck)
+                tilt_val = sizing.get("tilt_deg", 90.0) if sizing is not None else 90.0
+                transverse_scale = float(abs(math.sin(math.radians(tilt_val))))
+                scaled_pullback = base_pullback * transverse_scale
+
+                flat_rad_offset = -scaled_pullback
                 penetration_candidates = [
-                    flat_rad_offset,           # Dynamic pullback: keeps reach in ~245-255mm sweet spot
+                    flat_rad_offset,           # Dynamic pullback: scaled by transverse bottle orientation
                     flat_rad_offset + 5.0,     # fallback
                     flat_rad_offset + 10.0,    # fallback
                     flat_rad_offset + 15.0,    # fallback
@@ -3904,10 +3912,27 @@ def main():
                 time.sleep(0.6)
 
                 print("🏠 RETURNING...")
+                # 1. Lift vertical clearance step (so bottle clears the table without dragging)
+                lift_pos = dict(grab_pos)
+                lift_pos["shoulder_lift.pos"] = min(-75.0, grab_pos.get("shoulder_lift.pos", -100.0) - 20.0)
+                smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
+                time.sleep(0.3)
+
+                # 2. Turn wrist 180° in opposite direction from final grasp so object flips away from camera:
+                cur_roll = grab_pos.get("wrist_roll.pos", target_roll)
+                flipped_roll = cur_roll + 180.0 if cur_roll <= 0.0 else cur_roll - 180.0
+                flipped_roll = float(np.clip(flipped_roll, -165.0, 165.0))
+                print(f"   🔄 Turning wrist 180° ({cur_roll:+.1f}° → {flipped_roll:+.1f}°) to keep object away from camera...")
+                lift_pos["wrist_roll.pos"] = flipped_roll
+                smooth_move(robot, lift_pos, step_size=2.5, step_delay=0.03, hold_joints=["gripper.pos"])
+                time.sleep(0.3)
+
+                # 3. Transport to drop position while keeping bottle pointing downward away from camera:
                 drop_pos = dict(START_POS)
                 drop_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
-                smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
-                            hold_joints=["gripper.pos"])
+                drop_pos["wrist_roll.pos"] = flipped_roll
+                drop_pos["wrist_flex.pos"] = max(55.0, START_POS.get("wrist_flex.pos", 32.53))
+                smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
                 time.sleep(0.8)
     
                 print("🖐 DROPPING...")

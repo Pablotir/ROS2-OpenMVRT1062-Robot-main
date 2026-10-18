@@ -2078,32 +2078,49 @@ def size_up_object(frame: np.ndarray | None,
         body_width_mm = float(np.percentile(valid_ws, 80)) if valid_ws else float(w_box * scale)
 
         if is_bottle_like:
-            # Check width at both ends to identify the slimmer neck section:
-            # End 1 (s_min) vs End 2 (s_max)
-            w1_vals = [w for w in widths_mm[2:10] if w > 5.0]
-            w2_vals = [w for w in widths_mm[20:28] if w > 5.0]
-            w1 = float(np.median(w1_vals)) if w1_vals else body_width_mm
-            w2 = float(np.median(w2_vals)) if w2_vals else body_width_mm
+            # Check width at both ends to identify the slimmer cone/cap section:
+            # End 1 (s_min, bins 2:12) vs End 2 (s_max, bins 18:28)
+            # Find the minimum valid cross-sectional width in each end
+            w1_cands = [(widths_mm[i], i) for i in range(2, 12) if widths_mm[i] >= 15.0]
+            w2_cands = [(widths_mm[i], i) for i in range(18, 28) if widths_mm[i] >= 15.0]
+            min_w1, idx1 = min(w1_cands, key=lambda x: x[0]) if w1_cands else (body_width_mm, 5)
+            min_w2, idx2 = min(w2_cands, key=lambda x: x[0]) if w2_cands else (body_width_mm, 23)
 
             abs_tilt = abs(tilt_deg)
-            if abs_tilt <= 35.0 or h_box >= int(w_box * 1.15):
-                # Upright bottle: top in image (s_min) is ALWAYS the slimmer neck
-                s_grasp = s_min + 0.25 * L_px
-                thinnest_width_mm = min(w1, body_width_mm)
-                grasp_width_mm = thinnest_width_mm
-                height_pct = 75.0
-                opt_x = default_cx
-                opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1], y1 + 2, y2 - 2))
+            if abs_tilt <= 35.0:
+                # Upright bottle: top in image (End 1) is ALWAYS the neck/cap
+                best_idx = idx1
+                thinnest_width_mm = min_w1
                 recommended_pitch = 0.0  # Level horizontal approach (strictly parallel to ground)
+                height_pct = 75.0
             else:
-                # Lying flat bottle: always target the mid-body centroid for stable, balanced clamping
-                s_grasp = 0.0
-                thinnest_width_mm = min(w1, w2, body_width_mm)
-                grasp_width_mm = body_width_mm
-                height_pct = 50.0
-                opt_x = int(np.clip(x1 + c_x, x1 + 2, x2 - 2))
-                opt_y = int(np.clip(y1 + c_y, y1 + 2, y2 - 2))
+                # Lying flat / diagonal bottle:
+                # Select the thinner end (cone/cap):
+                if min_w1 + 5.0 < min_w2:
+                    best_idx = idx1
+                    thinnest_width_mm = min_w1
+                elif min_w2 + 5.0 < min_w1:
+                    best_idx = idx2
+                    thinnest_width_mm = min_w2
+                else:
+                    # If widths are comparable, select the end on the LEFT (smaller X)
+                    x_end1 = x1 + c_x + bin_centers[idx1] * v_maj[0]
+                    x_end2 = x1 + c_x + bin_centers[idx2] * v_maj[0]
+                    if x_end1 <= x_end2:
+                        best_idx = idx1
+                        thinnest_width_mm = min_w1
+                    else:
+                        best_idx = idx2
+                        thinnest_width_mm = min_w2
+
                 recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
+                height_pct = 50.0
+
+            s_grasp = bin_centers[best_idx]
+            grasp_width_mm = thinnest_width_mm
+            # Optimal 2D grasp point computed directly along major axis to the cone/cap:
+            opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0], x1 + 2, x2 - 2))
+            opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1], y1 + 2, y2 - 2))
         else:
             # Non-bottle objects: target centroid along major/minor axes
             opt_x = int(x1 + c_x)
@@ -2476,10 +2493,11 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
     else:
         # Lying flat / diagonal bottle:
-        # Always target the true 3D centroid of the bottle cylinder in arm base frame!
-        # This ensures a balanced, rock-solid clamp directly on the center of mass,
-        # preventing tipping, bottom-grabbing, or sliding off the edges.
-        target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
+        # Target the slimmer cone/cap section identified by size_up_object:
+        if sizing is not None and "opt_px" in sizing:
+            target_xy = (float(closest_sample[3][0]), float(closest_sample[3][1]))
+        else:
+            target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
 
         # Live vertical grasp height:
         # Center gripper at live measured vertical center of bottle (mid_z_b)
@@ -3776,8 +3794,8 @@ def main():
                 print("\n🔍 Search loop resumed\n")
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
-                print(f"\n🦾 APPROACHING (level gripper, jaws wide open to {GRIPPER_OPEN_POS_DEG:.1f}°)...")
-                grab_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
+                print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
+                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
                 level_approach(robot, grab_pos,
                                step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)

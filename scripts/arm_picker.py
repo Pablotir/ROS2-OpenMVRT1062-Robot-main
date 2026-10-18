@@ -2158,23 +2158,25 @@ def size_up_object(frame: np.ndarray | None,
 
             # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
             if cap_is_end1:
-                # Search bins 3 to 7 near End 1 for the neck cylinder
-                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(3, 8) if widths_mm[i] >= 16.0]
+                # Search bins 4 to 8 near End 1 for the neck cylinder (avoiding extreme cap tip in bins 0-3)
+                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(4, 9) if widths_mm[i] >= 16.0]
                 if neck_cands:
                     best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
                     thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
+                    s_grasp += 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
                 else:
-                    s_grasp = s_min + 0.15 * L_px
+                    s_grasp = s_min + 0.18 * L_px
                     mid_t_grasp = 0.0
                     thinnest_width_mm = med_w1
             else:
-                # Search bins 22 to 26 near End 2 for the neck cylinder
-                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(22, 27) if widths_mm[i] >= 16.0]
+                # Search bins 21 to 25 near End 2 for the neck cylinder (avoiding extreme cap tip in bins 26-29)
+                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(21, 26) if widths_mm[i] >= 16.0]
                 if neck_cands:
                     best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
                     thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
+                    s_grasp -= 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
                 else:
-                    s_grasp = s_max - 0.15 * L_px
+                    s_grasp = s_max - 0.18 * L_px
                     mid_t_grasp = 0.0
                     thinnest_width_mm = med_w2
 
@@ -2571,8 +2573,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
             measured_z = float(midpoint_b[2])
 
         # Live vertical grasp height:
-        # Grasp at measured neck height, while guaranteeing fingertips clear the table surface (+15mm above table floor):
-        safe_z_b = max(measured_z, live_table_z + 15.0)
+        # Bottle resting on tabletop/floor: the centerline of the neck cylinder is physically ~18mm above table surface.
+        safe_z_b = live_table_z + 18.0
         safe_z_b = float(np.clip(safe_z_b, -240.0, -50.0))
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
@@ -3709,12 +3711,23 @@ def main():
                 # Table-resting objects (top-down or steep approach):
                 # Pull back along the reach line so the gripper pads land squarely
                 # over the resting bottle neck without overshooting past it into empty air.
+                # Dynamic depth-proportional pullback: closer bottles (depth <= 190mm) use 30mm pullback;
+                # farther bottles scale pullback to compensate for perspective slant expansion and keep
+                # reach inside the ~250mm sweet spot where steep (-85°) top-down grasp is reachable.
+                depth_val = 190.0
+                if orient_3d.get("midpoint_cam") is not None:
+                    depth_val = float(orient_3d["midpoint_cam"][2])
+                elif xyz is not None:
+                    depth_val = float(xyz[2])
+                extra_pullback = max(0.0, (depth_val - 190.0) * 0.65)
+                base_pullback = abs(GRASP_FLAT_RADIAL_OFFSET_MM) + extra_pullback
+                flat_rad_offset = -base_pullback
                 penetration_candidates = [
-                    GRASP_FLAT_RADIAL_OFFSET_MM,         # -30.0mm default: centers pads dead over resting bottle neck
-                    GRASP_FLAT_RADIAL_OFFSET_MM + 5.0,   # -25.0mm fallback
-                    GRASP_FLAT_RADIAL_OFFSET_MM + 10.0,  # -20.0mm fallback
-                    GRASP_FLAT_RADIAL_OFFSET_MM + 15.0,  # -15.0mm fallback
-                    0.0,                                 # neutral zero fallback
+                    flat_rad_offset,           # Dynamic pullback: keeps reach in ~245-255mm sweet spot
+                    flat_rad_offset + 5.0,     # fallback
+                    flat_rad_offset + 10.0,    # fallback
+                    flat_rad_offset + 15.0,    # fallback
+                    0.0,                       # neutral zero fallback
                 ]
             else:
                 # Upright bottle: level horizontal approach with full pad penetration

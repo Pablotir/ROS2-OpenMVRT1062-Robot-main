@@ -298,7 +298,7 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 0.0
+GRAB_LATERAL_OFFSET_MM = 15.0
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -3912,27 +3912,12 @@ def main():
                 time.sleep(0.6)
 
                 print("🏠 RETURNING...")
-                # 1. Lift vertical clearance step (so bottle clears the table without dragging)
-                lift_pos = dict(grab_pos)
-                lift_pos["shoulder_lift.pos"] = min(-75.0, grab_pos.get("shoulder_lift.pos", -100.0) - 20.0)
-                smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
-                time.sleep(0.3)
-
-                # 2. Turn wrist 180° in opposite direction from final grasp so object flips away from camera:
-                cur_roll = grab_pos.get("wrist_roll.pos", target_roll)
-                flipped_roll = cur_roll + 180.0 if cur_roll <= 0.0 else cur_roll - 180.0
-                flipped_roll = float(np.clip(flipped_roll, -165.0, 165.0))
-                print(f"   🔄 Turning wrist 180° ({cur_roll:+.1f}° → {flipped_roll:+.1f}°) to keep object away from camera...")
-                lift_pos["wrist_roll.pos"] = flipped_roll
-                smooth_move(robot, lift_pos, step_size=2.5, step_delay=0.03, hold_joints=["gripper.pos"])
-                time.sleep(0.3)
-
-                # 3. Transport to drop position while keeping bottle pointing downward away from camera:
                 drop_pos = dict(START_POS)
                 drop_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
-                drop_pos["wrist_roll.pos"] = flipped_roll
-                drop_pos["wrist_flex.pos"] = max(55.0, START_POS.get("wrist_flex.pos", 32.53))
-                smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
+                # Maintain the grasp wrist roll so the wrist never twists while carrying the bottle:
+                drop_pos["wrist_roll.pos"] = grab_pos.get("wrist_roll.pos", target_roll)
+                smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
+                            hold_joints=["gripper.pos"])
                 time.sleep(0.8)
     
                 print("🖐 DROPPING...")

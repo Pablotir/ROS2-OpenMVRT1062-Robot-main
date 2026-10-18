@@ -610,6 +610,13 @@ class RealSenseStream:
                 return self._color.copy(), False, None
             return self._color.copy(), True, None
 
+    def get_raw_depth(self):
+        """Return (depth_img_uint16_copy, depth_scale_float) or (None, 0.001)."""
+        with self._lock:
+            if self._depth_img is None:
+                return None, 0.001
+            return self._depth_img.copy(), float(self._depth_scale)
+
     def get_colorized_depth(self):
         """Generate colorized depth map lazily on demand to avoid CPU overhead at high FPS."""
         with self._lock:
@@ -627,7 +634,7 @@ class RealSenseStream:
         """
         Deprojects pixel (px, py) into 3-D camera-space coordinates (mm).
         Uses a dynamic median patch (search_w x search_h) for noise rejection.
-        Optimized with NumPy slicing.
+        Optimized with NumPy slicing and foreground clustering to prevent table contamination.
         """
         with self._lock:
             depth_img = self._depth_img
@@ -654,7 +661,14 @@ class RealSenseStream:
         if valid.size == 0:
             return None
             
-        z_m = float(np.median(valid))
+        # Robust foreground surface depth extraction:
+        # In a patch centered on a narrow neck or edge resting on a table,
+        # background table pixels outnumber the foreground object.
+        # np.percentile(valid, 5) rejects single-pixel dropouts, and foreground cluster
+        # within 25mm isolates the true front surface of the object from the tabletop.
+        d_min = float(np.percentile(valid, 5))
+        fg = valid[(valid >= d_min) & (valid <= d_min + 0.025)]
+        z_m = float(np.median(fg)) if fg.size >= 3 else float(np.median(valid))
         point = rs.rs2_deproject_pixel_to_point(intr, [float(px), float(py)], z_m)
         return point[0] * 1000.0, point[1] * 1000.0, point[2] * 1000.0  # → mm
 
@@ -1957,7 +1971,9 @@ def size_up_object(frame: np.ndarray | None,
                    bbox: tuple[int, int, int, int],
                    depth_mm: float = 280.0,
                    target_desc: str = "bottle",
-                   fx: float = 452.5) -> dict:
+                   fx: float = 452.5,
+                   depth_frame: np.ndarray | None = None,
+                   depth_scale: float = 0.001) -> dict:
     """
     Sizes up the object and profiles its cross-sectional width along its true principal axis using PCA.
     Accurately handles objects at arbitrary angles (upright, 30°-60° tilted, or lying flat on tabletop).
@@ -1989,7 +2005,22 @@ def size_up_object(frame: np.ndarray | None,
     crop_mask = None
     if seg_mask is not None and np.sum(seg_mask == 255) >= 30:
         crop_mask = seg_mask[y1:y2, x1:x2].copy()
-    elif frame is not None and frame.size > 0:
+    elif depth_frame is not None and depth_frame.size > 0:
+        try:
+            depth_crop = depth_frame[y1:y2, x1:x2].astype(np.float32) * depth_scale
+            valid_d = depth_crop[(depth_crop > 0.05) & (depth_crop < 1.5)]
+            if valid_d.size >= 100:
+                # Background table is at the higher depth (further away)
+                table_depth_est = float(np.percentile(valid_d, 85))
+                # Physical object is elevated off table by >= 8mm (rejects table shadows and surface reflections)
+                obj_elev = (depth_crop > 0.05) & (depth_crop < table_depth_est - 0.008)
+                if np.sum(obj_elev) >= 50:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                    crop_mask = cv2.morphologyEx((obj_elev * 255).astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        except Exception:
+            crop_mask = None
+
+    if crop_mask is None and frame is not None and frame.size > 0:
         crop = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -2061,8 +2092,16 @@ def size_up_object(frame: np.ndarray | None,
             in_b = (s >= bin_edges[i]) & (s < bin_edges[i+1])
             if np.sum(in_b) >= 3:
                 t_b = t[in_b]
-                widths_px.append(float(np.max(t_b) - np.min(t_b)))
-                mid_ts.append(float((np.max(t_b) + np.min(t_b)) / 2.0))
+                delta_s = max(1.0, bin_edges[i+1] - bin_edges[i])
+                w_fill = float(len(t_b)) / delta_s
+                if len(t_b) >= 6:
+                    p15, p85 = np.percentile(t_b, 15), np.percentile(t_b, 85)
+                    w_perc = (p85 - p15) / 0.70
+                    w_val = min(w_perc, w_fill) if w_fill > 3.0 else w_perc
+                else:
+                    w_val = w_fill
+                widths_px.append(float(w_val))
+                mid_ts.append(float(np.median(t_b)))
                 bin_centers.append(float((bin_edges[i] + bin_edges[i+1]) / 2.0))
             else:
                 widths_px.append(0.0)
@@ -2079,42 +2118,65 @@ def size_up_object(frame: np.ndarray | None,
 
         if is_bottle_like:
             # Robustly distinguish the cone/cap end from the flat base end:
-            # The base of a bottle has full cylindrical body width (~65-80mm) from 10% to 30% inward.
-            # The cone/cap end is significantly slimmer (~25-45mm) from 10% to 30% inward.
-            # Measure the median width in bins 3:10 (End 1, 10%-33% from s_min)
-            # versus bins 20:27 (End 2, 10%-33% from s_max).
-            valid_w1 = [widths_mm[i] for i in range(3, 10) if widths_mm[i] >= 15.0]
-            valid_w2 = [widths_mm[i] for i in range(20, 27) if widths_mm[i] >= 15.0]
-            med_w1 = float(np.median(valid_w1)) if valid_w1 else body_width_mm
-            med_w2 = float(np.median(valid_w2)) if valid_w2 else body_width_mm
+            # End 1 candidate bins (bins 4 to 9, ~13% to 30% inward from s_min)
+            # End 2 candidate bins (bins 20 to 25, ~13% to 30% inward from s_max)
+            cands1 = [(widths_mm[i], bin_centers[i], mid_ts[i], i) for i in range(4, 10) if widths_mm[i] >= 12.0]
+            cands2 = [(widths_mm[i], bin_centers[i], mid_ts[i], i) for i in range(20, 26) if widths_mm[i] >= 12.0]
 
-            # The cone/cap end is definitively the narrower end:
-            cap_is_end1 = (med_w1 <= med_w2)
+            min_w1 = min(c[0] for c in cands1) if cands1 else 999.0
+            min_w2 = min(c[0] for c in cands2) if cands2 else 999.0
+            med_w1 = float(np.median([c[0] for c in cands1])) if cands1 else body_width_mm
+            med_w2 = float(np.median([c[0] for c in cands2])) if cands2 else body_width_mm
+
+            # A true bottle neck MUST be narrow (physically <= 45mm, typically 22-38mm).
+            # The body/base of a bottle is physically 60-85mm.
+            if min_w1 <= 45.0 and min_w2 > 45.0:
+                cap_is_end1 = True
+            elif min_w2 <= 45.0 and min_w1 > 45.0:
+                cap_is_end1 = False
+            elif min_w1 <= 45.0 and min_w2 <= 45.0:
+                # Both have a narrow section: pick the one with the deeper neck constriction
+                cap_is_end1 = (min_w1 <= min_w2)
+            else:
+                # Neither end measured <= 45mm: fallback to comparing median widths
+                # If medians are close (within 15%), prefer the end closer to the robot (larger y in image)
+                # to prevent lunging past the object into empty air!
+                if abs(med_w1 - med_w2) < 0.15 * max(med_w1, med_w2):
+                    y_end1 = y1 + c_y + s_min * v_maj[1]
+                    y_end2 = y1 + c_y + s_max * v_maj[1]
+                    cap_is_end1 = (y_end1 >= y_end2)
+                else:
+                    cap_is_end1 = (med_w1 <= med_w2)
+
             recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
             height_pct = 50.0
 
             # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
             if cap_is_end1:
-                # Search bins 3 to 6 near End 1 for the neck cylinder (avoiding bin 1-2 extreme cap tip)
-                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(3, 7) if widths_mm[i] >= 18.0]
+                # Search bins 3 to 7 near End 1 for the neck cylinder
+                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(3, 8) if widths_mm[i] >= 16.0]
                 if neck_cands:
-                    thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
+                    best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
+                    thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
                 else:
                     s_grasp = s_min + 0.15 * L_px
+                    mid_t_grasp = 0.0
                     thinnest_width_mm = med_w1
             else:
-                # Search bins 23 to 26 near End 2 for the neck cylinder (avoiding bin 27-29 extreme cap tip)
-                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(23, 27) if widths_mm[i] >= 18.0]
+                # Search bins 22 to 26 near End 2 for the neck cylinder
+                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(22, 27) if widths_mm[i] >= 16.0]
                 if neck_cands:
-                    thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
+                    best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
+                    thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
                 else:
                     s_grasp = s_max - 0.15 * L_px
+                    mid_t_grasp = 0.0
                     thinnest_width_mm = med_w2
 
             grasp_width_mm = thinnest_width_mm
-            # Optimal 2D grasp point computed directly along major axis to the cone/cap:
-            opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0], x1 + 2, x2 - 2))
-            opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1], y1 + 2, y2 - 2))
+            # Optimal 2D grasp point centered on the neck cylinder (including minor-axis centerline):
+            opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0] + mid_t_grasp * v_min[0], x1 + 2, x2 - 2))
+            opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1] + mid_t_grasp * v_min[1], y1 + 2, y2 - 2))
         else:
             # Non-bottle objects: target centroid along major/minor axes
             opt_x = int(x1 + c_x)
@@ -2152,7 +2214,7 @@ def size_up_object(frame: np.ndarray | None,
     }
 
 
-def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle", frame: np.ndarray | None = None) -> tuple[int, int]:
+def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, int, int], target_desc: str = "bottle", frame: np.ndarray | None = None, depth_frame: np.ndarray | None = None, depth_scale: float = 0.001) -> tuple[int, int]:
     """
     Computes optimal grasp point (x_px, y_px) on the object using PCA oriented profiling.
     Directly delegates to size_up_object with robust fallback to contour moments or Canny center.
@@ -2161,7 +2223,7 @@ def find_optimal_grasp_point(seg_mask: np.ndarray | None, bbox: tuple[int, int, 
     default_cx, default_cy = (x1 + x2) // 2, (y1 + y2) // 2
 
     try:
-        sizing = size_up_object(frame, seg_mask, bbox, 280.0, target_desc)
+        sizing = size_up_object(frame, seg_mask, bbox, 280.0, target_desc, depth_frame=depth_frame, depth_scale=depth_scale)
         return sizing["opt_px"]
     except Exception:
         pass
@@ -3535,7 +3597,8 @@ def main():
             print(f"   🔒 Target Track Locked in Memory: box=({x1_a},{y1_a},{x2_a},{y2_a}) stable_center=({obj_px},{obj_py})")
 
             # Size up object to determine dimensions & orientation
-            sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC)
+            depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
+            sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
             if sizing is not None and "opt_px" in sizing:
                 obj_px, obj_py = sizing["opt_px"]
             fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
@@ -3624,7 +3687,8 @@ def main():
 
             # Refresh sizing with exact live depth measurement
             if sizing is not None and xyz is not None:
-                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC)
+                depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
+                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
 
             # ── STEP 2b: 3D Orientation Analysis (Disambiguate Lying Flat vs Upright) ──
             orient_3d = analyze_3d_orientation(cap, robot, (x1_a, y1_a, x2_a, y2_a), seg_mask, sizing)

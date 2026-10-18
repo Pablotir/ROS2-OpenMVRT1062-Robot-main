@@ -2117,45 +2117,47 @@ def size_up_object(frame: np.ndarray | None,
         body_width_mm = float(np.percentile(valid_ws, 80)) if valid_ws else float(w_box * scale)
 
         if is_bottle_like:
-            # Check width at both ends to identify the slimmer cone/cap section:
-            # End 1 (s_min, bins 2:12) vs End 2 (s_max, bins 18:28)
-            # Find the minimum valid cross-sectional width in each end
-            w1_cands = [(widths_mm[i], i) for i in range(2, 12) if widths_mm[i] >= 15.0]
-            w2_cands = [(widths_mm[i], i) for i in range(18, 28) if widths_mm[i] >= 15.0]
-            min_w1, idx1 = min(w1_cands, key=lambda x: x[0]) if w1_cands else (body_width_mm, 5)
-            min_w2, idx2 = min(w2_cands, key=lambda x: x[0]) if w2_cands else (body_width_mm, 23)
+            # Robustly distinguish the cone/cap end from the flat base end:
+            # The base of a bottle has full cylindrical body width (~65-80mm) from 10% to 30% inward.
+            # The cone/cap end is significantly slimmer (~25-45mm) from 10% to 30% inward.
+            # Measure the median width in bins 3:10 (End 1, 10%-33% from s_min)
+            # versus bins 20:27 (End 2, 10%-33% from s_max).
+            valid_w1 = [widths_mm[i] for i in range(3, 10) if widths_mm[i] >= 15.0]
+            valid_w2 = [widths_mm[i] for i in range(20, 27) if widths_mm[i] >= 15.0]
+            med_w1 = float(np.median(valid_w1)) if valid_w1 else body_width_mm
+            med_w2 = float(np.median(valid_w2)) if valid_w2 else body_width_mm
 
             abs_tilt = abs(tilt_deg)
             if abs_tilt <= 35.0:
-                # Upright bottle: top in image (End 1) is ALWAYS the neck/cap
-                best_idx = idx1
-                thinnest_width_mm = min_w1
+                # Upright bottle: top in image (End 1, s_min) is ALWAYS the neck/cap
+                cap_is_end1 = True
                 recommended_pitch = 0.0  # Level horizontal approach (strictly parallel to ground)
                 height_pct = 75.0
             else:
                 # Lying flat / diagonal bottle:
-                # Select the thinner end (cone/cap):
-                if min_w1 + 5.0 < min_w2:
-                    best_idx = idx1
-                    thinnest_width_mm = min_w1
-                elif min_w2 + 5.0 < min_w1:
-                    best_idx = idx2
-                    thinnest_width_mm = min_w2
-                else:
-                    # If widths are comparable, select the end on the LEFT (smaller X)
-                    x_end1 = x1 + c_x + bin_centers[idx1] * v_maj[0]
-                    x_end2 = x1 + c_x + bin_centers[idx2] * v_maj[0]
-                    if x_end1 <= x_end2:
-                        best_idx = idx1
-                        thinnest_width_mm = min_w1
-                    else:
-                        best_idx = idx2
-                        thinnest_width_mm = min_w2
-
+                # The end with the smaller representative width is definitively the cone/cap!
+                cap_is_end1 = (med_w1 <= med_w2)
                 recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
                 height_pct = 50.0
 
-            s_grasp = bin_centers[best_idx]
+            # Once the cone/cap end is identified, locate the optimal grasp point right at the neck:
+            if cap_is_end1:
+                # Search bins 1 to 6 near End 1 for the minimum neck width
+                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(1, 7) if widths_mm[i] >= 15.0]
+                if neck_cands:
+                    thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
+                else:
+                    s_grasp = s_min + 0.12 * L_px
+                    thinnest_width_mm = med_w1
+            else:
+                # Search bins 23 to 28 near End 2 for the minimum neck width
+                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(23, 29) if widths_mm[i] >= 15.0]
+                if neck_cands:
+                    thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
+                else:
+                    s_grasp = s_max - 0.12 * L_px
+                    thinnest_width_mm = med_w2
+
             grasp_width_mm = thinnest_width_mm
             # Optimal 2D grasp point computed directly along major axis to the cone/cap:
             opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0], x1 + 2, x2 - 2))

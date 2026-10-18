@@ -2467,11 +2467,19 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     # - Upright bottle: stands vertically on tabletop (elev_deg >= 55°, v_span >= h_span * 1.15, abs(tilt_deg) < 30°)
     # - Lying flat bottle: rests horizontally on tabletop (elev_deg <= 40° or h_span >= v_span * 0.95 or abs(tilt_deg) >= 40° or w_box >= int(h_box * 1.15))
     # - 3D Diagonal bottle: genuinely propped up at an angle against an obstacle (elev_deg > 40° and v_span > h_span * 1.1 and abs(tilt_deg) < 40°)
-    # ── 3D Geometric Classification ──────────────────────────────────────────
-    # - Upright bottle: stands vertically on tabletop (v_span >= 120mm, elev_deg >= 55°, v_span >= h_span * 1.3)
-    # - Lying flat bottle: rests horizontally on tabletop (v_span <= 90mm — diameter of bottle cylinder, elev_deg <= 40°, or h_span >= v_span * 0.95)
-    # - 3D Diagonal bottle: genuinely propped up at an angle against an obstacle (v_span > 90mm and 40° < elev_deg < 65°)
-    if v_span >= 120.0 and v_span >= h_span * 1.3 and elev_deg >= 55.0:
+    # ── 3D & 2D Unified Geometric Classification ─────────────────────────────
+    # Upright standing bottle detection:
+    # 1) 3D Point cloud metrics:
+    is_upright_3d = (v_span >= 100.0 and v_span >= h_span * 1.2 and elev_deg >= 50.0)
+    # 2) 2D Vision & Camera Gaze metrics:
+    # A standing bottle is tall and vertical in the image: h_box >= 1.5 * w_box and |tilt| <= 22°
+    # AND camera gaze is elevated (wst < +18° or lift > -92°) to view the tall standing object
+    cur_j = get_pos(robot) if robot is not None else None
+    wst_cur = cur_j.get("wrist_flex.pos", 32.53) if cur_j else 32.53
+    lift_cur = cur_j.get("shoulder_lift.pos", -104.92) if cur_j else -104.92
+    is_upright_2d = (h_box >= int(w_box * 1.5) and abs(tilt_deg) <= 22.0 and (wst_cur < 18.0 or lift_cur > -92.0))
+
+    if is_upright_3d or is_upright_2d:
         is_upright = True
         is_lying_flat = False
         is_3d_diagonal = False
@@ -3709,29 +3717,25 @@ def main():
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
             if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
                 # Table-resting objects (top-down or steep approach):
-                # Pull back along the reach line so the gripper pads land squarely
-                # over the resting bottle neck without overshooting past it into empty air.
-                # Dynamic depth-proportional pullback: closer bottles (depth <= 190mm) use 30mm pullback;
-                # farther bottles scale pullback to compensate for perspective slant expansion and keep
-                # reach inside the ~250mm sweet spot where steep (-85°) top-down grasp is reachable.
-                depth_val = 190.0
-                if orient_3d.get("midpoint_cam") is not None:
-                    depth_val = float(orient_3d["midpoint_cam"][2])
-                elif xyz is not None:
-                    depth_val = float(xyz[2])
-                extra_pullback = max(0.0, (depth_val - 190.0) * 0.65)
-                base_pullback = abs(GRASP_FLAT_RADIAL_OFFSET_MM) + extra_pullback
+                # Table-resting objects (top-down or steep approach):
+                # Target the physical sweet spot (Dist ~ 248-254mm) where -85° top-down grasp is rigidly reachable.
+                # If raw deprojected distance exceeds 250mm due to 45° camera perspective slant, pull back
+                # towards 248mm (scaled by transverse angle). Never pull back below 248mm so it never falls short!
+                mid_base = orient_3d.get("midpoint_base")
+                raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 250.0
 
-                # Scale pullback by transverse component:
-                # - Horizontal bottle (|tilt| >= 45°): reach line is perpendicular to bottle axis -> full pullback across cylinder
-                # - Vertical flat bottle (|tilt| < 20°): reach line is parallel to bottle axis -> minimal pullback (grasp point is already at neck)
                 tilt_val = sizing.get("tilt_deg", 90.0) if sizing is not None else 90.0
                 transverse_scale = float(abs(math.sin(math.radians(tilt_val))))
-                scaled_pullback = base_pullback * transverse_scale
 
+                if raw_dist > 250.0:
+                    needed_pullback = (raw_dist - 248.0) * transverse_scale
+                else:
+                    needed_pullback = 0.0
+
+                scaled_pullback = float(np.clip(needed_pullback, 0.0, 55.0))
                 flat_rad_offset = -scaled_pullback
                 penetration_candidates = [
-                    flat_rad_offset,           # Dynamic pullback: scaled by transverse bottle orientation
+                    flat_rad_offset,           # Optimal pullback into [248, 254]mm sweet spot
                     flat_rad_offset + 5.0,     # fallback
                     flat_rad_offset + 10.0,    # fallback
                     flat_rad_offset + 15.0,    # fallback

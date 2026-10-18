@@ -2088,18 +2088,10 @@ def size_up_object(frame: np.ndarray | None,
             med_w1 = float(np.median(valid_w1)) if valid_w1 else body_width_mm
             med_w2 = float(np.median(valid_w2)) if valid_w2 else body_width_mm
 
-            abs_tilt = abs(tilt_deg)
-            if abs_tilt <= 35.0:
-                # Upright bottle: top in image (End 1, s_min) is ALWAYS the neck/cap
-                cap_is_end1 = True
-                recommended_pitch = 0.0  # Level horizontal approach (strictly parallel to ground)
-                height_pct = 75.0
-            else:
-                # Lying flat / diagonal bottle:
-                # The end with the smaller representative width is definitively the cone/cap!
-                cap_is_end1 = (med_w1 <= med_w2)
-                recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
-                height_pct = 50.0
+            # The cone/cap end is definitively the narrower end:
+            cap_is_end1 = (med_w1 <= med_w2)
+            recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
+            height_pct = 50.0
 
             # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
             if cap_is_end1:
@@ -2406,28 +2398,26 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     # - Upright bottle: stands vertically on tabletop (elev_deg >= 55°, v_span >= h_span * 1.15, abs(tilt_deg) < 30°)
     # - Lying flat bottle: rests horizontally on tabletop (elev_deg <= 40° or h_span >= v_span * 0.95 or abs(tilt_deg) >= 40° or w_box >= int(h_box * 1.15))
     # - 3D Diagonal bottle: genuinely propped up at an angle against an obstacle (elev_deg > 40° and v_span > h_span * 1.1 and abs(tilt_deg) < 40°)
-    if (v_span >= h_span * 1.25 and elev_deg >= 50.0 and abs(tilt_deg) < 30.0) or (elev_deg >= 65.0 and abs(tilt_deg) < 25.0):
+    # ── 3D Geometric Classification ──────────────────────────────────────────
+    # - Upright bottle: stands vertically on tabletop (v_span >= 120mm, elev_deg >= 55°, v_span >= h_span * 1.3)
+    # - Lying flat bottle: rests horizontally on tabletop (v_span <= 90mm — diameter of bottle cylinder, elev_deg <= 40°, or h_span >= v_span * 0.95)
+    # - 3D Diagonal bottle: genuinely propped up at an angle against an obstacle (v_span > 90mm and 40° < elev_deg < 65°)
+    if v_span >= 120.0 and v_span >= h_span * 1.3 and elev_deg >= 55.0:
         is_upright = True
         is_lying_flat = False
         is_3d_diagonal = False
-    elif (elev_deg <= 40.0) or (h_span >= v_span * 0.95) or (abs(tilt_deg) >= 40.0) or (w_box >= int(h_box * 1.15)):
+    elif (v_span <= 90.0) or (elev_deg <= 40.0) or (h_span >= v_span * 0.95) or (abs(tilt_deg) >= 40.0) or (w_box >= int(h_box * 1.15)):
         is_lying_flat = True
         is_upright = False
         is_3d_diagonal = False
-    elif 40.0 < elev_deg < 65.0:
+    elif (v_span > 90.0 and 40.0 < elev_deg < 65.0):
         is_3d_diagonal = True
         is_upright = False
         is_lying_flat = False
     else:
-        # Fallback based on 2D visual aspect ratio and tilt
-        if abs(tilt_deg) >= 35.0 or w_box >= h_box:
-            is_lying_flat = True
-            is_upright = False
-            is_3d_diagonal = False
-        else:
-            is_upright = True
-            is_lying_flat = False
-            is_3d_diagonal = False
+        is_lying_flat = True
+        is_upright = False
+        is_3d_diagonal = False
 
     # Approach pitch calculation:
     # - Upright bottle: 0.0° (strictly parallel to ground)
@@ -3635,7 +3625,7 @@ def main():
             # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
             # securely between the rubber gripper pads (~17mm clearance from rear servo face).
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
-            if orient_3d.get("is_lying_flat"):
+            if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
                 # Forward reach penetration along approach vector:
                 # Backed up to gentle penetration (5mm -> 2.5mm -> 0.0mm) so the claws
                 # gently encircle the resting bottle without colliding with or pushing it.

@@ -282,6 +282,11 @@ MAX_GRAB_DEPTH_MM = 380.0
 # firm grip without pushing or toppling.
 GRASP_PENETRATION_MM = 20.0
 
+# Radial reach offset for table-resting (lying flat / 3D diagonal) objects.
+# Negative (-ve) = pulls gripper back along reach line towards the robot base,
+# centering the gripper pads directly over the resting bottle neck and preventing overshoot.
+GRASP_FLAT_RADIAL_OFFSET_MM = -20.0
+
 # Preferred gripper approach pitch (degrees relative to horizontal table).
 # 0.0° = perfectly parallel/horizontal to ground (ideal for upright bottles, cups, cans).
 PREFERRED_GRAB_PITCH_DEG = 0.0
@@ -3258,6 +3263,8 @@ def main():
                         help=f"Target gripper closed angle in degrees (default: {GRIPPER_CLOSED_POS_DEG})")
     parser.add_argument("--lateral-offset", type=float, default=GRAB_LATERAL_OFFSET_MM,
                         help=f"Target lateral grasp offset in mm to the left perpendicular to reach line (default: {GRAB_LATERAL_OFFSET_MM})")
+    parser.add_argument("--radial-offset", type=float, default=None,
+                        help=f"Radial reach offset in mm along reach line for table grasps (default: {GRASP_FLAT_RADIAL_OFFSET_MM}mm)")
     parser.add_argument("--table-z", type=float, default=TABLE_FLOOR_Z_MM,
                         help=f"Tabletop surface height in mm below shoulder pivot (default: {TABLE_FLOOR_Z_MM})")
     args, unknown = parser.parse_known_args()
@@ -3819,10 +3826,18 @@ def main():
             # securely between the rubber gripper pads (~17mm clearance from rear servo face).
             # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
             if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
-                # Forward reach penetration along approach vector:
-                # Backed up to gentle penetration (5mm -> 2.5mm -> 0.0mm) so the claws
-                # gently encircle the resting bottle without colliding with or pushing it.
-                penetration_candidates = [5.0, 2.5, 0.0]
+                # Table-resting objects (top-down or steep approach):
+                # Pull back along the reach line so the gripper pads land squarely
+                # over the resting bottle neck without overshooting past it into empty air.
+                flat_rad_offset = getattr(args, "radial_offset", None)
+                if flat_rad_offset is None:
+                    flat_rad_offset = GRASP_FLAT_RADIAL_OFFSET_MM
+                penetration_candidates = [
+                    flat_rad_offset,           # -20.0mm: centers pads dead over resting bottle neck
+                    flat_rad_offset + 5.0,     # -15.0mm fallback
+                    flat_rad_offset + 10.0,    # -10.0mm fallback
+                    0.0,                       # neutral zero fallback
+                ]
             else:
                 # Upright bottle: level horizontal approach with full pad penetration
                 penetration_candidates = [
@@ -3934,10 +3949,13 @@ def main():
             if final_target is not None:
                 arm_x, arm_y, arm_z, pen_used = final_target
                 rho_t = math.sqrt(arm_x**2 + arm_y**2)
-                clearance_val = 37.0 - pen_used
-                grasp_type = f"TIP GRASP (~{clearance_val:.0f}mm servo clearance)"
+                if pen_used < 0:
+                    grasp_type = f"PULLBACK GRASP ({abs(pen_used):.0f}mm pullback along reach line)"
+                else:
+                    clearance_val = 37.0 - pen_used
+                    grasp_type = f"TIP GRASP (~{clearance_val:.0f}mm servo clearance)"
                 print(f"   🎯 Grasp Target: X={arm_x:+.0f}mm, Y={arm_y:+.0f}mm, Z={arm_z:+.0f}mm | Dist={rho_t:.0f}mm")
-                print(f"   📐 Penetration: {pen_used:.0f}mm ({grasp_type}) | Approach Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}°")
+                print(f"   📐 Penetration: {pen_used:+.0f}mm ({grasp_type}) | Approach Pitch={target_pitch:.1f}° | Wrist Roll={target_roll:.1f}°")
 
             if grab_pos is not None:
                 t_t2_ms = (time.perf_counter() - t_t2_start) * 1000.0

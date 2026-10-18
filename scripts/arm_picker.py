@@ -247,7 +247,7 @@ WS_Y_MIN_MM  = -280.0   # max lateral right
 WS_Z_MIN_MM  = -280.0   # lowest reachable height below shoulder pivot (supports low tables and desks)
 WS_Z_MAX_MM  =  300.0   # highest point straight up
 WS_RHO_MAX_MM =  390.0  # max horizontal extension from shoulder pivot (405mm theoretical minus margin)
-TABLE_FLOOR_Z_MM = -220.0  # fallback physical tabletop height (mm) when live camera depth unavailable
+TABLE_FLOOR_Z_MM = -138.0  # fallback physical tabletop height (mm) below shoulder pivot when live camera depth unavailable
 
 # ── RealSense D405 — Eye-in-Hand Calibration (T_cam_wrist) ──────────────────
 # Static 4×4 homogeneous transform: how the D405 is physically bolted to the wrist.
@@ -2101,22 +2101,22 @@ def size_up_object(frame: np.ndarray | None,
                 recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
                 height_pct = 50.0
 
-            # Once the cone/cap end is identified, locate the optimal grasp point right at the neck:
+            # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
             if cap_is_end1:
-                # Search bins 1 to 6 near End 1 for the minimum neck width
-                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(1, 7) if widths_mm[i] >= 15.0]
+                # Search bins 3 to 6 near End 1 for the neck cylinder (avoiding bin 1-2 extreme cap tip)
+                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(3, 7) if widths_mm[i] >= 18.0]
                 if neck_cands:
                     thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
                 else:
-                    s_grasp = s_min + 0.12 * L_px
+                    s_grasp = s_min + 0.15 * L_px
                     thinnest_width_mm = med_w1
             else:
-                # Search bins 23 to 28 near End 2 for the minimum neck width
-                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(23, 29) if widths_mm[i] >= 15.0]
+                # Search bins 23 to 26 near End 2 for the neck cylinder (avoiding bin 27-29 extreme cap tip)
+                neck_cands = [(widths_mm[i], bin_centers[i]) for i in range(23, 27) if widths_mm[i] >= 18.0]
                 if neck_cands:
                     thinnest_width_mm, s_grasp = min(neck_cands, key=lambda x: x[0])
                 else:
-                    s_grasp = s_max - 0.12 * L_px
+                    s_grasp = s_max - 0.15 * L_px
                     thinnest_width_mm = med_w2
 
             grasp_width_mm = thinnest_width_mm
@@ -2480,18 +2480,19 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
 
     # ── Live Table Floor Estimation from Real 3D Camera Depth ──────────────
     # Uses actual 3D points on the object resting on the table rather than a hardcoded height.
-    z_min_sample = float(np.min(pts_b[:, 2]))
+    # Use 15th percentile to reject single-pixel depth dropouts / shadow noise.
+    z_15pct = float(np.percentile(pts_b[:, 2], 15)) if len(pts_b) >= 10 else float(np.min(pts_b[:, 2]))
     body_w = 70.0
     if sizing is not None:
         body_w = sizing.get("grasp_width_mm", sizing.get("body_width_mm", 70.0))
     cyl_dia = float(np.clip(body_w, 45.0, 85.0))
-    # Table floor surface directly under the resting bottle:
-    live_table_z = z_min_sample - 5.0
+    # Table floor surface directly under the resting bottle (clamped to physical tabletop range [-145, -132] mm):
+    live_table_z = float(np.clip(z_15pct - 5.0, -145.0, -132.0))
 
     if is_upright:
         # Upright bottle: grasp at the slim neck (+35mm to +45mm above mid-height, within safe reach)
         neck_offset = min(45.0, 0.25 * max(v_span, 140.0))
-        neck_z = mid_z_b + neck_offset
+        neck_z = max(mid_z_b + neck_offset, -90.0)
         midpoint_base = (mid_x_b, mid_y_b, float(neck_z))
     else:
         # Lying flat / diagonal bottle:
@@ -2502,9 +2503,9 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
             target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
 
         # Live vertical grasp height:
-        # Center gripper at live measured vertical center of bottle (mid_z_b)
-        # while keeping fingertips safely >= 18mm above the live table surface.
-        safe_z_b = max(live_table_z + 18.0, mid_z_b - 5.0)
+        # Center gripper at safe height above table, strictly bounded to prevent digging into surface.
+        # In Attempt 1 ("genuinely perfect"), safe_z was -119mm (+17.7mm above table).
+        safe_z_b = max(live_table_z + 20.0, -122.0)
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
@@ -3674,6 +3675,7 @@ def main():
                     arm_y = mid_y
                     live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
                     table_floor_z = live_tbl_z if live_tbl_z is not None else TABLE_FLOOR_Z_MM
+                    table_floor_z = float(np.clip(table_floor_z, -145.0, -132.0))
 
                     if orient_3d["is_lying_flat"] or orient_3d.get("is_3d_diagonal"):
                         # Lying flat or 3D diagonal: penetrate horizontally along reach line (pan)
@@ -3712,12 +3714,13 @@ def main():
                 # ── Dynamic Tabletop Safeguard with Jaw Droop Protection ───────────
                 # When wrist is pitched and rolled, lower jaw tip hangs lower than wrist/grasp centerline.
                 # Droop = 45mm * |sin(delta_roll)| * cos(pitch).
-                # Table surface protection guarantees fingertip stays >= 8mm above physical tabletop surface!
+                # Table surface protection guarantees fingertip stays >= 15mm above physical tabletop surface and >= -125mm!
                 live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
                 table_floor_z = live_tbl_z if live_tbl_z is not None else TABLE_FLOOR_Z_MM
+                table_floor_z = float(np.clip(table_floor_z, -145.0, -132.0))
                 droll_actual = target_roll - (START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27))
                 jaw_droop_mm = 45.0 * abs(math.sin(math.radians(droll_actual))) * math.cos(math.radians(target_pitch))
-                min_safe_z = table_floor_z + jaw_droop_mm + 10.0
+                min_safe_z = max(table_floor_z + jaw_droop_mm + 15.0, -125.0)
                 if arm_z < min_safe_z:
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.1f}mm (< {min_safe_z:+.1f}mm with {jaw_droop_mm:.1f}mm jaw droop) → elevating to {min_safe_z:+.1f}mm")
                     arm_z = min_safe_z

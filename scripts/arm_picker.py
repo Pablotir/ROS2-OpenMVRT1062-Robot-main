@@ -298,7 +298,9 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 48.0
+GRAB_LATERAL_OFFSET_MM = 48.0            # 48.0mm default (verified perfect for vertical flat)
+GRAB_LATERAL_OFFSET_STANDING_MM = 76.2   # ~3.0 inches (76.2mm) for standing bottle
+GRAB_LATERAL_OFFSET_RIGHT_MM = 76.2      # ~3.0 inches (76.2mm) for pointed-right flat bottle
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -3799,11 +3801,19 @@ def main():
                 # ── Apply true lateral claw offset (strictly perpendicular to reach line) ──
                 # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
                 # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
-                if abs(GRAB_LATERAL_OFFSET_MM) > 0.01:
+                tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
+                if orient_3d.get("is_upright"):
+                    lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM  # ~3.0 inches (76.2mm)
+                elif tilt_val <= -20.0:
+                    lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM     # ~3.0 inches (76.2mm)
+                else:
+                    lat_offset = GRAB_LATERAL_OFFSET_MM           # 48.0mm (verified perfect)
+
+                if abs(lat_offset) > 0.01:
                     pan_t = math.atan2(arm_y, arm_x)
-                    arm_x += -GRAB_LATERAL_OFFSET_MM * math.sin(pan_t)
-                    arm_y +=  GRAB_LATERAL_OFFSET_MM * math.cos(pan_t)
-                    print(f"   📐 Applied lateral grasp offset: {GRAB_LATERAL_OFFSET_MM:+.1f}mm (LEFT claw clearance shift perpendicular to reach)")
+                    arm_x += -lat_offset * math.sin(pan_t)
+                    arm_y +=  lat_offset * math.cos(pan_t)
+                    print(f"   📐 Applied lateral grasp offset: {lat_offset:+.1f}mm (LEFT claw clearance shift perpendicular to reach)")
 
                 # ── Dynamic Tabletop Safeguard with Jaw Droop Protection ───────────
                 # When wrist is pitched and rolled, lower jaw tip hangs lower than wrist/grasp centerline.

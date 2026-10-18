@@ -303,7 +303,9 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # - You can also pass `--lateral-offset <mm>` on the CLI without editing this file!
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 48.0
+GRAB_LATERAL_OFFSET_MM = 48.0            # 48.0mm default (verified perfect for vertical flat)
+GRAB_LATERAL_OFFSET_STANDING_MM = 76.2   # ~3.0 inches (76.2mm) for standing bottle
+GRAB_LATERAL_OFFSET_RIGHT_MM = 76.2      # ~3.0 inches (76.2mm) for pointed-right flat bottle
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -3276,8 +3278,8 @@ def main():
     parser.add_argument("--interactive", action="store_true", help="Show interactive menu")
     parser.add_argument("--gripper-close", type=float, default=GRIPPER_CLOSED_POS_DEG,
                         help=f"Target gripper closed angle in degrees (default: {GRIPPER_CLOSED_POS_DEG})")
-    parser.add_argument("--lateral-offset", type=float, default=GRAB_LATERAL_OFFSET_MM,
-                        help=f"Target lateral grasp offset in mm to the left perpendicular to reach line (default: {GRAB_LATERAL_OFFSET_MM})")
+    parser.add_argument("--lateral-offset", type=float, default=None,
+                        help="Target lateral grasp offset in mm to the left perpendicular to reach line (default: adaptive, 48mm or 76mm)")
     parser.add_argument("--radial-offset", type=float, default=None,
                         help=f"Radial reach offset in mm along reach line for table grasps (default: {GRASP_FLAT_RADIAL_OFFSET_MM}mm)")
     parser.add_argument("--table-z", type=float, default=TABLE_FLOOR_Z_MM,
@@ -3924,7 +3926,16 @@ def main():
                 # ── Apply true lateral claw offset (strictly perpendicular to reach line) ──
                 # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
                 # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
-                lat_offset = getattr(args, "lateral_offset", GRAB_LATERAL_OFFSET_MM)
+                lat_offset = getattr(args, "lateral_offset", None) if "args" in locals() else None
+                if lat_offset is None:
+                    tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
+                    if orient_3d.get("is_upright"):
+                        lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM  # ~3.0 inches (76.2mm)
+                    elif tilt_val <= -20.0:
+                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM     # ~3.0 inches (76.2mm)
+                    else:
+                        lat_offset = GRAB_LATERAL_OFFSET_MM           # 48.0mm (verified perfect)
+
                 if abs(lat_offset) > 0.01:
                     pan_t = math.atan2(arm_y, arm_x)
                     arm_x += -lat_offset * math.sin(pan_t)

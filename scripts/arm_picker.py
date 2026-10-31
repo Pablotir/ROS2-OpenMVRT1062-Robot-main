@@ -3649,7 +3649,8 @@ def main():
                         robot=robot,
                         cap=cap,
                         locked_bbox=(x1_a, y1_a, x2_a, y2_a),
-                        target_desc=TARGET_DESC
+                        target_desc=TARGET_DESC,
+                        seg_mask=seg_mask
                     )
                     if anygrasp_j is not None and anygrasp_plan.get("success"):
                         grab_pos = anygrasp_j

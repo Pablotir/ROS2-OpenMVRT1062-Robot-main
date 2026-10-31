@@ -100,6 +100,9 @@ WRIST_FLEX_MIN_DEG  = -120.0
 WRIST_FLEX_MAX_DEG  =  120.0
 WRIST_ROLL_MIN_DEG  = -150.0
 WRIST_ROLL_MAX_DEG  =  150.0
+HARDWARE_NEUTRAL_ROLL_DEG = 29.27  # Physical servo neutral horizontal roll angle (homing_offset -1120)
+GRAB_LATERAL_OFFSET_STANDING_MM = 76.2  # Calibrated hardware lateral offset for upright standing (mm)
+GRAB_LATERAL_OFFSET_FLAT_MM = 91.2      # Calibrated hardware lateral offset for flat table grasp (mm)
 
 D405_MIN_RANGE_M    = 0.07      # RealSense D405 optical min range (0.07 m = 70 mm)
 D405_MAX_RANGE_M    = 0.50      # Close-range workspace max range (0.50 m = 500 mm)
@@ -334,7 +337,8 @@ class SemanticConfirmationGate:
     def segment_and_confirm(self,
                             color_img: np.ndarray,
                             bbox: Tuple[int, int, int, int],
-                            target_label: str = "bottle") -> Tuple[bool, Optional[np.ndarray], float, Dict[str, Any]]:
+                            target_label: str = "bottle",
+                            precomputed_mask: Optional[np.ndarray] = None) -> Tuple[bool, Optional[np.ndarray], float, Dict[str, Any]]:
         """
         Runs pixel-accurate segmentation inside the locked bbox and confirms semantic identity.
         Returns (confirmed: bool, mask: np.ndarray (H, W), conf: float, meta: dict).
@@ -353,7 +357,10 @@ class SemanticConfirmationGate:
         conf = 0.0
         class_name = target_label
 
-        if self.yolo_model is not None:
+        if precomputed_mask is not None and np.any(precomputed_mask > 0):
+            mask = (precomputed_mask > 0).astype(np.uint8) * 255
+            conf = 0.95
+        elif self.yolo_model is not None:
             roi = color_img[y1:y2, x1:x2]
             results = self.yolo_model(roi, verbose=False, conf=0.35)
             if len(results) > 0 and results[0].masks is not None:
@@ -430,6 +437,13 @@ class SemanticConfirmationGate:
 
         if len(v_obj) < 30:
             raise ValueError(f"Insufficient valid depth points in object mask ({len(v_obj)} points)")
+
+        z_raw_obj = depth_mm[v_obj, u_obj]
+        z_min_bound = np.percentile(z_raw_obj, 5)
+        # Filter points that see through clear plastic / glass directly onto the background table
+        front_shell = z_raw_obj <= (z_min_bound + 65.0)
+        v_obj = v_obj[front_shell]
+        u_obj = u_obj[front_shell]
 
         z_obj = depth_mm[v_obj, u_obj]
         x_obj = (u_obj - cx) * z_obj / fx
@@ -633,21 +647,20 @@ class PretrainedGraspEngine:
 
     def _vectorized_antipodal_synthesis(self,
                                         P_obj: np.ndarray,
-                                        num_grasps: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                        num_grasps: int,
+                                        target_label: str = "bottle") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Vectorized antipodal grasp generator across object point cloud.
-        Constructs physically aligned antipodal 6-DoF grasp frames in SE(3):
-          - z_approach: pointing from robot gripper towards object pinch center
-          - x_closing:  tangential/closing axis between jaws
-          - y_thickness: z cross x
+        Aligns approach azimuths with 5-DoF reach plane taking into account
+        the asymmetric stationary finger offset.
         """
         N = P_obj.shape[0]
         com = np.mean(P_obj, axis=0)
 
-        # Base azimuth and radial unit vectors
+        # Base azimuth and radial distance
+        R_obj = math.hypot(com[0], com[1])
         q1_obj = np.arctan2(com[1], com[0])
-        u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
-        u_tang = np.array([-np.sin(q1_obj), np.cos(q1_obj), 0.0])
+        theta_asym = float(np.arcsin(np.clip(GRAB_LATERAL_OFFSET_STANDING_MM / max(R_obj, 100.0), -0.85, 0.85)))
 
         # Principal axis & 3D dimension analysis
         cov = np.cov((P_obj - com).T)
@@ -661,13 +674,9 @@ class PretrainedGraspEngine:
             v_main *= -1.0
 
         is_standing_or_tilted = abs(v_main[2]) > 0.35
-        is_tall_elongated = is_standing_or_tilted and (aspect_ratio >= 1.4) and (L_major >= 75.0)
+        is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
+        is_tall_elongated = (is_standing_or_tilted and (aspect_ratio >= 1.25) and (L_major >= 50.0)) or (is_standing_or_tilted and is_cylinder_name)
         is_compact = is_standing_or_tilted and not is_tall_elongated
-
-        # Surface normal in radial reach plane perpendicular to v_main
-        v_rad_comp = float(np.dot(v_main[:2], u_rad[:2]))
-        v_z_comp = float(v_main[2])
-        normal_pitch_rad = math.atan2(-v_rad_comp, v_z_comp)
 
         # Sample pinch centers across object points
         sample_indices = np.random.choice(N, size=num_grasps, replace=(N < num_grasps))
@@ -677,59 +686,79 @@ class PretrainedGraspEngine:
         T_grasps = np.tile(np.eye(4, dtype=np.float64), (num_grasps, 1, 1))
 
         if is_tall_elongated:
-            # Continuously center approach pitch around the object's true 3D surface normal!
-            # Clamped between horizontal (-5 deg) and steep downward (-75 deg)
-            center_pitch = float(np.clip(normal_pitch_rad, np.radians(-75.0), np.radians(-10.0)))
-            pitches = np.linspace(center_pitch - np.radians(20.0), center_pitch + np.radians(20.0), num_grasps)
-            pitches = np.clip(pitches, np.radians(-85.0), np.radians(0.0))
+            # Side grasp approach for standing/tilted cylinders:
+            # Align approach azimuth with reach plane through wrist: q1_obj + theta_asym
+            half = num_grasps // 2
+            az1 = np.linspace(q1_obj + 0.70 * theta_asym, q1_obj + 1.15 * theta_asym, half)
+            az2 = np.linspace(q1_obj - 1.15 * theta_asym, q1_obj - 0.70 * theta_asym, num_grasps - half)
+            azimuths = np.concatenate([az1, az2])
+            np.random.shuffle(azimuths)
+
+            # Continuous side approach pitches: between -15 deg and -45 deg
+            pitches = np.linspace(np.radians(-15.0), np.radians(-45.0), num_grasps)
             np.random.shuffle(pitches)
 
-            # Continuous roll variations around radial azimuth
-            rolls = np.linspace(np.radians(-25.0), np.radians(25.0), num_grasps)
-            np.random.shuffle(rolls)
+            u_rx = np.cos(azimuths)
+            u_ry = np.sin(azimuths)
+            u_tx = -np.sin(azimuths)
+            u_ty = np.cos(azimuths)
 
-            z_app_x = np.cos(pitches) * u_rad[0]
-            z_app_y = np.cos(pitches) * u_rad[1]
+            z_app_x = np.cos(pitches) * u_rx
+            z_app_y = np.cos(pitches) * u_ry
             z_app_z = np.sin(pitches)
             z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
 
-            x_close_base = np.tile(u_tang, (num_grasps, 1))
-            dot_zx = np.sum(z_approach * x_close_base, axis=-1, keepdims=True)
-            x_closing = x_close_base - dot_zx * z_approach
-            x_closing /= (np.linalg.norm(x_closing, axis=-1, keepdims=True) + 1e-8)
+            x_closing = np.stack([u_tx, u_ty, np.zeros(num_grasps)], axis=-1)
             y_thickness = np.cross(z_approach, x_closing)
 
         elif is_compact:
             # Compact 3D objects (balls, cubes, apples, mugs):
-            # Approach radially towards the 3D Center of Mass across wide pitch range (-10 deg to -75 deg)
-            center_pitch = float(np.clip(normal_pitch_rad, np.radians(-75.0), np.radians(-30.0)))
-            pitches = np.linspace(center_pitch - np.radians(25.0), center_pitch + np.radians(25.0), num_grasps)
-            pitches = np.clip(pitches, np.radians(-85.0), np.radians(0.0))
+            half = num_grasps // 2
+            az1 = np.linspace(q1_obj + 0.50 * theta_asym, q1_obj + 1.10 * theta_asym, half)
+            az2 = np.linspace(q1_obj - 1.10 * theta_asym, q1_obj - 0.50 * theta_asym, num_grasps - half)
+            azimuths = np.concatenate([az1, az2])
+            np.random.shuffle(azimuths)
+
+            pitches = np.linspace(np.radians(-25.0), np.radians(-60.0), num_grasps)
             np.random.shuffle(pitches)
 
-            z_app_x = np.cos(pitches) * u_rad[0]
-            z_app_y = np.cos(pitches) * u_rad[1]
+            u_rx = np.cos(azimuths)
+            u_ry = np.sin(azimuths)
+            u_tx = -np.sin(azimuths)
+            u_ty = np.cos(azimuths)
+
+            z_app_x = np.cos(pitches) * u_rx
+            z_app_y = np.cos(pitches) * u_ry
             z_app_z = np.sin(pitches)
             z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
 
-            x_close_base = np.tile(u_tang, (num_grasps, 1))
-            dot_zx = np.sum(z_approach * x_close_base, axis=-1, keepdims=True)
-            x_closing = x_close_base - dot_zx * z_approach
-            x_closing /= (np.linalg.norm(x_closing, axis=-1, keepdims=True) + 1e-8)
+            x_closing = np.stack([u_tx, u_ty, np.zeros(num_grasps)], axis=-1)
             y_thickness = np.cross(z_approach, x_closing)
 
         else:
             # Flat objects lying on table (phones, tools, boxes, lying bottles):
-            # Top-down plunge approach centered around -80 deg to -85 deg
-            pitches = np.linspace(np.radians(-88.0), np.radians(-65.0), num_grasps)
+            # Pull back candidate pinch centers along reach line if outside 2-link reach envelope
+            excess_reach = max(0.0, R_obj - 248.0)
+            if excess_reach > 0.0:
+                pullback_reach = float(np.clip(15.0 + excess_reach, 15.0, 50.0))
+                u_radial = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
+                pinch_centers -= pullback_reach * u_radial
+
+            # Top-down plunge approach centered around -75 deg to -88 deg
+            pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
             np.random.shuffle(pitches)
 
+            # Clamp across narrow width perpendicular to planar tilt
+            tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
+            close_rad = tilt_plane_rad + math.pi / 2.0
+            x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
+
+            u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
             z_app_x = np.cos(pitches) * u_rad[0]
             z_app_y = np.cos(pitches) * u_rad[1]
             z_app_z = np.sin(pitches)
             z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
 
-            x_close_base = np.tile(u_tang, (num_grasps, 1))
             dot_zx = np.sum(z_approach * x_close_base, axis=-1, keepdims=True)
             x_closing = x_close_base - dot_zx * z_approach
             x_closing /= (np.linalg.norm(x_closing, axis=-1, keepdims=True) + 1e-8)
@@ -740,11 +769,9 @@ class PretrainedGraspEngine:
         T_grasps[:, :3, 2] = z_approach
         T_grasps[:, :3, 3] = pinch_centers
 
-        # Grasp width scaled to estimated object width (clamped to gripper capacity [12mm, 65mm])
         base_width = float(np.clip(W_inter, 20.0, 60.0))
         widths = np.clip(np.random.normal(loc=base_width, scale=4.0, size=num_grasps), 15.0, 70.0)
         scores = np.clip(np.random.normal(loc=0.88, scale=0.05, size=num_grasps), 0.70, 0.99)
-
         return T_grasps, scores, widths
 
 
@@ -843,12 +870,10 @@ class VectorizedSO101GraspSolver:
         z_approach = T_grasps[:, :3, 2]
         theta_pitch = np.arcsin(np.clip(z_approach[:, 2], -1.0, 1.0))
 
-        # 2. Continuous lateral offset delta_lat(w, pitch)
-        # Smooth trigonometric bridge from +76.2mm (upright) to +91.2mm (flat table) + width clearance
+        # 2. Continuous lateral offset delta_lat(pitch)
+        # Smooth trigonometric bridge from +76.2mm (upright standing) to +91.2mm (flat table)
         sin_sq_pitch = np.sin(theta_pitch) ** 2
-        delta_lat = (76.2 + (91.2 - 76.2) * sin_sq_pitch +
-                     0.5 * (widths - GRIPPER_NOMINAL_WIDTH_MM) +
-                     GRIPPER_CLEARANCE_MARGIN_MM)
+        delta_lat = GRAB_LATERAL_OFFSET_STANDING_MM + (GRAB_LATERAL_OFFSET_FLAT_MM - GRAB_LATERAL_OFFSET_STANDING_MM) * sin_sq_pitch
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), np.full(N, RADIAL_PULLBACK_MM), np.ones(N)], axis=-1)
@@ -861,19 +886,34 @@ class VectorizedSO101GraspSolver:
         clearance_1 = P_stat_base_1[:, 2] - z_tbl
         clearance_2 = P_stat_base_2[:, 2] - z_tbl
 
-        use_hyp2 = clearance_2 > clearance_1
+        # Precompute wrist targets for both hypotheses
+        T_asym_1 = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
+        T_asym_1[:, 0, 3] = delta_lat
+        T_asym_1[:, 2, 3] = RADIAL_PULLBACK_MM
+        T_w_1 = np.matmul(T_grasps, T_asym_1)
+
+        T_asym_2 = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
+        T_asym_2[:, 0, 0] = -1.0
+        T_asym_2[:, 1, 1] = -1.0
+        T_asym_2[:, 0, 3] = -delta_lat
+        T_asym_2[:, 2, 3] = RADIAL_PULLBACK_MM
+        T_w_2 = np.matmul(T_grasps, T_asym_2)
+
+        r1 = np.hypot(T_w_1[:, 0, 3], T_w_1[:, 1, 3])
+        r2 = np.hypot(T_w_2[:, 0, 3], T_w_2[:, 1, 3])
+
+        # Multi-objective hypothesis selection:
+        # 1. Primary: prioritize substantial table clearance difference (> 12mm)
+        # 2. Secondary: if clearances are equal (e.g. flat objects), select reachable hypothesis inside 2-link envelope
+        table_diff = clearance_2 - clearance_1
+        use_hyp2 = np.where(
+            table_diff > 12.0, True,
+            np.where(table_diff < -12.0, False, r2 < r1)
+        )
         chosen_hypotheses = np.where(use_hyp2, 2, 1)
 
-        # 4. Construct local asymmetric transformation matrix T_asym_local (N, 4, 4)
-        T_asym_local = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
-        T_asym_local[use_hyp2, 0, 0] = -1.0
-        T_asym_local[use_hyp2, 1, 1] = -1.0
-        T_asym_local[use_hyp2, 0, 3] = -delta_lat[use_hyp2]
-        T_asym_local[~use_hyp2, 0, 3] = delta_lat[~use_hyp2]
-        T_asym_local[:, 2, 3] = RADIAL_PULLBACK_MM
-
-        # Batched matrix multiplication: T_wrist_target = T_grasp @ T_asym_local
-        T_wrist_targets = np.matmul(T_grasps, T_asym_local)
+        # Batched assignment of selected wrist targets
+        T_wrist_targets = np.where(use_hyp2[:, None, None], T_w_2, T_w_1)
 
         return T_wrist_targets, delta_lat, chosen_hypotheses
 
@@ -943,12 +983,15 @@ class VectorizedSO101GraspSolver:
         elbow_deg = -np.degrees(t2) - 81.0
         wrist_deg = np.degrees(t1 + t2 - theta_pitch) - 5.0
 
-        # 5. Extract Wrist Roll Angle q5
+        # 5. Extract Wrist Roll Angle q5 mapped to physical servo neutral (+29.27 deg)
         x_closing = T_wrist_targets[:, :3, 0]
         y_tool_ref = np.cross(z_proj_hat, n_plane)
         roll_rad = np.arctan2(np.sum(x_closing * y_tool_ref, axis=-1),
                               np.sum(x_closing * n_plane, axis=-1))
-        roll_deg = -np.degrees(roll_rad)
+        raw_roll_deg = -np.degrees(roll_rad)
+        # Normalize into [-90, +90] relative to neutral
+        norm_roll_deg = ((raw_roll_deg + 90.0) % 180.0) - 90.0
+        roll_deg = np.clip(HARDWARE_NEUTRAL_ROLL_DEG + norm_roll_deg, WRIST_ROLL_MIN_DEG, WRIST_ROLL_MAX_DEG)
 
         # 6. Tabletop Clearance Guard (evaluated from exact 3D orientation of fingertips and silicone pads)
         y_thickness = T_wrist_targets[:, :3, 1]
@@ -1037,10 +1080,14 @@ class VectorizedSO101GraspSolver:
             S_height_com = np.exp(-((h_rel - 0.68) ** 2) / (2.0 * (0.09 ** 2)))
 
             # 3D Anti-Overshoot Cap Guard:
-            # Disqualify grasps within 30.0 mm of top cap on horizontal/diagonal approach (> -70 deg)
+            # Disqualify grasps within 30.0 mm of top cap
             cap_guard_dist = min(30.0, 0.20 * total_height)
-            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) & (theta_pitch_deg > -70.0)
+            near_top_cap = dist_from_top_cap_mm < cap_guard_dist
             S_height_com[near_top_cap] = -1.0
+
+            # Penalize steep claw-machine vertical plunges from above for standing tall objects
+            steep_top_down = theta_pitch_deg < -55.0
+            S_height_com[steep_top_down] -= 1.0
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1137,7 +1184,8 @@ class ThreeStageAnyGraspPipeline:
                        intrinsics: Dict[str, float],
                        q_current: Dict[str, float],
                        target_label: str = "bottle",
-                       depth_scale: float = 0.001) -> Dict[str, Any]:
+                       depth_scale: float = 0.001,
+                       seg_mask: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
         Executes end-to-end Three-Stage Pipeline on locked target.
         Returns execution plan dictionary.
@@ -1151,7 +1199,8 @@ class ThreeStageAnyGraspPipeline:
         confirmed, mask, sem_conf, affordance_meta = self.stage1_gate.segment_and_confirm(
             color_img=color_img,
             bbox=locked_bbox,
-            target_label=target_label
+            target_label=target_label,
+            precomputed_mask=seg_mask
         )
 
         if not confirmed or mask is None:
@@ -1235,7 +1284,8 @@ def get_global_pipeline() -> ThreeStageAnyGraspPipeline:
 def execute_tier2_anygrasp(robot,
                            cap,
                            locked_bbox: Tuple[int, int, int, int],
-                           target_desc: str = "bottle") -> Tuple[Optional[Dict[str, float]], Dict[str, Any]]:
+                           target_desc: str = "bottle",
+                           seg_mask: Optional[np.ndarray] = None) -> Tuple[Optional[Dict[str, float]], Dict[str, Any]]:
     """
     Seamless drop-in replacement for legacy Tier 2 in arm_picker.py.
     Triggered immediately when Tier 1 visual servoing locks the target:
@@ -1281,7 +1331,8 @@ def execute_tier2_anygrasp(robot,
         intrinsics=intrinsics_dict,
         q_current=q_current,
         target_label=target_desc,
-        depth_scale=scale
+        depth_scale=scale,
+        seg_mask=seg_mask
     )
 
     pipeline.profiler.print_summary()

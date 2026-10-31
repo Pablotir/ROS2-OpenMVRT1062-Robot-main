@@ -2201,36 +2201,40 @@ def size_up_object(frame: np.ndarray | None,
 
             if is_upright_posture:
                 recommended_pitch = 0.0    # Level horizontal approach for upright standing bottle
-                height_pct = 82.0          # Grasp at slim neck (~82% height beneath cap)
+                height_pct = 55.0          # Grasp at stable cylinder waist (~55% height)
+                # For upright standing bottles (right-side up or upside-down), target the solid cylindrical waist:
+                s_grasp = (s_min + s_max) / 2.0
+                mid_t_grasp = 0.0
+                grasp_width_mm = body_width_mm
             else:
                 recommended_pitch = -85.0  # Steep top-down approach for lying flat bottle
                 height_pct = 50.0
 
-            # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
-            if cap_is_end1:
-                # Search bins 4 to 8 near End 1 for the neck cylinder (avoiding extreme cap tip in bins 0-3)
-                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(4, 9) if widths_mm[i] >= 16.0]
-                if neck_cands:
-                    best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
-                    thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
-                    s_grasp += 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
+                # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
+                if cap_is_end1:
+                    # Search bins 4 to 8 near End 1 for the neck cylinder (avoiding extreme cap tip in bins 0-3)
+                    neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(4, 9) if widths_mm[i] >= 16.0]
+                    if neck_cands:
+                        best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
+                        thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
+                        s_grasp += 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
+                    else:
+                        s_grasp = s_min + 0.18 * L_px
+                        mid_t_grasp = 0.0
+                        thinnest_width_mm = med_w1
                 else:
-                    s_grasp = s_min + 0.18 * L_px
-                    mid_t_grasp = 0.0
-                    thinnest_width_mm = med_w1
-            else:
-                # Search bins 21 to 25 near End 2 for the neck cylinder (avoiding extreme cap tip in bins 26-29)
-                neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(21, 26) if widths_mm[i] >= 16.0]
-                if neck_cands:
-                    best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
-                    thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
-                    s_grasp -= 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
-                else:
-                    s_grasp = s_max - 0.18 * L_px
-                    mid_t_grasp = 0.0
-                    thinnest_width_mm = med_w2
+                    # Search bins 21 to 25 near End 2 for the neck cylinder (avoiding extreme cap tip in bins 26-29)
+                    neck_cands = [(widths_mm[i], bin_centers[i], mid_ts[i]) for i in range(21, 26) if widths_mm[i] >= 16.0]
+                    if neck_cands:
+                        best_cand = min(neck_cands, key=lambda x: abs(x[0] - 28.0) if x[0] <= 45.0 else x[0])
+                        thinnest_width_mm, s_grasp, mid_t_grasp = best_cand
+                        s_grasp -= 0.03 * L_px  # Inward bias (~6mm) into neck cylinder away from cap edge
+                    else:
+                        s_grasp = s_max - 0.18 * L_px
+                        mid_t_grasp = 0.0
+                        thinnest_width_mm = med_w2
 
-            grasp_width_mm = thinnest_width_mm
+                grasp_width_mm = thinnest_width_mm
             # Optimal 2D grasp point centered on the neck cylinder (including minor-axis centerline):
             opt_x = int(np.clip(x1 + c_x + s_grasp * v_maj[0] + mid_t_grasp * v_min[0], x1 + 2, x2 - 2))
             opt_y = int(np.clip(y1 + c_y + s_grasp * v_maj[1] + mid_t_grasp * v_min[1], y1 + 2, y2 - 2))
@@ -2614,18 +2618,32 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     live_table_z = float(np.clip(z_15pct - 5.0, -250.0, -80.0))
 
     if is_upright:
-        # Upright standing bottle: stands vertically on tabletop from live_table_z to (live_table_z + h_calc).
-        # Grasp at the slim neck cylinder directly beneath the cap (~82% of bottle height, ~35mm below cap top).
-        h_bottle = 210.0
+        # Upright standing bottle (right-side up or upside-down):
+        # Grasp at the stable cylindrical waist (~55% of bottle height above tabletop).
+        # Targeting the waist guarantees:
+        # 1) Solid body grip for both upright and upside-down bottles (waist is uniform cylinder).
+        # 2) Completely prevents grabbing empty air above the cap or sitting on top of the inverted base.
+        # 3) Plenty of clearance above the tabletop (>45mm) and below the top rim (>30mm).
+        h_bottle = 200.0
         if sizing is not None and "height_mm" in sizing:
             h_bottle = float(sizing["height_mm"])
-        h_bottle = float(np.clip(h_bottle, 140.0, 290.0))
+        h_bottle = float(np.clip(h_bottle, 110.0, 260.0))
 
-        # Target neck grasp height above tabletop:
-        neck_height_above_table = max(h_bottle - 38.0, 0.82 * h_bottle)
-        safe_z_b = live_table_z + neck_height_above_table
+        # Target waist grasp height above tabletop:
+        waist_height_above_table = 0.55 * h_bottle
+        safe_z_b = live_table_z + waist_height_above_table
+
+        # Guard with measured 3D point bounds on the object:
+        if len(pts_b) >= 3:
+            z_top = float(np.max(pts_b[:, 2]))
+            z_bot = float(np.min(pts_b[:, 2]))
+            # Centerline must remain >= 20mm below highest detected surface point (never grabs air above bottle)
+            safe_z_b = min(safe_z_b, z_top - 20.0)
+            # Centerline must remain >= 20mm above lowest detected surface point (never hits table)
+            safe_z_b = max(safe_z_b, z_bot + 20.0)
+
         # Clamp within safe physical workspace bounds
-        safe_z_b = float(np.clip(safe_z_b, live_table_z + 40.0, WS_Z_MAX_MM - 20.0))
+        safe_z_b = float(np.clip(safe_z_b, live_table_z + 30.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
     else:
         # Lying flat / diagonal bottle:
@@ -3885,14 +3903,15 @@ def main():
                     0.0,                       # neutral zero fallback
                 ]
             else:
-                # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
-                # Base penetration: +5.0mm (was +20.0mm; backed up by 15mm to prevent crowding or toppling close bottles)
+                # Upright standing bottle (right-side up or upside-down):
+                # Backed up by 20mm (-15.0mm penetration) from previous +5.0mm so the rubber
+                # fingertip pads grip the bottle waist with full clearance from the claw servo hub.
                 penetration_candidates = [
-                    5.0,                          # +5.0mm: fingertips/pads clamp securely with ~32mm servo clearance
-                    2.0,                          # +2.0mm: close bottle fallback
-                    0.0,                          #  0.0mm: exact surface edge
-                    -5.0,                         # -5.0mm: light pullback for very close bottles
-                    8.0,                          # +8.0mm: deeper grip fallback
+                    -15.0,                        # -15.0mm: optimal 20mm pullback; pads clamp bottle waist securely
+                    -20.0,                        # -20.0mm: extra pullback for wider/closer bottles
+                    -10.0,                        # -10.0mm: fallback
+                    -25.0,                        # -25.0mm: deep pullback fallback
+                    -5.0,                         #  -5.0mm: fallback
                 ]
             grab_pos = None
             final_target = None
@@ -3978,8 +3997,8 @@ def main():
                     arm_z = min_safe_z
 
                 # Multi-height candidate search for standing upright bottle:
-                # Tries optimal slim neck beneath cap (~82% height) first, falling back to 75% or 70% if needed
-                z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0] if orient_3d.get("is_upright") else [arm_z]
+                # Tries optimal waist (~55% height) first, falling back to 45% or 65% if needed
+                z_candidates = [arm_z, arm_z - 15.0, arm_z + 15.0] if orient_3d.get("is_upright") else [arm_z]
                 for trial_z in z_candidates:
                     cur_z = max(trial_z, min_safe_z)
                     if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:

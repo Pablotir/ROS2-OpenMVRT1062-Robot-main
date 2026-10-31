@@ -2634,27 +2634,28 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         h_bottle = 200.0
         if sizing is not None and "height_mm" in sizing:
             h_bottle = float(sizing["height_mm"])
-        h_bottle = float(np.clip(h_bottle, 110.0, 260.0))
+        h_bottle = float(np.clip(h_bottle, 120.0, 260.0))
 
-        # Target neck grasp height above tabletop:
+        # Target neck grasp height directly from tabletop and bottle height:
         neck_height_above_table = max(h_bottle - 38.0, 0.78 * h_bottle)
         safe_z_b = live_table_z + neck_height_above_table
 
-        # If direct 3D depth at the neck pixel (pt_opt_b) was acquired, use it to anchor Z:
+        # If direct 3D depth at the neck pixel (pt_opt_b) was acquired and valid, use it:
         if pt_opt_b is not None and pt_opt_b[2] > live_table_z + 40.0:
             safe_z_b = float(pt_opt_b[2])
 
-        # Anti-overshoot ceiling and anti-floor guard using 3D point cloud bounds:
-        if len(pts_b) >= 3:
-            z_top = float(np.max(pts_b[:, 2]))
-            z_bot = float(np.min(pts_b[:, 2]))
-            # Gripper centerline MUST remain >= 28mm below highest detected bottle point (prevents grabbing air above cap)
-            safe_z_b = min(safe_z_b, z_top - 28.0)
-            # Gripper centerline MUST remain >= 35mm above lowest detected bottle point (prevents table collision)
-            safe_z_b = max(safe_z_b, z_bot + 35.0)
+        # Physical cap ceiling guard:
+        # Top of the bottle is at (live_table_z + h_bottle).
+        # Gripper centerline must remain >= 30mm below the cap top so jaws never sit on top of cap:
+        cap_top_z = live_table_z + h_bottle
+        safe_z_b = min(safe_z_b, cap_top_z - 30.0)
+
+        # Floor guard:
+        # Gripper centerline must remain >= 45mm above tabletop:
+        safe_z_b = max(safe_z_b, live_table_z + 45.0)
 
         # Clamp within safe physical workspace bounds
-        safe_z_b = float(np.clip(safe_z_b, live_table_z + 35.0, WS_Z_MAX_MM - 20.0))
+        safe_z_b = float(np.clip(safe_z_b, WS_Z_MIN_MM + 20.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
     else:
         # Lying flat / diagonal bottle:
@@ -2789,7 +2790,7 @@ def derotate_detections(raw_result, rot_type: str, orig_w: int, orig_h: int) -> 
     return DetectionResult(new_boxes, masks_obj)
 
 
-def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: float = 0.45, target_class_ids=None):
+def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: float = 0.45, target_class_ids=None, enable_rotations: bool = False):
     """
     Multi-angle rotation-aware inference.
     1. First tries normal 0° upright inference. If target is detected, returns immediately (zero overhead).
@@ -2828,7 +2829,7 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
                     target_found = True
                     break
 
-    if target_found:
+    if target_found or not enable_rotations:
         return results
 
     # Step 2: Test rotated views where non-upright objects appear upright to YOLO
@@ -3610,7 +3611,8 @@ def main():
             last_yolo_t = time.time()
 
             t_yolo_start = time.perf_counter()
-            results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
+            enable_rot = getattr(args, "rotation_tta", False)
+            results = detect_with_rotation(model, color, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS, enable_rotations=enable_rot)
             t_yolo_ms = (time.perf_counter() - t_yolo_start) * 1000.0
             tier1_latencies.append(t_yolo_ms)
 

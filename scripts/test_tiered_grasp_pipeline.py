@@ -2127,7 +2127,9 @@ def size_up_object(frame: np.ndarray | None,
         t = (pts_crop[:, 0] - c_x) * v_min[0] + (pts_crop[:, 1] - c_y) * v_min[1]
         s_min, s_max = float(np.min(s)), float(np.max(s))
         L_px = s_max - s_min
-        h_calc = float(np.clip(L_px * scale, 80.0, 280.0))
+        # Physical metric height accounting for distance and camera optical tilt foreshortening
+        cos_tilt = max(0.85, abs(math.cos(math.radians(tilt_deg))))
+        h_calc = float(np.clip(L_px * scale / cos_tilt, 80.0, 290.0))
 
         # Oriented cross-sectional profiling in discrete bins along the major axis
         n_bins = 30
@@ -2177,7 +2179,11 @@ def size_up_object(frame: np.ndarray | None,
 
             # A true bottle neck MUST be narrow (physically <= 45mm, typically 22-38mm).
             # The body/base of a bottle is physically 60-85mm.
-            if min_w1 <= 45.0 and min_w2 > 45.0:
+            is_upright_posture = (h_box >= int(w_box * 1.15) or abs(tilt_deg) <= 25.0)
+            if is_upright_posture:
+                # Upright standing bottle: cap is ALWAYS at End 1 (top of image, smaller y)
+                cap_is_end1 = True
+            elif min_w1 <= 45.0 and min_w2 > 45.0:
                 cap_is_end1 = True
             elif min_w2 <= 45.0 and min_w1 > 45.0:
                 cap_is_end1 = False
@@ -2186,17 +2192,19 @@ def size_up_object(frame: np.ndarray | None,
                 cap_is_end1 = (min_w1 <= min_w2)
             else:
                 # Neither end measured <= 45mm: fallback to comparing median widths
-                # If medians are close (within 15%), prefer the end closer to the robot (larger y in image)
-                # to prevent lunging past the object into empty air!
                 if abs(med_w1 - med_w2) < 0.15 * max(med_w1, med_w2):
                     y_end1 = y1 + c_y + s_min * v_maj[1]
                     y_end2 = y1 + c_y + s_max * v_maj[1]
-                    cap_is_end1 = (y_end1 >= y_end2)
+                    cap_is_end1 = (y_end1 <= y_end2)
                 else:
                     cap_is_end1 = (med_w1 <= med_w2)
 
-            recommended_pitch = -85.0  # Steep top-down approach (perpendicular to ground)
-            height_pct = 50.0
+            if is_upright_posture:
+                recommended_pitch = 0.0    # Level horizontal approach for upright standing bottle
+                height_pct = 82.0          # Grasp at slim neck (~82% height beneath cap)
+            else:
+                recommended_pitch = -85.0  # Steep top-down approach for lying flat bottle
+                height_pct = 50.0
 
             # Once the cone/cap end is identified, locate the optimal grasp point right at the neck cylinder:
             if cap_is_end1:
@@ -2606,10 +2614,18 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     live_table_z = float(np.clip(z_15pct - 5.0, -250.0, -80.0))
 
     if is_upright:
-        # Upright bottle: grasp at the slim neck (+35mm to +45mm above mid-height, within safe reach)
-        neck_offset = min(45.0, 0.25 * max(v_span, 140.0))
-        neck_z = max(mid_z_b + neck_offset, -90.0)
-        safe_z_b = float(neck_z)
+        # Upright standing bottle: stands vertically on tabletop from live_table_z to (live_table_z + h_calc).
+        # Grasp at the slim neck cylinder directly beneath the cap (~82% of bottle height, ~35mm below cap top).
+        h_bottle = 210.0
+        if sizing is not None and "height_mm" in sizing:
+            h_bottle = float(sizing["height_mm"])
+        h_bottle = float(np.clip(h_bottle, 140.0, 290.0))
+
+        # Target neck grasp height above tabletop:
+        neck_height_above_table = max(h_bottle - 38.0, 0.82 * h_bottle)
+        safe_z_b = live_table_z + neck_height_above_table
+        # Clamp within safe physical workspace bounds
+        safe_z_b = float(np.clip(safe_z_b, live_table_z + 40.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
     else:
         # Lying flat / diagonal bottle:
@@ -3961,16 +3977,24 @@ def main():
                     print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.1f}mm (< {min_safe_z:+.1f}mm with {jaw_droop_mm:.1f}mm jaw droop) → elevating to {min_safe_z:+.1f}mm")
                     arm_z = min_safe_z
 
-                if not workspace_in_bounds(arm_x, arm_y, arm_z) and not do_manual_lunge:
-                    continue
+                # Multi-height candidate search for standing upright bottle:
+                # Tries optimal slim neck beneath cap (~82% height) first, falling back to 75% or 70% if needed
+                z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0] if orient_3d.get("is_upright") else [arm_z]
+                for trial_z in z_candidates:
+                    cur_z = max(trial_z, min_safe_z)
+                    if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:
+                        continue
 
-                sol = solve_ik(arm_x, arm_y, arm_z,
-                               end_pitch_deg=target_pitch,
-                               current_joints=current_j,
-                               wrist_roll_deg=target_roll)
-                if sol is not None:
-                    grab_pos = sol
-                    final_target = (arm_x, arm_y, arm_z, pen_mm)
+                    sol = solve_ik(arm_x, arm_y, cur_z,
+                                   end_pitch_deg=target_pitch,
+                                   current_joints=current_j,
+                                   wrist_roll_deg=target_roll)
+                    if sol is not None:
+                        grab_pos = sol
+                        final_target = (arm_x, arm_y, cur_z, pen_mm)
+                        break
+
+                if grab_pos is not None:
                     break
 
             if grab_pos is None:

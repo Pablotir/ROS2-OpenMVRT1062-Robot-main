@@ -224,6 +224,7 @@ YOLO_CLASS_ID    = 39     # 39 = bottle in standard COCO segmentation / detectio
 TARGET_CLASS_IDS = [39]   # Set of active class IDs
 YOLO_CONF        = 0.50   # Standard detection confidence (uncompromised high threshold)
 SKIP_MOONDREAM   = True   # Set False to re-enable Moondream semantic verification
+USE_TIER2_ANYGRASP = True # Sub-3-Second Zero-Shot 6-DoF AnyGrasp Pipeline (False = legacy PCA)
 
 # ── Arm Geometry (SO-ARM101 — Physical Kinematic Constants) ───────────────────
 IK_L1 = 115.0   # shoulder pivot  → elbow pivot  (11.5 cm)
@@ -3634,241 +3635,272 @@ def main():
             obj_px = int((x1_a + x2_a) / 2)
             obj_py = int((y1_a + y2_a) / 2)
             print(f"   🔒 Target Track Locked in Memory: box=({x1_a},{y1_a},{x2_a},{y2_a}) stable_center=({obj_px},{obj_py})")
+            grab_pos = None
+            final_target = None
+            target_pitch = PREFERRED_GRAB_PITCH_DEG
+            target_roll = START_POS.get("wrist_roll.pos", 29.27)
 
-            # Size up object to determine dimensions & orientation
-            depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
-            sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
-            if sizing is not None and "opt_px" in sizing:
-                obj_px, obj_py = sizing["opt_px"]
-            fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
-            print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
-                  f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
-            print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-            print(f"   🎯 Slimmer Section Grasp Point: ({obj_px},{obj_py})")
+            # ── Modern Tier 2: Sub-3-Second Zero-Shot 6-DoF AnyGrasp Pipeline ──
+            if USE_TIER2_ANYGRASP:
+                try:
+                    from soarm101_anygrasp_pipeline import execute_tier2_anygrasp
+                    print(f"\n🚀 [TIER 2 ANYGRASP] Invoking Sub-3-Second 6-DoF Zero-Shot Pipeline on '{TARGET_DESC}'...")
+                    anygrasp_j, anygrasp_plan = execute_tier2_anygrasp(
+                        robot=robot,
+                        cap=cap,
+                        locked_bbox=(x1_a, y1_a, x2_a, y2_a),
+                        target_desc=TARGET_DESC
+                    )
+                    if anygrasp_j is not None and anygrasp_plan.get("success"):
+                        grab_pos = anygrasp_j
+                        target_pitch = anygrasp_plan.get("pitch_deg", 0.0)
+                        target_roll = anygrasp_j.get("wrist_roll.pos", target_roll)
+                        best_w = anygrasp_plan.get("best_wrist_pose")
+                        if best_w is not None:
+                            final_target = (float(best_w[0, 3]), float(best_w[1, 3]), float(best_w[2, 3]), anygrasp_plan.get("delta_lat_mm", 0.0))
+                        dur = anygrasp_plan["latencies_ms"].get("Total Grasp Pipeline", 0.0)
+                        print(f"✅ [TIER 2 ANYGRASP] Optimal grasp trajectory generated in {dur:.1f} ms!")
+                    else:
+                        print(f"⚠️ [TIER 2 ANYGRASP] Pipeline returned no feasible solution. Falling back to legacy Tier 2 heuristics...")
+                except Exception as e:
+                    print(f"⚠️ [TIER 2 ANYGRASP] Error during AnyGrasp execution: {e}. Falling back to legacy Tier 2 heuristics...")
 
-            # ── STEP 2: Get 3-D object position in camera space ────────────────
-            # Prefer mask-based depth (object pixels only) over point sampling.
-            # Falls back to bbox-patch median if no segmentation mask is available.
-            cur_pose = get_pos(robot)
-            pan_deg = cur_pose.get("shoulder_pan.pos", 0.0)
-            lift_deg = cur_pose.get("shoulder_lift.pos", 0.0)
-            elb_deg = cur_pose.get("elbow_flex.pos", 0.0)
-            wst_deg = cur_pose.get("wrist_flex.pos", 0.0)
-            t1_deg = 90.0 - lift_deg
-            t2_deg = t1_deg - (elb_deg + 81.0)
-            t3_deg = t2_deg - (wst_deg + 5.0)
-            print(f"   🤖 RAW JOINTS: pan={pan_deg:.1f} lift={lift_deg:.1f} elb={elb_deg:.1f} wst={wst_deg:.1f}")
-            print(f"   📐 FK ANGLES: t1={t1_deg:.1f}° t2={t2_deg:.1f}° t3={t3_deg:.1f}° (wrist absolute)")
+            # ── Fallback: Legacy Tier 2 Heuristics (Runs only if AnyGrasp did not solve) ──
+            if grab_pos is None:
+                # Size up object to determine dimensions & orientation
+                depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
+                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
+                if sizing is not None and "opt_px" in sizing:
+                    obj_px, obj_py = sizing["opt_px"]
+                fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
+                print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
+                      f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
+                print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
+                print(f"   🎯 Slimmer Section Grasp Point: ({obj_px},{obj_py})")
+
+                # ── STEP 2: Get 3-D object position in camera space ────────────────
+                # Prefer mask-based depth (object pixels only) over point sampling.
+                # Falls back to bbox-patch median if no segmentation mask is available.
+                cur_pose = get_pos(robot)
+                pan_deg = cur_pose.get("shoulder_pan.pos", 0.0)
+                lift_deg = cur_pose.get("shoulder_lift.pos", 0.0)
+                elb_deg = cur_pose.get("elbow_flex.pos", 0.0)
+                wst_deg = cur_pose.get("wrist_flex.pos", 0.0)
+                t1_deg = 90.0 - lift_deg
+                t2_deg = t1_deg - (elb_deg + 81.0)
+                t3_deg = t2_deg - (wst_deg + 5.0)
+                print(f"   🤖 RAW JOINTS: pan={pan_deg:.1f} lift={lift_deg:.1f} elb={elb_deg:.1f} wst={wst_deg:.1f}")
+                print(f"   📐 FK ANGLES: t1={t1_deg:.1f}° t2={t2_deg:.1f}° t3={t3_deg:.1f}° (wrist absolute)")
             
-            xyz = None
-            if seg_mask is not None:
-                xyz = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
-                if xyz is not None and xyz[2] <= MAX_GRAB_DEPTH_MM:
-                    print(f"   🎭 Mask depth: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
-                          f"(from {np.sum(seg_mask==255)} mask pixels)")
-                else:
-                    xyz = None
+                xyz = None
+                if seg_mask is not None:
+                    xyz = cap.get_xyz_from_mask(seg_mask, target_px=(obj_px, obj_py))
+                    if xyz is not None and xyz[2] <= MAX_GRAB_DEPTH_MM:
+                        print(f"   🎭 Mask depth: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  z={xyz[2]:.0f}mm  "
+                              f"(from {np.sum(seg_mask==255)} mask pixels)")
+                    else:
+                        xyz = None
 
-            if xyz is None:
-                # Centered depth samples along the target grasp point and object body
-                xyz_samples  = []
-                c_box_x = (x1_a + x2_a) // 2
-                c_box_y = (y1_a + y2_a) // 2
-                sample_pts = [
-                    (obj_px, obj_py),
-                    (c_box_x, c_box_y),
-                    ((obj_px + c_box_x) // 2, (obj_py + c_box_y) // 2),
-                ]
-                if y2_a > y1_a:
-                    h_b = y2_a - y1_a
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.25))))
-                    sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.50))))
+                if xyz is None:
+                    # Centered depth samples along the target grasp point and object body
+                    xyz_samples  = []
+                    c_box_x = (x1_a + x2_a) // 2
+                    c_box_y = (y1_a + y2_a) // 2
+                    sample_pts = [
+                        (obj_px, obj_py),
+                        (c_box_x, c_box_y),
+                        ((obj_px + c_box_x) // 2, (obj_py + c_box_y) // 2),
+                    ]
+                    if y2_a > y1_a:
+                        h_b = y2_a - y1_a
+                        sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.25))))
+                        sample_pts.append((obj_px, min(h_a - 1, y1_a + int(h_b * 0.50))))
 
-                for pt in sample_pts:
-                    for _ in range(2):
-                        s = cap.get_xyz(pt[0], pt[1], search_w=14, search_h=14)
-                        if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
-                            xyz_samples.append(s)
-                        time.sleep(0.015)
-                if not xyz_samples:
-                    for _ in range(3):
-                        s = cap.get_xyz(obj_px, obj_py, search_w=18, search_h=18)
-                        if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
-                            xyz_samples.append(s)
-                        time.sleep(0.015)
-                if not xyz_samples:
-                    print(f"⚠️  No valid object depth (depth > {MAX_GRAB_DEPTH_MM:.0f}mm or in blind zone) — restarting search")
+                    for pt in sample_pts:
+                        for _ in range(2):
+                            s = cap.get_xyz(pt[0], pt[1], search_w=14, search_h=14)
+                            if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
+                                xyz_samples.append(s)
+                            time.sleep(0.015)
+                    if not xyz_samples:
+                        for _ in range(3):
+                            s = cap.get_xyz(obj_px, obj_py, search_w=18, search_h=18)
+                            if s is not None and s[2] > 70.0 and s[2] <= MAX_GRAB_DEPTH_MM:
+                                xyz_samples.append(s)
+                            time.sleep(0.015)
+                    if not xyz_samples:
+                        print(f"⚠️  No valid object depth (depth > {MAX_GRAB_DEPTH_MM:.0f}mm or in blind zone) — restarting search")
+                        smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
+                        STATE = "SEARCHING"
+                        continue
+                    zs = [s[2] for s in xyz_samples]
+                    med_z = float(np.median(zs))
+                    # Deproject the true CAP pixel (obj_px, obj_py) using median depth
+                    intr = cap._intrinsics
+                    if intr is not None:
+                        pt_3d = rs.rs2_deproject_pixel_to_point(intr, [float(obj_px), float(obj_py)], med_z / 1000.0)
+                        xyz = (pt_3d[0] * 1000.0, pt_3d[1] * 1000.0, med_z)
+                    else:
+                        xyz = (float(np.median([s[0] for s in xyz_samples])),
+                               float(np.median([s[1] for s in xyz_samples])),
+                               med_z)
+                print(f"   📍 Camera-space: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  "
+                      f"depth={xyz[2]:.0f}mm")
+                # Margin of error / Offset debug
+                print(f"   📊 Target margin of error from Camera Center: X_err={xyz[0]:+.0f}mm, Y_err={xyz[1]:+.0f}mm")
+
+                # ── Guard: reject background floor/wall depth noise ────────────────
+                if xyz[2] > MAX_GRAB_DEPTH_MM:
+                    print(f"   ⚠️  Depth reading {xyz[2]:.0f}mm exceeds max table grab depth ({MAX_GRAB_DEPTH_MM:.0f}mm) — background depth detected, ignoring!")
                     smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
                     STATE = "SEARCHING"
                     continue
-                zs = [s[2] for s in xyz_samples]
-                med_z = float(np.median(zs))
-                # Deproject the true CAP pixel (obj_px, obj_py) using median depth
-                intr = cap._intrinsics
-                if intr is not None:
-                    pt_3d = rs.rs2_deproject_pixel_to_point(intr, [float(obj_px), float(obj_py)], med_z / 1000.0)
-                    xyz = (pt_3d[0] * 1000.0, pt_3d[1] * 1000.0, med_z)
+
+                # Refresh sizing with exact live depth measurement
+                if sizing is not None and xyz is not None:
+                    depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
+                    sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
+
+                # ── STEP 2b: 3D Orientation Analysis (Disambiguate Lying Flat vs Upright) ──
+                orient_3d = analyze_3d_orientation(cap, robot, (x1_a, y1_a, x2_a, y2_a), seg_mask, sizing)
+
+                # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
+                # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
+                # securely between the rubber gripper pads (~17mm clearance from rear servo face).
+                # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
+                if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
+                    # Table-resting objects (top-down or steep approach):
+                    # Pull back along the reach line so the gripper pads land squarely
+                    # over the resting bottle neck without overshooting past it into empty air.
+                    # Base pullback of 15.0mm aligns the rubber pads (which sit behind the fingertips) with the bottle.
+                    # Farther bottles (raw_dist > 260mm) receive proportional extra pullback to keep reach inside
+                    # the ~255-260mm physical sweet spot where steep (-85°) top-down grasp is reachable.
+                    mid_base = orient_3d.get("midpoint_base")
+                    raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 250.0
+
+                    base_pullback = 15.0
+                    excess_dist = max(0.0, raw_dist - 260.0)
+                    needed_pullback = base_pullback + excess_dist
+                    scaled_pullback = float(np.clip(needed_pullback, 15.0, 50.0))
+
+                    flat_rad_offset = -scaled_pullback
+                    penetration_candidates = [
+                        flat_rad_offset,           # Optimal pullback into sweet spot
+                        flat_rad_offset + 5.0,     # fallback
+                        flat_rad_offset + 10.0,    # fallback
+                        flat_rad_offset + 15.0,    # fallback
+                        0.0,                       # neutral zero fallback
+                    ]
                 else:
-                    xyz = (float(np.median([s[0] for s in xyz_samples])),
-                           float(np.median([s[1] for s in xyz_samples])),
-                           med_z)
-            print(f"   📍 Camera-space: x={xyz[0]:+.0f}mm  y={xyz[1]:+.0f}mm  "
-                  f"depth={xyz[2]:.0f}mm")
-            # Margin of error / Offset debug
-            print(f"   📊 Target margin of error from Camera Center: X_err={xyz[0]:+.0f}mm, Y_err={xyz[1]:+.0f}mm")
+                    # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
+                    # Base penetration: +5.0mm (was +20.0mm; backed up by 15mm to prevent crowding or toppling close bottles)
+                    penetration_candidates = [
+                        5.0,                          # +5.0mm: fingertips/pads clamp securely with ~32mm servo clearance
+                        2.0,                          # +2.0mm: close bottle fallback
+                        0.0,                          #  0.0mm: exact surface edge
+                        -5.0,                         # -5.0mm: light pullback for very close bottles
+                        8.0,                          # +8.0mm: deeper grip fallback
+                    ]
+                grab_pos = None
+                final_target = None
+                current_j = get_pos(robot)
+                target_pitch = PREFERRED_GRAB_PITCH_DEG  # Preferred parallel-to-ground pitch (0.0° = horizontal)
+                target_roll = START_POS.get("wrist_roll.pos", 29.27)
+                delta_roll = 0.0
 
-            # ── Guard: reject background floor/wall depth noise ────────────────
-            if xyz[2] > MAX_GRAB_DEPTH_MM:
-                print(f"   ⚠️  Depth reading {xyz[2]:.0f}mm exceeds max table grab depth ({MAX_GRAB_DEPTH_MM:.0f}mm) — background depth detected, ignoring!")
-                smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
-                STATE = "SEARCHING"
-                continue
+                if sizing is not None:
+                    target_pitch = sizing.get("recommended_pitch_deg", PREFERRED_GRAB_PITCH_DEG)
+                    target_roll  = sizing.get("recommended_roll_deg", target_roll)
+                    delta_roll   = sizing.get("delta_roll_deg", 0.0)
 
-            # Refresh sizing with exact live depth measurement
-            if sizing is not None and xyz is not None:
-                depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
-                sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=xyz[2], target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
+                # 3D Orientation override (detects bottles lying flat pointing towards arm)
+                if orient_3d.get("confidence") == "high_3d_span":
+                    target_pitch = orient_3d["target_pitch_deg"]
+                    target_roll  = orient_3d["target_roll_deg"]
+                    delta_roll   = orient_3d["delta_roll_deg"]
+                    if orient_3d["is_lying_flat"] and orient_3d.get("midpoint_cam") is not None:
+                        xyz = orient_3d["midpoint_cam"]
 
-            # ── STEP 2b: 3D Orientation Analysis (Disambiguate Lying Flat vs Upright) ──
-            orient_3d = analyze_3d_orientation(cap, robot, (x1_a, y1_a, x2_a, y2_a), seg_mask, sizing)
+                for pen_mm in penetration_candidates:
+                    if orient_3d.get("confidence") == "high_3d_span" and orient_3d.get("midpoint_base") is not None:
+                        mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
+                        arm_x = mid_x
+                        arm_y = mid_y
+                        live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
+                        table_floor_z = live_tbl_z if live_tbl_z is not None else TABLE_FLOOR_Z_MM
+                        table_floor_z = float(np.clip(table_floor_z, -250.0, -80.0))
 
-            # ── Convert to arm base frame & Solve IK with Adaptive Penetration ──
-            # Gripper throat is ~37mm deep. GRASP_PENETRATION_MM (20.0mm) centers the object
-            # securely between the rubber gripper pads (~17mm clearance from rear servo face).
-            # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
-            if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
-                # Table-resting objects (top-down or steep approach):
-                # Pull back along the reach line so the gripper pads land squarely
-                # over the resting bottle neck without overshooting past it into empty air.
-                # Base pullback of 15.0mm aligns the rubber pads (which sit behind the fingertips) with the bottle.
-                # Farther bottles (raw_dist > 260mm) receive proportional extra pullback to keep reach inside
-                # the ~255-260mm physical sweet spot where steep (-85°) top-down grasp is reachable.
-                mid_base = orient_3d.get("midpoint_base")
-                raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 250.0
+                        if orient_3d["is_lying_flat"] or orient_3d.get("is_3d_diagonal"):
+                            # Lying flat or 3D diagonal: penetrate horizontally along reach line (pan)
+                            # NEVER subtract Z, so the gripper does not plunge into the table surface!
+                            pan_rad = math.atan2(arm_y, arm_x)
+                            arm_x = mid_x + pen_mm * math.cos(pan_rad)
+                            arm_y = mid_y + pen_mm * math.sin(pan_rad)
+                            arm_z = mid_z
+                        else:
+                            # Upright bottle: level horizontal approach directly into neck cylinder
+                            pan_rad = math.atan2(mid_y, mid_x)
+                            arm_x = mid_x + pen_mm * math.cos(pan_rad)
+                            arm_y = mid_y + pen_mm * math.sin(pan_rad)
+                            arm_z = mid_z
+                    else:
+                        target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
+                        if target is None:
+                            continue
+                        arm_x, arm_y, arm_z = target
 
-                base_pullback = 15.0
-                excess_dist = max(0.0, raw_dist - 260.0)
-                needed_pullback = base_pullback + excess_dist
-                scaled_pullback = float(np.clip(needed_pullback, 15.0, 50.0))
+                    # ── Apply true lateral claw offset (strictly perpendicular to reach line) ──
+                    # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
+                    # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
+                    tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
+                    if orient_3d.get("is_upright"):
+                        lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM   # ~3.0 inches (76.2mm)
+                    elif abs(tilt_val) >= 55.0:
+                        lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 91.2mm (76.2mm + 15.0mm extra left offset for horizontal flat)
+                    elif tilt_val <= -20.0:
+                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 76.2mm (tested and verified benchmark for angled)
+                    else:
+                        lat_offset = GRAB_LATERAL_OFFSET_MM            # 78.0mm (63.0mm + 15.0mm extra left offset for vertical flat)
 
-                flat_rad_offset = -scaled_pullback
-                penetration_candidates = [
-                    flat_rad_offset,           # Optimal pullback into sweet spot
-                    flat_rad_offset + 5.0,     # fallback
-                    flat_rad_offset + 10.0,    # fallback
-                    flat_rad_offset + 15.0,    # fallback
-                    0.0,                       # neutral zero fallback
-                ]
-            else:
-                # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
-                # Base penetration: +5.0mm (was +20.0mm; backed up by 15mm to prevent crowding or toppling close bottles)
-                penetration_candidates = [
-                    5.0,                          # +5.0mm: fingertips/pads clamp securely with ~32mm servo clearance
-                    2.0,                          # +2.0mm: close bottle fallback
-                    0.0,                          #  0.0mm: exact surface edge
-                    -5.0,                         # -5.0mm: light pullback for very close bottles
-                    8.0,                          # +8.0mm: deeper grip fallback
-                ]
-            grab_pos = None
-            final_target = None
-            current_j = get_pos(robot)
-            target_pitch = PREFERRED_GRAB_PITCH_DEG  # Preferred parallel-to-ground pitch (0.0° = horizontal)
-            target_roll = START_POS.get("wrist_roll.pos", 29.27)
-            delta_roll = 0.0
+                    if abs(lat_offset) > 0.01:
+                        pan_t = math.atan2(arm_y, arm_x)
+                        arm_x += -lat_offset * math.sin(pan_t)
+                        arm_y +=  lat_offset * math.cos(pan_t)
+                        print(f"   📐 Applied lateral grasp offset: {lat_offset:+.1f}mm (LEFT claw clearance shift perpendicular to reach)")
 
-            if sizing is not None:
-                target_pitch = sizing.get("recommended_pitch_deg", PREFERRED_GRAB_PITCH_DEG)
-                target_roll  = sizing.get("recommended_roll_deg", target_roll)
-                delta_roll   = sizing.get("delta_roll_deg", 0.0)
-
-            # 3D Orientation override (detects bottles lying flat pointing towards arm)
-            if orient_3d.get("confidence") == "high_3d_span":
-                target_pitch = orient_3d["target_pitch_deg"]
-                target_roll  = orient_3d["target_roll_deg"]
-                delta_roll   = orient_3d["delta_roll_deg"]
-                if orient_3d["is_lying_flat"] and orient_3d.get("midpoint_cam") is not None:
-                    xyz = orient_3d["midpoint_cam"]
-
-            for pen_mm in penetration_candidates:
-                if orient_3d.get("confidence") == "high_3d_span" and orient_3d.get("midpoint_base") is not None:
-                    mid_x, mid_y, mid_z = orient_3d["midpoint_base"]
-                    arm_x = mid_x
-                    arm_y = mid_y
+                    # ── Dynamic Tabletop Safeguard with Jaw Droop Protection ───────────
+                    # When wrist is pitched and rolled, lower jaw tip hangs lower than wrist/grasp centerline.
+                    # Droop = 45mm * |sin(delta_roll)| * cos(pitch).
+                    # Table surface protection guarantees fingertip stays >= 12mm above physical tabletop surface!
                     live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
                     table_floor_z = live_tbl_z if live_tbl_z is not None else TABLE_FLOOR_Z_MM
                     table_floor_z = float(np.clip(table_floor_z, -250.0, -80.0))
+                    droll_actual = target_roll - (START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27))
+                    jaw_droop_mm = 45.0 * abs(math.sin(math.radians(droll_actual))) * math.cos(math.radians(target_pitch))
+                    min_safe_z = table_floor_z + jaw_droop_mm + 12.0
+                    if arm_z < min_safe_z:
+                        print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.1f}mm (< {min_safe_z:+.1f}mm with {jaw_droop_mm:.1f}mm jaw droop) → elevating to {min_safe_z:+.1f}mm")
+                        arm_z = min_safe_z
 
-                    if orient_3d["is_lying_flat"] or orient_3d.get("is_3d_diagonal"):
-                        # Lying flat or 3D diagonal: penetrate horizontally along reach line (pan)
-                        # NEVER subtract Z, so the gripper does not plunge into the table surface!
-                        pan_rad = math.atan2(arm_y, arm_x)
-                        arm_x = mid_x + pen_mm * math.cos(pan_rad)
-                        arm_y = mid_y + pen_mm * math.sin(pan_rad)
-                        arm_z = mid_z
-                    else:
-                        # Upright bottle: level horizontal approach directly into neck cylinder
-                        pan_rad = math.atan2(mid_y, mid_x)
-                        arm_x = mid_x + pen_mm * math.cos(pan_rad)
-                        arm_y = mid_y + pen_mm * math.sin(pan_rad)
-                        arm_z = mid_z
-                else:
-                    target = depth_to_arm_target(xyz, robot, penetration_mm=pen_mm)
-                    if target is None:
-                        continue
-                    arm_x, arm_y, arm_z = target
+                    # Multi-height candidate search for standing upright bottle:
+                    # Tries optimal slim neck beneath cap (~82% height) first, falling back to 75% or 70% if needed
+                    z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0] if orient_3d.get("is_upright") else [arm_z]
+                    for trial_z in z_candidates:
+                        cur_z = max(trial_z, min_safe_z)
+                        if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:
+                            continue
 
-                # ── Apply true lateral claw offset (strictly perpendicular to reach line) ──
-                # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
-                # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
-                tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
-                if orient_3d.get("is_upright"):
-                    lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM   # ~3.0 inches (76.2mm)
-                elif abs(tilt_val) >= 55.0:
-                    lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 91.2mm (76.2mm + 15.0mm extra left offset for horizontal flat)
-                elif tilt_val <= -20.0:
-                    lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 76.2mm (tested and verified benchmark for angled)
-                else:
-                    lat_offset = GRAB_LATERAL_OFFSET_MM            # 78.0mm (63.0mm + 15.0mm extra left offset for vertical flat)
+                        sol = solve_ik(arm_x, arm_y, cur_z,
+                                       end_pitch_deg=target_pitch,
+                                       current_joints=current_j,
+                                       wrist_roll_deg=target_roll)
+                        if sol is not None:
+                            grab_pos = sol
+                            final_target = (arm_x, arm_y, cur_z, pen_mm)
+                            break
 
-                if abs(lat_offset) > 0.01:
-                    pan_t = math.atan2(arm_y, arm_x)
-                    arm_x += -lat_offset * math.sin(pan_t)
-                    arm_y +=  lat_offset * math.cos(pan_t)
-                    print(f"   📐 Applied lateral grasp offset: {lat_offset:+.1f}mm (LEFT claw clearance shift perpendicular to reach)")
-
-                # ── Dynamic Tabletop Safeguard with Jaw Droop Protection ───────────
-                # When wrist is pitched and rolled, lower jaw tip hangs lower than wrist/grasp centerline.
-                # Droop = 45mm * |sin(delta_roll)| * cos(pitch).
-                # Table surface protection guarantees fingertip stays >= 12mm above physical tabletop surface!
-                live_tbl_z = orient_3d.get("live_table_z") if orient_3d.get("confidence") == "high_3d_span" else None
-                table_floor_z = live_tbl_z if live_tbl_z is not None else TABLE_FLOOR_Z_MM
-                table_floor_z = float(np.clip(table_floor_z, -250.0, -80.0))
-                droll_actual = target_roll - (START_POS.get("wrist_roll.pos", 29.27) if "START_POS" in globals() else _BASE.get("wrist_roll.pos", 29.27))
-                jaw_droop_mm = 45.0 * abs(math.sin(math.radians(droll_actual))) * math.cos(math.radians(target_pitch))
-                min_safe_z = table_floor_z + jaw_droop_mm + 12.0
-                if arm_z < min_safe_z:
-                    print(f"   🛡️ Table Floor Guard: arm_z was {arm_z:+.1f}mm (< {min_safe_z:+.1f}mm with {jaw_droop_mm:.1f}mm jaw droop) → elevating to {min_safe_z:+.1f}mm")
-                    arm_z = min_safe_z
-
-                # Multi-height candidate search for standing upright bottle:
-                # Tries optimal slim neck beneath cap (~82% height) first, falling back to 75% or 70% if needed
-                z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0] if orient_3d.get("is_upright") else [arm_z]
-                for trial_z in z_candidates:
-                    cur_z = max(trial_z, min_safe_z)
-                    if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:
-                        continue
-
-                    sol = solve_ik(arm_x, arm_y, cur_z,
-                                   end_pitch_deg=target_pitch,
-                                   current_joints=current_j,
-                                   wrist_roll_deg=target_roll)
-                    if sol is not None:
-                        grab_pos = sol
-                        final_target = (arm_x, arm_y, cur_z, pen_mm)
+                    if grab_pos is not None:
                         break
-
-                if grab_pos is not None:
-                    break
 
             if grab_pos is None:
                 if do_manual_lunge:

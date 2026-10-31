@@ -676,7 +676,8 @@ def save_matplotlib_3d_render(scenario: str,
 
 def run_simulation(scenario: str = "standing",
                    export_html: Optional[str] = "sim_grasp_interactive.html",
-                   export_plot: Optional[str] = "sim_grasp_result.png") -> Dict[str, Any]:
+                   export_plot: Optional[str] = "sim_grasp_result.png",
+                   open_browser: bool = False) -> Dict[str, Any]:
     """
     Executes full end-to-end simulation of the specified scenario.
     """
@@ -756,6 +757,11 @@ def run_simulation(scenario: str = "standing",
     # 5. Export Visual Artifacts
     if export_html:
         generate_interactive_webgl_html(scenario, label, plan, trajectory, P_obj_base, export_html)
+        if open_browser:
+            import webbrowser
+            abs_html = os.path.abspath(export_html)
+            print(f"  [OK] Launching 3D WebGL Simulator in browser: {abs_html}")
+            webbrowser.open(abs_html)
 
     if export_plot:
         save_matplotlib_3d_render(scenario, label, plan, trajectory, P_obj_base, export_plot)
@@ -775,6 +781,8 @@ if __name__ == "__main__":
     parser.add_argument("--save-plot", type=str, default="sim_grasp_result.png",
                         help="Path for Matplotlib 3D render export")
     parser.add_argument("--no-plot", action="store_true", help="Skip PNG plot generation")
+    parser.add_argument("--open", action="store_true", default=False,
+                        help="Auto-open the interactive 3D WebGL viewer in your default browser")
 
     args = parser.parse_args()
 
@@ -782,6 +790,6 @@ if __name__ == "__main__":
 
     if args.all:
         for sc in ["standing", "tilted", "flat", "ball", "box", "mug"]:
-            run_simulation(sc, export_html=f"sim_grasp_{sc}.html", export_plot=f"sim_grasp_{sc}.png")
+            run_simulation(sc, export_html=f"sim_grasp_{sc}.html", export_plot=f"sim_grasp_{sc}.png", open_browser=(args.open and sc == "standing"))
     else:
-        run_simulation(args.scenario, export_html=args.export_html, export_plot=plot_target)
+        run_simulation(args.scenario, export_html=args.export_html, export_plot=plot_target, open_browser=args.open)

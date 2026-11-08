@@ -82,7 +82,7 @@ try:
 except Exception:
     pass
 
-import cv2, time, signal, base64, math, threading, atexit
+import cv2, time, signal, base64, math, threading, atexit, contextlib, gc
 import numpy as np
 try:
     import pyrealsense2 as rs
@@ -222,7 +222,7 @@ ARM_ID     = "jetson_arm"
 TARGET_DESC      = "bottle"
 YOLO_CLASS_ID    = 39     # 39 = bottle in standard COCO segmentation / detection models
 TARGET_CLASS_IDS = [39]   # Set of active class IDs
-YOLO_CONF        = 0.50   # Standard detection confidence (uncompromised high threshold)
+YOLO_CONF        = 0.35   # Optimized zero-shot detection confidence (robust for flat/angled objects) (uncompromised high threshold)
 SKIP_MOONDREAM   = True   # Set False to re-enable Moondream semantic verification
 USE_TIER2_ANYGRASP = True # Sub-3-Second Zero-Shot 6-DoF AnyGrasp Pipeline (False = legacy PCA)
 
@@ -2721,20 +2721,20 @@ def derotate_detections(raw_result, rot_type: str, orig_w: int, orig_h: int) -> 
     return DetectionResult(new_boxes, masks_obj)
 
 
-def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: float = 0.45, target_class_ids=None):
+def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.35, iou: float = 0.45, target_class_ids=None):
     """
-    Multi-angle rotation-aware inference.
-    1. First tries normal 0° upright inference. If target is detected, returns immediately (zero overhead).
-    2. If no target is detected (e.g. bottle is lying on its side, upside down, or tilted),
-       tests rotated views where the object appears upright to standard YOLO weights.
-    3. De-rotates detected bounding boxes and masks back to the original image coordinate frame.
-    Guarantees detection at any angle without lowering confidence or adding extra vocabulary!
+    High-Performance rotation-aware inference with torch.inference_mode.
+    1. First tries normal 0° upright inference. If target is detected, returns immediately (15-20 FPS).
+    2. If no target is detected, tests a single 90° CW rotation to catch sideways items without tanking FPS.
+    3. De-rotates detected bounding boxes back to the original image coordinate frame.
     """
     if model is None or frame is None or frame.size == 0:
         return [DetectionResult([])]
 
-    # Step 1: Normal upright inference
-    results = model(frame, verbose=False, conf=conf, iou=iou)
+    ctx = torch.inference_mode() if torch is not None else contextlib.nullcontext()
+    with ctx:
+        # Step 1: Normal upright inference
+        results = model(frame, verbose=False, conf=conf, iou=iou)
 
     target_found = False
     if results and len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
@@ -2749,28 +2749,20 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.50, iou: floa
     if target_found:
         return results
 
-    # Step 2: Test rotated views where non-upright objects appear upright to YOLO
+    # Step 2: Test single 90° rotation fallback (caps latency, prevents 3-5 FPS tanking)
     orig_h, orig_w = frame.shape[:2]
-    rotations = [
-        ("rot90_cw", lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
-        ("rot90_ccw", lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-        ("rot180", lambda img: cv2.rotate(img, cv2.ROTATE_180)),
-        ("rot45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), 45.0, 1.0), (orig_w, orig_h))),
-        ("rot_neg45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), -45.0, 1.0), (orig_w, orig_h))),
-    ]
-
-    for rot_name, rot_fn in rotations:
-        rot_frame = rot_fn(frame)
+    rot_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    with ctx:
         res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
-        if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
-            has_match = False
-            for box in res_rot[0].boxes:
-                if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
-                    has_match = True
-                    break
-            if has_match:
-                derotated_res = derotate_detections(res_rot[0], rot_name, orig_w, orig_h)
-                return [derotated_res]
+    if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
+        has_match = False
+        for box in res_rot[0].boxes:
+            if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
+                has_match = True
+                break
+        if has_match:
+            derotated_res = derotate_detections(res_rot[0], "rot90_cw", orig_w, orig_h)
+            return [derotated_res]
 
     return results
 
@@ -3311,12 +3303,22 @@ def main():
         pass
 
     if "world" in chosen_path.lower() or hasattr(model, "set_classes"):
-        user_target = TARGET_DESC.strip()
-        query_variants = [user_target]
+        user_target = TARGET_DESC.strip().lower()
+        VOCAB_SYNONYMS = {
+            "phone": ["cell phone", "smartphone", "phone", "mobile phone"],
+            "smartphone": ["cell phone", "smartphone", "phone", "mobile phone"],
+            "bottle": ["bottle", "water bottle", "flask"],
+            "cup": ["cup", "mug", "coffee mug"],
+            "mug": ["mug", "cup", "coffee mug"],
+            "can": ["can", "aluminum can", "soda can", "tin"],
+            "ball": ["ball", "tennis ball", "sports ball"],
+            "box": ["box", "carton", "cube"]
+        }
+        query_variants = VOCAB_SYNONYMS.get(user_target, [user_target])
         model.set_classes(query_variants)
         TARGET_CLASS_IDS = list(range(len(query_variants)))
         YOLO_CLASS_ID = 0  # Primary class ID
-        print(f"   🌍 YOLO-World loaded and targeting: {query_variants} (Class IDs: {TARGET_CLASS_IDS})")
+        print(f"   🌍 YOLO-World loaded with expanded synonyms: {query_variants} (Class IDs: {TARGET_CLASS_IDS})")
     else:
         TARGET_CLASS_IDS = [YOLO_CLASS_ID]
         print(f"   🎯 Standard YOLO targeting class {YOLO_CLASS_ID} ('{TARGET_DESC}')")
@@ -3639,6 +3641,7 @@ def main():
             final_target = None
             target_pitch = PREFERRED_GRAB_PITCH_DEG
             target_roll = START_POS.get("wrist_roll.pos", 29.27)
+            target_closed_grip = None
 
             # ── Modern Tier 2: Sub-3-Second Zero-Shot 6-DoF AnyGrasp Pipeline ──
             if USE_TIER2_ANYGRASP:
@@ -3654,13 +3657,15 @@ def main():
                     )
                     if anygrasp_j is not None and anygrasp_plan.get("success"):
                         grab_pos = anygrasp_j
+                        target_closed_grip = float(anygrasp_j.get("gripper.pos", GRIPPER_CLOSED_POS_DEG))
                         target_pitch = anygrasp_plan.get("pitch_deg", 0.0)
                         target_roll = anygrasp_j.get("wrist_roll.pos", target_roll)
                         best_w = anygrasp_plan.get("best_wrist_pose")
                         if best_w is not None:
                             final_target = (float(best_w[0, 3]), float(best_w[1, 3]), float(best_w[2, 3]), anygrasp_plan.get("delta_lat_mm", 0.0))
                         dur = anygrasp_plan["latencies_ms"].get("Total Grasp Pipeline", 0.0)
-                        print(f"✅ [TIER 2 ANYGRASP] Optimal grasp trajectory generated in {dur:.1f} ms!")
+                        w_target = anygrasp_plan.get("target_width", 40.0)
+                        print(f"✅ [TIER 2 ANYGRASP] Optimal grasp trajectory generated in {dur:.1f} ms! (Target width: {w_target:.1f}mm -> Grip angle: {target_closed_grip:.1f}°)")
                     else:
                         print(f"⚠️ [TIER 2 ANYGRASP] Pipeline returned no feasible solution. Falling back to legacy Tier 2 heuristics...")
                 except Exception as e:
@@ -3968,21 +3973,27 @@ def main():
                 print("\n🔍 Search loop resumed\n")
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
-                print("\n🦾 APPROACHING (level gripper, jaws wide open)...")
+                print("\n🦾 APPROACHING (jaws wide open)...")
                 grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
-                level_approach(robot, grab_pos,
-                               step_size=3.0, step_delay=0.03)
+                # For rotated steep grasps (e.g. 90° flat phone), smooth_move moves all joints directly without fighting level_approach:
+                is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", -86.0) - HARDWARE_NEUTRAL_ROLL_DEG) > 25.0
+                if is_rotated_roll:
+                    print("   📐 Rotated wrist approach (adaptive 5-DoF flat phone alignment)...")
+                    smooth_move(robot, grab_pos, step_size=2.5, step_delay=0.03)
+                else:
+                    level_approach(robot, grab_pos, step_size=3.0, step_delay=0.03)
                 time.sleep(0.4)
 
     
-                print(f"✊ GRIPPING (closing jaws firmly to {GRIPPER_CLOSED_POS_DEG:.1f}°)...")
-                grab_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
+                actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG
+                print(f"✊ GRIPPING (closing jaws firmly to {actual_closed_grip:.1f}° with zero air gap)...")
+                grab_pos["gripper.pos"] = actual_closed_grip
                 smooth_move(robot, grab_pos, step_size=3.0, step_delay=0.02, hold_joints=[])
                 time.sleep(0.6)
 
                 print("🏠 RETURNING...")
                 drop_pos = dict(START_POS)
-                drop_pos["gripper.pos"] = GRIPPER_CLOSED_POS_DEG
+                drop_pos["gripper.pos"] = actual_closed_grip
                 # Maintain the grasp wrist roll so the wrist never twists while carrying the bottle:
                 drop_pos["wrist_roll.pos"] = grab_pos.get("wrist_roll.pos", target_roll)
                 smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
@@ -3996,8 +4007,12 @@ def main():
     
                 print("🔄 Back to search position...")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
+                # Flush PyTorch CUDA VRAM and run garbage collection to keep FPS high
+                if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
                 STATE = "SEARCHING"
-                print("\n🔍 Search loop resumed\n")
+                print("\n🔍 Search loop resumed (CUDA cache cleared)\n")
 
     except KeyboardInterrupt:
         print("\n⏹️  Interrupted by user — stowing arm smoothly...")

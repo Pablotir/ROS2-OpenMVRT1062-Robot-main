@@ -3465,7 +3465,7 @@ def main():
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
             # ── Throttle YOLO to ~5 fps during search ─────────────────────────
-            if time.time() - last_yolo_t < 0.2:
+            if time.time() - last_yolo_t < 0.033:
                 _show_frame("Picker Vision", _make_vis(display, depth_colormap))
                 if not HEADLESS: cv2.waitKey(1)
                 continue
@@ -3799,13 +3799,15 @@ def main():
                     ]
                 else:
                     # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
-                    # Base penetration: +5.0mm (was +20.0mm; backed up by 15mm to prevent crowding or toppling close bottles)
+                    # Upright object: level horizontal approach with proper silicone pad depth (~20mm).
+                    # Pads are 20mm behind fingertips (IK_L3); 20mm penetration centers pads firmly on object.
                     penetration_candidates = [
-                        5.0,                          # +5.0mm: fingertips/pads clamp securely with ~32mm servo clearance
-                        2.0,                          # +2.0mm: close bottle fallback
-                        0.0,                          #  0.0mm: exact surface edge
-                        -5.0,                         # -5.0mm: light pullback for very close bottles
-                        8.0,                          # +8.0mm: deeper grip fallback
+                        20.0,                         # +20.0mm: optimal deep grip (pads centered on bottle waist)
+                        18.0,                         # +18.0mm: robust fallback
+                        15.0,                         # +15.0mm: firm grip
+                        22.0,                         # +22.0mm: deep grip for distant bottles
+                        12.0,                         # +12.0mm: fallback
+                        8.0,                          # +8.0mm: fallback
                     ]
                 grab_pos = None
                 final_target = None
@@ -4008,12 +4010,8 @@ def main():
     
                 print("🔄 Back to search position...")
                 smooth_move(robot, START_POS, step_size=2.0, step_delay=0.03)
-                # Flush PyTorch CUDA VRAM and run garbage collection to keep FPS high
-                if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
                 STATE = "SEARCHING"
-                print("\n🔍 Search loop resumed (CUDA cache cleared)\n")
+                print("\n🔍 Search loop resumed\n")
 
     except KeyboardInterrupt:
         print("\n⏹️  Interrupted by user — stowing arm smoothly...")

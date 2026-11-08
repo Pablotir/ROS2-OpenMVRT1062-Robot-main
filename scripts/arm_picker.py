@@ -3657,7 +3657,7 @@ def main():
                     )
                     if anygrasp_j is not None and anygrasp_plan.get("success"):
                         grab_pos = anygrasp_j
-                        target_closed_grip = float(anygrasp_j.get("gripper.pos", GRIPPER_CLOSED_POS_DEG))
+                        target_closed_grip = GRIPPER_CLOSED_POS_DEG
                         target_pitch = anygrasp_plan.get("pitch_deg", 0.0)
                         target_roll = anygrasp_j.get("wrist_roll.pos", target_roll)
                         best_w = anygrasp_plan.get("best_wrist_pose")
@@ -3976,7 +3976,8 @@ def main():
                 print("\n🦾 APPROACHING (jaws wide open)...")
                 grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
                 # For rotated steep grasps (e.g. 90° flat phone), smooth_move moves all joints directly without fighting level_approach:
-                is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", -86.0) - HARDWARE_NEUTRAL_ROLL_DEG) > 25.0
+                neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
+                is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
                 if is_rotated_roll:
                     print("   📐 Rotated wrist approach (adaptive 5-DoF flat phone alignment)...")
                     smooth_move(robot, grab_pos, step_size=2.5, step_delay=0.03)

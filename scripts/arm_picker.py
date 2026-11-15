@@ -308,6 +308,7 @@ GRAB_LATERAL_OFFSET_RIGHT_MM = 35.0      # Reduced proportionally for pointed-ri
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
 GRIPPER_CLOSED_POS_DEG = 4.14   # °: Target angle when closing the claw (1585 ticks, firm clamp on bottle)
 GRIPPER_OPEN_POS_DEG   = 91.58  # °: Fully open jaws (2748 ticks)
+LIFT_MIN_DEG           = -110.0 # °: Minimum safe shoulder lift hardware limit (avoid backward lean)
 LIFT_MAX_DEG           = 85.0   # °: Maximum safe shoulder lift hardware limit
 
 
@@ -1588,7 +1589,21 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
     T_wrist_base = forward_kinematics(cur)   # 4×4 matrix from servo readings
     P_base      = T_wrist_base @ P_wrist
 
-    x_base, y_base, z_base = P_base[0], P_base[1], P_base[2]
+    x_base, y_base, z_base = float(P_base[0]), float(P_base[1]), float(P_base[2])
+
+    # Enforce optical line-of-sight base azimuth alignment:
+    # Eliminates azimuth skew caused by hand-eye calibration matrix errors (reprojection error).
+    # Since visual servoing actively centers the object on camera optical axis (cx, cy),
+    # the true line-of-sight in base frame is anchored to the servoed shoulder pan angle!
+    if "shoulder_pan.pos" in cur:
+        q1_servo = math.radians(-cur["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
+        # Angular deviation in camera azimuth: -atan2(x_cam, approach_z)
+        delta_phi = -math.atan2(x_cam, max(approach_z, 1.0))
+        q1_true = q1_servo + delta_phi
+        rho = math.hypot(x_base, y_base)
+        x_base = rho * math.cos(q1_true)
+        y_base = rho * math.sin(q1_true)
+
     if verbose:
         print(f"   🔗 P_cam=({x_cam:+.0f},{y_cam:+.0f},{z_cam:.0f})mm → "
               f"P_wrist=({P_wrist[0]:+.0f},{P_wrist[1]:+.0f},{P_wrist[2]:.0f})mm → "
@@ -2871,7 +2886,9 @@ class ObjectTracker:
                     cur_cy = (self.smooth_box[1] + self.smooth_box[3]) / 2.0
                     dist = math.hypot(cand_cx - cur_cx, cand_cy - cur_cy)
 
-                    if iou >= 0.10 or dist < 250.0:
+                    # Stricter spatial gating when locked on target to reject peripheral false detections
+                    max_allowed_dist = 85.0 if self.locked and self.confirmed_frames >= 3 else 180.0
+                    if iou >= 0.10 or dist < max_allowed_dist:
                         score = iou * 0.65 + max(0.0, 1.0 - (dist / float(fw))) * 0.35
                         valid_candidates.append((score, cand_box, cand_area, poly))
                 else:
@@ -3625,6 +3642,7 @@ def main():
             color_aligned = None
             seg_mask = None
             best_box = tracker.last_box if tracker.last_box is not None else (x1, y1, x2, y2)
+            converged_px, converged_py = obj_px, obj_py
 
             for _ in range(3):
                 c_snap, _, _ = cap.read()
@@ -3633,15 +3651,19 @@ def main():
                     res_snap = detect_with_rotation(model, color_aligned, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
                     found_snap, _, _, _ = tracker.detect(color_aligned, res_snap, TARGET_CLASS_IDS)
                     if found_snap and tracker.last_box is not None:
-                        best_box = tracker.last_box
-                        if hasattr(tracker, 'last_mask_polygon') and tracker.last_mask_polygon is not None:
-                            h_s, w_s = color_aligned.shape[:2]
-                            m = np.zeros((h_s, w_s), dtype=np.uint8)
-                            cv2.fillPoly(m, [tracker.last_mask_polygon.astype(np.int32)], 255)
-                            n_px = int(np.sum(m == 255))
-                            MAX_MASK_PIXELS = int(h_s * w_s * 0.15)
-                            if n_px <= MAX_MASK_PIXELS:
-                                seg_mask = m
+                        # Spatial gating: ensure consensus candidate remains close to converged visual servoing center
+                        cand_cx = (tracker.last_box[0] + tracker.last_box[2]) / 2.0
+                        cand_cy = (tracker.last_box[1] + tracker.last_box[3]) / 2.0
+                        if math.hypot(cand_cx - converged_px, cand_cy - converged_py) <= 65.0:
+                            best_box = tracker.last_box
+                            if hasattr(tracker, 'last_mask_polygon') and tracker.last_mask_polygon is not None:
+                                h_s, w_s = color_aligned.shape[:2]
+                                m = np.zeros((h_s, w_s), dtype=np.uint8)
+                                cv2.fillPoly(m, [tracker.last_mask_polygon.astype(np.int32)], 255)
+                                n_px = int(np.sum(m == 255))
+                                MAX_MASK_PIXELS = int(h_s * w_s * 0.15)
+                                if n_px <= MAX_MASK_PIXELS:
+                                    seg_mask = m
                 time.sleep(0.02)
 
             if color_aligned is None:
@@ -3649,6 +3671,17 @@ def main():
             h_a, w_a = color_aligned.shape[:2]
 
             x1_a, y1_a, x2_a, y2_a = best_box
+            # Gating safeguard: if consensus box center drifted, anchor it squarely to the converged center
+            cur_cx = (x1_a + x2_a) / 2.0
+            cur_cy = (y1_a + y2_a) / 2.0
+            if math.hypot(cur_cx - converged_px, cur_cy - converged_py) > 50.0:
+                half_w = (x2_a - x1_a) / 2.0
+                half_h = (y2_a - y1_a) / 2.0
+                x1_a = int(round(converged_px - half_w))
+                x2_a = int(round(converged_px + half_w))
+                y1_a = int(round(converged_py - half_h))
+                y2_a = int(round(converged_py + half_h))
+
             x1_a, y1_a = max(0, x1_a), max(0, y1_a)
             x2_a, y2_a = min(w_a, x2_a), min(h_a, y2_a)
 
@@ -3821,24 +3854,23 @@ def main():
                     mid_base = orient_3d.get("midpoint_base")
                     raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 280.0
                     if raw_dist >= 260.0:
-                        # Distant upright bottle: reach smoothly into the neck at ~303-305mm
-                        excess_reach = max(0.0, raw_dist - 304.0)
-                        base_pb = 0.0 - excess_reach
-                        pullback_val = float(np.clip(base_pb, -15.0, 5.0))
+                        # Distant upright bottle: reach smoothly into the neck (~308-316mm)
+                        # Gripper rubber pads sit ~17-20mm behind fingertips; positive penetration ensures
+                        # the rubber pads clamp firmly around the bottle neck without being short!
+                        max_allowed_pen = max(0.0, 316.0 - raw_dist)
+                        target_pen = float(np.clip(18.0, 5.0, max_allowed_pen))
                         penetration_candidates = [
-                            pullback_val,
-                            pullback_val + 3.0,
+                            target_pen,
+                            max(0.0, target_pen - 5.0),
                             0.0,
                             5.0,
-                            -5.0,
                         ]
                     else:
                         penetration_candidates = [
-                            0.0,
+                            15.0,
+                            10.0,
                             5.0,
-                            8.0,
-                            -5.0,
-                            -10.0,
+                            0.0,
                         ]
                 grab_pos = None
                 final_target = None
@@ -3925,9 +3957,9 @@ def main():
                         arm_z = min_safe_z
 
                     # Multi-height candidate search for standing upright bottle:
-                    # Tries optimal slim neck height elevated by +50mm (+5cm) first (depth reduced by 2cm)
-                    # to guarantee the gripper never plunges down into the body of the bottle
-                    z_candidates = [arm_z + 50.0, arm_z + 35.0, arm_z + 20.0] if orient_3d.get("is_upright") else [arm_z]
+                    # Targets the slim neck height directly (already placed at 82% bottle height in 3D analysis)
+                    # and searches tight +/-10mm window without overshooting above the bottle cap
+                    z_candidates = [arm_z, arm_z - 10.0, arm_z + 10.0] if orient_3d.get("is_upright") else [arm_z]
                     for trial_z in z_candidates:
                         cur_z = max(trial_z, min_safe_z)
                         if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:

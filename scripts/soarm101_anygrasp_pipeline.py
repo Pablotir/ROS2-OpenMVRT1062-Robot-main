@@ -507,7 +507,8 @@ class SemanticConfirmationGate:
         if "shoulder_pan.pos" in q_joints and N_obj > 0:
             q1_servo = math.radians(-q_joints["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
             u_center = float(np.mean(u_obj)) if len(u_obj) > 0 else cx
-            delta_azimuth = -(u_center - cx) / fx
+            # Clamp delta_azimuth to [-6°, +6°] so minor bbox edge offsets cannot distort azimuth or cause dev_mask rejection
+            delta_azimuth = float(np.clip(-(u_center - cx) / fx, math.radians(-6.0), math.radians(6.0)))
             q1_true = q1_servo + delta_azimuth
 
             q1_cam_cloud = float(np.arctan2(np.mean(P_obj_base[:, 1]), np.mean(P_obj_base[:, 0])))
@@ -763,10 +764,10 @@ class PretrainedGraspEngine:
                 neck_z = max(float(z_bot + 0.82 * (z_top - z_bot)), float(tbl_ref + 95.0))
                 pinch_centers[:, 2] = neck_z
 
-                # Cap radial reach of grasp targets to 304.0mm to position fingertips squarely
-                # at the bottle neck (reaching ~303-305mm) without being short or overextending
+                # Cap radial reach of grasp targets to 316.0mm to position fingertips squarely
+                # at the bottle neck (reaching ~310-316mm) without being short or overextending
                 r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-                excess_r = np.maximum(0.0, r_pinch - 304.0)
+                excess_r = np.maximum(0.0, r_pinch - 316.0)
                 pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
                 pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 

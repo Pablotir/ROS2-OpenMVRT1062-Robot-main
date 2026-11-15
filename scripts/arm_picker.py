@@ -1509,12 +1509,6 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 best_solution = c
 
         if best_solution is not None:
-            # For horizontal (pitch≈0°) upright grasps, reject solutions where Lift > 30°
-            # (high Lift means top-down forearm approach which overshoots and grazes bottle top)
-            if abs(test_pitch) < 5.0 and best_solution["shoulder_lift.pos"] > 30.0:
-                best_solution = None
-                best_cost = float('inf')
-                continue
             # Found a valid configuration for this pitch
             print(f"   ✅ IK matched at pitch {test_pitch:.1f}° (Lift={best_solution['shoulder_lift.pos']:+.1f}°, Elb={best_solution['elbow_flex.pos']:+.1f}°, Wst={best_solution['wrist_flex.pos']:+.1f}°)")
             return best_solution
@@ -2169,7 +2163,7 @@ def size_up_object(frame: np.ndarray | None,
 
             if is_upright_posture:
                 recommended_pitch = 0.0    # Level horizontal approach for upright standing bottle
-                height_pct = 60.0          # Grasp at bottle body (~60% height for secure cylindrical grip)
+                height_pct = 80.0          # Grasp at slim neck (~80% height beneath cap, +5cm above body)
             else:
                 recommended_pitch = -85.0  # Steep top-down approach for lying flat bottle
                 height_pct = 50.0
@@ -3896,9 +3890,9 @@ def main():
                         arm_z = min_safe_z
 
                     # Multi-height candidate search for standing upright bottle:
-                    # Tries optimal grasp height first, then steps progressively lower to find
-                    # a geometry that gives a low Lift angle (true side approach, not top-down)
-                    z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0, arm_z - 50.0, arm_z - 70.0] if orient_3d.get("is_upright") else [arm_z]
+                    # Tries optimal slim neck height first, then steps slightly higher (+15mm)
+                    # to guarantee the gripper never plunges down into the body of the bottle
+                    z_candidates = [arm_z, arm_z + 15.0, arm_z + 30.0] if orient_3d.get("is_upright") else [arm_z]
                     for trial_z in z_candidates:
                         cur_z = max(trial_z, min_safe_z)
                         if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:

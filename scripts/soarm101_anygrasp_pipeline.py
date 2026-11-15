@@ -686,30 +686,53 @@ class PretrainedGraspEngine:
         T_grasps = np.tile(np.eye(4, dtype=np.float64), (num_grasps, 1, 1))
 
         if is_tall_elongated:
-            # Side grasp approach for standing/tilted cylinders:
-            # Align approach azimuth with reach plane through wrist: q1_obj + theta_asym
-            half = num_grasps // 2
-            az1 = np.linspace(q1_obj + 0.70 * theta_asym, q1_obj + 1.15 * theta_asym, half)
-            az2 = np.linspace(q1_obj - 1.15 * theta_asym, q1_obj - 0.70 * theta_asym, num_grasps - half)
-            azimuths = np.concatenate([az1, az2])
-            np.random.shuffle(azimuths)
+            if R_obj < 260.0:
+                # Close standing cylinder: side approach unreachable; use top-down claw plunge at neck (+5cm above body CoM)
+                neck_z = max(float(com[2] + 50.0), float(np.max(P_obj[:, 2]) - 25.0))
+                pinch_centers[:, 2] = neck_z
 
-            # Continuous side approach pitches: between -15 deg and -45 deg
-            pitches = np.linspace(np.radians(-15.0), np.radians(-45.0), num_grasps)
-            np.random.shuffle(pitches)
+                pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
+                np.random.shuffle(pitches)
 
-            u_rx = np.cos(azimuths)
-            u_ry = np.sin(azimuths)
-            u_tx = -np.sin(azimuths)
-            u_ty = np.cos(azimuths)
+                tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
+                close_rad = tilt_plane_rad + math.pi / 2.0
+                x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
 
-            z_app_x = np.cos(pitches) * u_rx
-            z_app_y = np.cos(pitches) * u_ry
-            z_app_z = np.sin(pitches)
-            z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
+                u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
+                z_app_x = np.cos(pitches) * u_rad[0]
+                z_app_y = np.cos(pitches) * u_rad[1]
+                z_app_z = np.sin(pitches)
+                z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
 
-            x_closing = np.stack([u_tx, u_ty, np.zeros(num_grasps)], axis=-1)
-            y_thickness = np.cross(z_approach, x_closing)
+                dot_zx = np.sum(z_approach * x_close_base, axis=-1, keepdims=True)
+                x_closing = x_close_base - dot_zx * z_approach
+                x_closing /= (np.linalg.norm(x_closing, axis=-1, keepdims=True) + 1e-8)
+                y_thickness = np.cross(z_approach, x_closing)
+            else:
+                # Side grasp approach for standing/tilted cylinders:
+                # Align approach azimuth with reach plane through wrist: q1_obj + theta_asym
+                half = num_grasps // 2
+                az1 = np.linspace(q1_obj + 0.70 * theta_asym, q1_obj + 1.15 * theta_asym, half)
+                az2 = np.linspace(q1_obj - 1.15 * theta_asym, q1_obj - 0.70 * theta_asym, num_grasps - half)
+                azimuths = np.concatenate([az1, az2])
+                np.random.shuffle(azimuths)
+
+                # Continuous side approach pitches: between -15 deg and -45 deg
+                pitches = np.linspace(np.radians(-15.0), np.radians(-45.0), num_grasps)
+                np.random.shuffle(pitches)
+
+                u_rx = np.cos(azimuths)
+                u_ry = np.sin(azimuths)
+                u_tx = -np.sin(azimuths)
+                u_ty = np.cos(azimuths)
+
+                z_app_x = np.cos(pitches) * u_rx
+                z_app_y = np.cos(pitches) * u_ry
+                z_app_z = np.sin(pitches)
+                z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
+
+                x_closing = np.stack([u_tx, u_ty, np.zeros(num_grasps)], axis=-1)
+                y_thickness = np.cross(z_approach, x_closing)
 
         elif is_compact:
             # Compact 3D objects (balls, cubes, apples, mugs):
@@ -736,13 +759,19 @@ class PretrainedGraspEngine:
             y_thickness = np.cross(z_approach, x_closing)
 
         else:
-            # Flat objects lying on table (phones, tools, boxes, lying bottles):
-            # Pull back candidate pinch centers along reach line if outside 2-link reach envelope
-            excess_reach = max(0.0, R_obj - 248.0)
-            if excess_reach > 0.0:
-                pullback_reach = float(np.clip(15.0 + excess_reach, 15.0, 50.0))
-                u_radial = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
-                pinch_centers -= pullback_reach * u_radial
+            # Flat objects lying on table or close standing cylinders in top-down plunge:
+            z_span_obj = float(np.ptp(P_obj[:, 2]))
+            if is_cylinder_name or z_span_obj >= 35.0:
+                # Upright/tall object in claw plunge: elevate grasp to neck/top (+5cm above body CoM)
+                neck_z = max(float(com[2] + 50.0), float(np.max(P_obj[:, 2]) - 25.0))
+                pinch_centers[:, 2] = neck_z
+            else:
+                # Pure flat object (e.g. phone lying flat): pull back along reach line if outside 2-link reach envelope
+                excess_reach = max(0.0, R_obj - 248.0)
+                if excess_reach > 0.0:
+                    pullback_reach = float(np.clip(15.0 + excess_reach, 15.0, 50.0))
+                    u_radial = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
+                    pinch_centers -= pullback_reach * u_radial
 
             # Top-down plunge approach centered around -75 deg to -88 deg
             pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
@@ -1074,20 +1103,30 @@ class VectorizedSO101GraspSolver:
         S_height_com = np.zeros(N, dtype=np.float64)
         theta_pitch_deg = np.degrees(ik_results["theta_pitch"])
 
+        R_obj = math.hypot(com[0], com[1])
+        z_span_obj = float(np.ptp(P_obj_base[:, 2]))
+        has_vert_height = (z_span_obj >= 35.0)
+
         if is_tall_elongated:
-            # Tall Standing / Tilted Object (bottles, tall cans, flasks):
-            # Optimal grasp elevation: peak reward at 60%-75% height zone (centered at 68% waist/neck)
-            S_height_com = np.exp(-((h_rel - 0.68) ** 2) / (2.0 * (0.09 ** 2)))
+            if R_obj < 260.0:
+                # Close standing cylinder: claw plunge at neck (+5cm above body CoM)
+                target_z = max(float(com[2] + 50.0), float(np.max(P_obj_base[:, 2]) - 25.0))
+                dist_z = np.abs(pinch_centers[:, 2] - target_z)
+                S_height_com = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
+            else:
+                # Tall Standing / Tilted Object (bottles, tall cans, flasks):
+                # Optimal grasp elevation: peak reward at 60%-75% height zone (centered at 68% waist/neck)
+                S_height_com = np.exp(-((h_rel - 0.68) ** 2) / (2.0 * (0.09 ** 2)))
 
-            # 3D Anti-Overshoot Cap Guard:
-            # Disqualify grasps within 30.0 mm of top cap
-            cap_guard_dist = min(30.0, 0.20 * total_height)
-            near_top_cap = dist_from_top_cap_mm < cap_guard_dist
-            S_height_com[near_top_cap] = -1.0
+                # 3D Anti-Overshoot Cap Guard:
+                # Disqualify grasps within 30.0 mm of top cap
+                cap_guard_dist = min(30.0, 0.20 * total_height)
+                near_top_cap = dist_from_top_cap_mm < cap_guard_dist
+                S_height_com[near_top_cap] = -1.0
 
-            # Penalize steep claw-machine vertical plunges from above for standing tall objects
-            steep_top_down = theta_pitch_deg < -55.0
-            S_height_com[steep_top_down] -= 1.0
+                # Penalize steep claw-machine vertical plunges from above for distant standing tall objects
+                steep_top_down = theta_pitch_deg < -55.0
+                S_height_com[steep_top_down] -= 1.0
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1099,10 +1138,16 @@ class VectorizedSO101GraspSolver:
             S_height_com[near_top_crown] = -0.5
 
         else:
-            # Flat Object on Table (phones, tools, horizontal containers, boxes):
-            # Optimal grasp: centered within 15mm of 3D Center of Mass
-            dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
-            S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (15.0 ** 2)))
+            if has_vert_height:
+                # Upright object in claw plunge: reward neck elevation (+5cm above body CoM)
+                target_z = max(float(com[2] + 50.0), float(np.max(P_obj_base[:, 2]) - 25.0))
+                dist_z = np.abs(pinch_centers[:, 2] - target_z)
+                S_height_com = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
+            else:
+                # Flat Object on Table (phones, tools, horizontal containers, boxes):
+                # Optimal grasp: centered within 15mm of 3D Center of Mass
+                dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
+                S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (15.0 ** 2)))
 
         # 3. 5-DoF Projection Compliance Score cos(delta_phi)
         S_projection = np.cos(ik_results["delta_phi"])
@@ -1138,10 +1183,13 @@ class VectorizedSO101GraspSolver:
 
         S_joint = 0.60 * S_dist + 0.40 * S_limits
 
-        # 5. Pitch Level Score — penalizes near-vertical (claw-machine) approaches for horizontal grasps
+        # 5. Pitch Level Score — penalizes near-vertical (claw-machine) approaches for distant horizontal grasps,
+        # but allows claw plunge for close objects (R_obj < 260mm) or tall objects where steep approach is kinematically required
         theta_pitch_deg_arr = np.degrees(ik_results["theta_pitch"])
-        # S_level: +1 at pitch=0° (horizontal), -1 at pitch<=-50° (nearly vertical down)
-        S_level = np.clip((theta_pitch_deg_arr + 50.0) / 50.0, -1.0, 1.0)
+        if R_obj < 260.0 or has_vert_height:
+            S_level = np.ones(N, dtype=np.float64)
+        else:
+            S_level = np.clip((theta_pitch_deg_arr + 50.0) / 50.0, -1.0, 1.0)
 
         # 6. Composite Vectorized Score
         composite_score = (0.35 * scores +

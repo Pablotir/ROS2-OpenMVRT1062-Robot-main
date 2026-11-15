@@ -3891,9 +3891,9 @@ def main():
                         arm_z = min_safe_z
 
                     # Multi-height candidate search for standing upright bottle:
-                    # Tries optimal slim neck height first, then steps slightly higher (+15mm)
+                    # Tries optimal slim neck height elevated by +30mm (+3cm) first
                     # to guarantee the gripper never plunges down into the body of the bottle
-                    z_candidates = [arm_z, arm_z + 15.0, arm_z + 30.0] if orient_3d.get("is_upright") else [arm_z]
+                    z_candidates = [arm_z + 30.0, arm_z + 15.0, arm_z] if orient_3d.get("is_upright") else [arm_z]
                     for trial_z in z_candidates:
                         cur_z = max(trial_z, min_safe_z)
                         if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:

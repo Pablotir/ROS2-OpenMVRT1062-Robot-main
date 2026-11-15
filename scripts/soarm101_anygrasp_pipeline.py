@@ -687,8 +687,8 @@ class PretrainedGraspEngine:
 
         if is_tall_elongated:
             if R_obj < 260.0:
-                # Close standing cylinder: side approach unreachable; use top-down claw plunge at neck (+5cm above body CoM)
-                neck_z = max(float(com[2] + 50.0), float(np.max(P_obj[:, 2]) - 25.0))
+                # Close standing cylinder: side approach unreachable; use top-down claw plunge at neck (+8cm above body CoM)
+                neck_z = max(float(com[2] + 80.0), float(np.max(P_obj[:, 2]) + 5.0))
                 pinch_centers[:, 2] = neck_z
 
                 pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
@@ -762,8 +762,8 @@ class PretrainedGraspEngine:
             # Flat objects lying on table or close standing cylinders in top-down plunge:
             z_span_obj = float(np.ptp(P_obj[:, 2]))
             if is_cylinder_name or z_span_obj >= 35.0:
-                # Upright/tall object in claw plunge: elevate grasp to neck/top (+5cm above body CoM)
-                neck_z = max(float(com[2] + 50.0), float(np.max(P_obj[:, 2]) - 25.0))
+                # Upright/tall object in claw plunge: elevate grasp to neck/top (+8cm above body CoM)
+                neck_z = max(float(com[2] + 80.0), float(np.max(P_obj[:, 2]) + 5.0))
                 pinch_centers[:, 2] = neck_z
             else:
                 # Pure flat object (e.g. phone lying flat): pull back along reach line if outside 2-link reach envelope
@@ -1115,8 +1115,8 @@ class VectorizedSO101GraspSolver:
 
         if is_tall_elongated:
             if R_obj < 260.0:
-                # Close standing cylinder: claw plunge at neck (+5cm above body CoM)
-                target_z = max(float(com[2] + 50.0), float(np.max(P_obj_base[:, 2]) - 25.0))
+                # Close standing cylinder: claw plunge at neck (+8cm above body CoM)
+                target_z = max(float(com[2] + 80.0), float(np.max(P_obj_base[:, 2]) + 5.0))
                 dist_z = np.abs(pinch_centers[:, 2] - target_z)
                 S_height_com = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
             else:
@@ -1145,8 +1145,8 @@ class VectorizedSO101GraspSolver:
 
         else:
             if has_vert_height:
-                # Upright object in claw plunge: reward neck elevation (+5cm above body CoM)
-                target_z = max(float(com[2] + 50.0), float(np.max(P_obj_base[:, 2]) - 25.0))
+                # Upright object in claw plunge: reward neck elevation (+8cm above body CoM)
+                target_z = max(float(com[2] + 80.0), float(np.max(P_obj_base[:, 2]) + 5.0))
                 dist_z = np.abs(pinch_centers[:, 2] - target_z)
                 S_height_com = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
             else:

@@ -619,7 +619,8 @@ class PretrainedGraspEngine:
     @profile_stage("Stage 2: 6-DoF Point-Cloud Grasp Synthesis", target_ms=180.0)
     def synthesize_6dof_grasps(self,
                                P_obj_base: np.ndarray,
-                               P_bg_base: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                               P_bg_base: Optional[np.ndarray] = None,
+                               target_label: str = "bottle") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Synthesizes N candidate 6-DoF grasps in base frame.
         Returns:
@@ -643,7 +644,7 @@ class PretrainedGraspEngine:
             return T_grasps[:self.num_samples], scores[:self.num_samples], widths[:self.num_samples]
 
         # 3. High-Performance Vectorized Antipodal Synthesis Engine
-        return self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples)
+        return self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label)
 
     def _vectorized_antipodal_synthesis(self,
                                         P_obj: np.ndarray,
@@ -694,9 +695,14 @@ class PretrainedGraspEngine:
                 pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
                 np.random.shuffle(pitches)
 
-                tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
-                close_rad = tilt_plane_rad + math.pi / 2.0
-                x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
+                if is_cylinder_name or z_span_obj >= 35.0:
+                    # Axisymmetric standing cylinder: clamp symmetrically perpendicular to reach azimuth (n_plane)
+                    # Guarantees roll_deg = HARDWARE_NEUTRAL_ROLL_DEG (+29.27°), eliminating unnecessary wrist twisting!
+                    x_close_base = np.array([-np.sin(q1_obj), np.cos(q1_obj), 0.0])
+                else:
+                    tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
+                    close_rad = tilt_plane_rad + math.pi / 2.0
+                    x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
 
                 u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
                 z_app_x = np.cos(pitches) * u_rad[0]
@@ -777,10 +783,15 @@ class PretrainedGraspEngine:
             pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
             np.random.shuffle(pitches)
 
-            # Clamp across narrow width perpendicular to planar tilt
-            tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
-            close_rad = tilt_plane_rad + math.pi / 2.0
-            x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
+            # Clamp across narrow width
+            if is_cylinder_name or z_span_obj >= 35.0:
+                # Axisymmetric standing cylinder: clamp symmetrically perpendicular to reach azimuth (n_plane)
+                # Guarantees roll_deg = HARDWARE_NEUTRAL_ROLL_DEG (+29.27°), eliminating unnecessary wrist twisting!
+                x_close_base = np.array([-np.sin(q1_obj), np.cos(q1_obj), 0.0])
+            else:
+                tilt_plane_rad = np.arctan2(v_main[1], v_main[0])
+                close_rad = tilt_plane_rad + math.pi / 2.0
+                x_close_base = np.array([np.cos(close_rad), np.sin(close_rad), 0.0])
 
             u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
             z_app_x = np.cos(pitches) * u_rad[0]
@@ -1289,7 +1300,8 @@ class ThreeStageAnyGraspPipeline:
         # ---------------------------------------------------------------------
         T_grasps, scores, widths = self.stage2_engine.synthesize_6dof_grasps(
             P_obj_base=P_obj_base,
-            P_bg_base=P_bg_base
+            P_bg_base=P_bg_base,
+            target_label=target_label
         )
 
         # ---------------------------------------------------------------------

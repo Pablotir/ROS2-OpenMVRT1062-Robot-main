@@ -495,6 +495,26 @@ class SemanticConfirmationGate:
         P_bg_h = np.hstack([P_bg_cam, np.ones((N_bg, 1), dtype=np.float32)])
         P_bg_base = (T_base_cam @ P_bg_h.T).T[:, :3]
 
+        # 3b. Align azimuth of P_obj_base with the physically servoed line-of-sight:
+        # Prevents lateral grasp offset caused by skewed hand-eye rotation matrix.
+        if "shoulder_pan.pos" in q_joints and N_obj > 0:
+            q1_servo = math.radians(-q_joints["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
+            u_center = float(np.mean(u_obj)) if len(u_obj) > 0 else cx
+            delta_azimuth = -(u_center - cx) / fx
+            q1_true = q1_servo + delta_azimuth
+
+            q1_cam_cloud = float(np.arctan2(np.mean(P_obj_base[:, 1]), np.mean(P_obj_base[:, 0])))
+            delta_q1 = q1_true - q1_cam_cloud
+
+            c_corr, s_corr = math.cos(delta_q1), math.sin(delta_q1)
+            R_corr = np.array([
+                [c_corr, -s_corr, 0.0],
+                [s_corr,  c_corr, 0.0],
+                [0.0,     0.0,    1.0]
+            ], dtype=np.float64)
+            P_obj_base = P_obj_base @ R_corr.T
+            P_bg_base = P_bg_base @ R_corr.T
+
         # 4. Fast Vectorized Table Plane Fit (RANSAC < 5 ms)
         Z_table, n_table = self._fit_table_plane_ransac(P_bg_base, P_obj_base)
 
@@ -620,7 +640,8 @@ class PretrainedGraspEngine:
     def synthesize_6dof_grasps(self,
                                P_obj_base: np.ndarray,
                                P_bg_base: Optional[np.ndarray] = None,
-                               target_label: str = "bottle") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                               target_label: str = "bottle",
+                               Z_table: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Synthesizes N candidate 6-DoF grasps in base frame.
         Returns:
@@ -644,12 +665,13 @@ class PretrainedGraspEngine:
             return T_grasps[:self.num_samples], scores[:self.num_samples], widths[:self.num_samples]
 
         # 3. High-Performance Vectorized Antipodal Synthesis Engine
-        return self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label)
+        return self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label, Z_table=Z_table)
 
     def _vectorized_antipodal_synthesis(self,
                                         P_obj: np.ndarray,
                                         num_grasps: int,
-                                        target_label: str = "bottle") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                        target_label: str = "bottle",
+                                        Z_table: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Vectorized antipodal grasp generator across object point cloud.
         Aligns approach azimuths with 5-DoF reach plane taking into account
@@ -723,14 +745,17 @@ class PretrainedGraspEngine:
             else:
                 # ── FARTHER STANDING CYLINDER (R_obj >= 250mm) ────────────────────────
                 # Extend straight forward to grab the bottle's neck! (NO claw machine plunge)
-                # Target the bottle's upper neck cylinder (75% to 85% height, or 20mm below top)
+                # Target the bottle's upper neck cylinder (elevated well above table floor)
                 z_top = float(np.max(P_obj[:, 2]))
                 z_bot = float(np.min(P_obj[:, 2]))
-                neck_z = float(z_bot + 0.80 * (z_top - z_bot)) if (z_top - z_bot) > 30.0 else float(z_top - 20.0)
+                tbl_ref = Z_table if Z_table is not None else (z_bot - 5.0)
+                # Ensure grasp is elevated at least 85mm above tabletop to reach the neck
+                # and prevent diving down into the base of the bottle
+                neck_z = max(float(z_bot + 0.80 * (z_top - z_bot)), float(tbl_ref + 85.0))
                 pinch_centers[:, 2] = neck_z
 
-                # Level to shallow approach pitch: 0 deg to -20 deg (horizontal forward reach)
-                pitches = np.linspace(np.radians(0.0), np.radians(-20.0), num_grasps)
+                # Level horizontal approach pitch: strictly 0 deg to -3 deg (NO downward diving!)
+                pitches = np.linspace(np.radians(0.0), np.radians(-3.0), num_grasps)
                 np.random.shuffle(pitches)
 
                 u_rx = np.cos(q1_obj)
@@ -929,8 +954,11 @@ class VectorizedSO101GraspSolver:
         delta_lat = w_val / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
-        v_stat_1 = np.stack([delta_lat, np.zeros(N), np.full(N, RADIAL_PULLBACK_MM), np.ones(N)], axis=-1)
-        v_stat_2 = np.stack([-delta_lat, np.zeros(N), np.full(N, RADIAL_PULLBACK_MM), np.ones(N)], axis=-1)
+        # Level grasps use -25mm pullback along approach to prevent overextension/overshoot past the neck;
+        # Claw plunges use -15mm pullback.
+        pullbacks = np.where(theta_pitch > np.radians(-30.0), -25.0, RADIAL_PULLBACK_MM)
+        v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
+        v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 
         # Stationary finger 3D coordinates in base frame
         P_stat_base_1 = np.einsum('nij,nj->ni', T_grasps, v_stat_1)[:, :3]
@@ -942,14 +970,14 @@ class VectorizedSO101GraspSolver:
         # Precompute wrist targets for both hypotheses
         T_asym_1 = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
         T_asym_1[:, 0, 3] = delta_lat
-        T_asym_1[:, 2, 3] = RADIAL_PULLBACK_MM
+        T_asym_1[:, 2, 3] = pullbacks
         T_w_1 = np.matmul(T_grasps, T_asym_1)
 
         T_asym_2 = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
         T_asym_2[:, 0, 0] = -1.0
         T_asym_2[:, 1, 1] = -1.0
         T_asym_2[:, 0, 3] = -delta_lat
-        T_asym_2[:, 2, 3] = RADIAL_PULLBACK_MM
+        T_asym_2[:, 2, 3] = pullbacks
         T_w_2 = np.matmul(T_grasps, T_asym_2)
 
         r1 = np.hypot(T_w_1[:, 0, 3], T_w_1[:, 1, 3])
@@ -1161,9 +1189,9 @@ class VectorizedSO101GraspSolver:
                 near_top_cap = dist_from_top_cap_mm < cap_guard_dist
                 S_height_com[near_top_cap] = -1.0
 
-                # Strictly disqualify steep claw-machine vertical plunges for distant standing tall objects!
-                steep_top_down = theta_pitch_deg < -45.0
-                S_height_com[steep_top_down] = -10.0
+                # Strictly disqualify any downward plunge for distant standing tall objects!
+                steep_pitch = theta_pitch_deg < -4.0
+                S_height_com[steep_pitch] = -10.0
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1235,7 +1263,8 @@ class VectorizedSO101GraspSolver:
         if R_obj < 250.0:
             S_level = np.ones(N, dtype=np.float64)
         else:
-            S_level = np.clip((theta_pitch_deg_arr + 30.0) / 30.0, -1.0, 1.0)
+            # Gaussian peak at strictly level horizontal approach (0.0°) with 4° tolerance
+            S_level = np.exp(-(theta_pitch_deg_arr ** 2) / (2.0 * (4.0 ** 2)))
 
         # 6. Composite Vectorized Score
         composite_score = (0.35 * scores +
@@ -1330,7 +1359,8 @@ class ThreeStageAnyGraspPipeline:
         T_grasps, scores, widths = self.stage2_engine.synthesize_6dof_grasps(
             P_obj_base=P_obj_base,
             P_bg_base=P_bg_base,
-            target_label=target_label
+            target_label=target_label,
+            Z_table=Z_table
         )
 
         # ---------------------------------------------------------------------

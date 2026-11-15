@@ -299,10 +299,10 @@ PREFERRED_GRAB_PITCH_DEG = 0.0
 # - If the MOVING (left) claw pokes the object on approach: DECREASE this value (-5mm to -10mm).
 # - Current value: 20.0mm (pure lateral shift perpendicular to reach line; preserves radial distance rho)
 # ==============================================================================
-GRAB_LATERAL_OFFSET_MM = 78.0            # 78.0mm default (63.0mm + 15.0mm extra left offset for vertical flat)
-GRAB_LATERAL_OFFSET_HORIZONTAL_MM = 91.2 # 91.2mm default (76.2mm + 15.0mm extra left offset for horizontal flat)
-GRAB_LATERAL_OFFSET_STANDING_MM = 76.2   # ~3.0 inches (76.2mm) for standing bottle
-GRAB_LATERAL_OFFSET_RIGHT_MM = 76.2      # ~3.0 inches (76.2mm) for pointed-right flat bottle
+GRAB_LATERAL_OFFSET_MM = 40.0            # Reduced to keep rho within IK reach envelope
+GRAB_LATERAL_OFFSET_HORIZONTAL_MM = 50.0 # Reduced proportionally for horizontal flat
+GRAB_LATERAL_OFFSET_STANDING_MM = 35.0   # Reduced to prevent top-down Lift for standing bottle
+GRAB_LATERAL_OFFSET_RIGHT_MM = 35.0      # Reduced proportionally for pointed-right flat bottle
 
 # ── Gripper Jaw Angles ────────────────────────────────────────────────────────
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
@@ -2163,7 +2163,7 @@ def size_up_object(frame: np.ndarray | None,
 
             if is_upright_posture:
                 recommended_pitch = 0.0    # Level horizontal approach for upright standing bottle
-                height_pct = 82.0          # Grasp at slim neck (~82% height beneath cap)
+                height_pct = 60.0          # Grasp at bottle body (~60% height for secure cylindrical grip)
             else:
                 recommended_pitch = -85.0  # Steep top-down approach for lying flat bottle
                 height_pct = 50.0

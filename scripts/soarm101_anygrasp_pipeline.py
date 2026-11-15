@@ -92,17 +92,17 @@ PAN_ZERO_OFFSET_DEG = -4.6      # Calibrated hardware base pan zero offset
 PAN_MIN_DEG         = -113.8    # Left mechanical limit
 PAN_MAX_DEG         =  113.8    # Right mechanical limit
 
-LIFT_MIN_DEG        = -90.0     # Avoid leaning backward into arm base
+LIFT_MIN_DEG        = -110.0    # Avoid leaning backward into arm base
 LIFT_MAX_DEG        =  150.0    # Forward reach limit
 ELBOW_MIN_DEG       = -120.0
-ELBOW_MAX_DEG       =  45.0     # > 45 deg indicates backward stow fold, not forward reach
+ELBOW_MAX_DEG       =  90.0     # Relaxed to allow forward reach configurations
 WRIST_FLEX_MIN_DEG  = -120.0
 WRIST_FLEX_MAX_DEG  =  120.0
 WRIST_ROLL_MIN_DEG  = -150.0
 WRIST_ROLL_MAX_DEG  =  150.0
 HARDWARE_NEUTRAL_ROLL_DEG = 29.27  # Physical servo neutral horizontal roll angle (homing_offset -1120)
-GRAB_LATERAL_OFFSET_STANDING_MM = 76.2  # Calibrated hardware lateral offset for upright standing (mm)
-GRAB_LATERAL_OFFSET_FLAT_MM = 91.2      # Calibrated hardware lateral offset for flat table grasp (mm)
+GRAB_LATERAL_OFFSET_STANDING_MM = 35.0  # Reduced to prevent top-down approach (rho stays in reach envelope)
+GRAB_LATERAL_OFFSET_FLAT_MM = 50.0      # Reduced proportionally for flat table grasp
 
 D405_MIN_RANGE_M    = 0.07      # RealSense D405 optical min range (0.07 m = 70 mm)
 D405_MAX_RANGE_M    = 0.50      # Close-range workspace max range (0.50 m = 500 mm)
@@ -1138,11 +1138,17 @@ class VectorizedSO101GraspSolver:
 
         S_joint = 0.60 * S_dist + 0.40 * S_limits
 
-        # 5. Composite Vectorized Score
-        composite_score = (0.40 * scores +
-                           0.30 * S_height_com +
+        # 5. Pitch Level Score — penalizes near-vertical (claw-machine) approaches for horizontal grasps
+        theta_pitch_deg_arr = np.degrees(ik_results["theta_pitch"])
+        # S_level: +1 at pitch=0° (horizontal), -1 at pitch<=-50° (nearly vertical down)
+        S_level = np.clip((theta_pitch_deg_arr + 50.0) / 50.0, -1.0, 1.0)
+
+        # 6. Composite Vectorized Score
+        composite_score = (0.35 * scores +
+                           0.25 * S_height_com +
                            0.15 * S_projection +
-                           0.15 * S_joint)
+                           0.15 * S_joint +
+                           0.10 * S_level)
 
         composite_score[~valid_mask] = -1e9
 
@@ -1153,6 +1159,7 @@ class VectorizedSO101GraspSolver:
             "score_height_com": S_height_com,
             "score_projection": S_projection,
             "score_joint": S_joint,
+            "score_level": S_level,
             "dist_from_top_cap_mm": dist_from_top_cap_mm,
             "height_percent": h_rel * 100.0
         }

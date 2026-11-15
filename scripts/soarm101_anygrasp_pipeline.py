@@ -763,10 +763,10 @@ class PretrainedGraspEngine:
                 neck_z = max(float(z_bot + 0.82 * (z_top - z_bot)), float(tbl_ref + 95.0))
                 pinch_centers[:, 2] = neck_z
 
-                # Cap radial reach of grasp targets to 298.0mm to prevent overshooting
-                # past the bottle neck and sagging under cantilever torque load
+                # Cap radial reach of grasp targets to 304.0mm to position fingertips squarely
+                # at the bottle neck (reaching ~303-305mm) without being short or overextending
                 r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-                excess_r = np.maximum(0.0, r_pinch - 298.0)
+                excess_r = np.maximum(0.0, r_pinch - 304.0)
                 pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
                 pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 
@@ -972,9 +972,9 @@ class VectorizedSO101GraspSolver:
         delta_lat = w_val / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
-        # Level grasps use -25mm pullback along approach to prevent overextension/overshoot past the neck;
+        # Level grasps use neutral 0.0mm pullback to reach bottle neck squarely at ~303-305mm without being short;
         # Claw plunges use -15mm pullback.
-        pullbacks = np.where(theta_pitch > np.radians(-30.0), -25.0, RADIAL_PULLBACK_MM)
+        pullbacks = np.where(theta_pitch > np.radians(-30.0), 0.0, RADIAL_PULLBACK_MM)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
         v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 

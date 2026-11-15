@@ -881,7 +881,7 @@ def check_servo_health(robot) -> bool:
 
 
 
-def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
+def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.02,
                 hold_joints=None):
     if hold_joints is None:
         hold_joints = []
@@ -895,16 +895,18 @@ def smooth_move(robot, target: dict, step_size=2.0, step_delay=0.02,
         return
     n = max(1, int(max_delta / step_size))
     for s in range(1, n + 1):
-        t      = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0))
+        t = s / n
+        # Smooth S-curve sinusoidal easing for bell-shaped acceleration and deceleration
+        t_eased = 0.5 * (1.0 - math.cos(math.pi * t))
+        interp = {j: cur.get(j, 0.0) + t_eased * (target[j] - cur.get(j, 0.0))
                   for j in target}
         robot.send_action(interp)
         time.sleep(step_delay)
 
 
-def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
+def level_approach(robot, target: dict, step_size=1.5, step_delay=0.025):
     """
-    Move all joints simultaneously toward *target* at uniform speed while
+    Move all joints simultaneously toward *target* with smooth S-curve easing while
     continuously adjusting wrist_flex so the gripper smoothly tracks the
     desired approach pitch along the reach trajectory (pitch = 0° for horizontal,
     or steep/angled down for tilted or tabletop objects).
@@ -934,11 +936,13 @@ def level_approach(robot, target: dict, step_size=2.0, step_delay=0.03):
 
     for s in range(1, n + 1):
         t = s / n
-        interp = {j: cur.get(j, 0.0) + t * (target[j] - cur.get(j, 0.0))
+        # Smooth S-curve sinusoidal easing for bell-shaped acceleration and deceleration
+        t_eased = 0.5 * (1.0 - math.cos(math.pi * t))
+        interp = {j: cur.get(j, 0.0) + t_eased * (target[j] - cur.get(j, 0.0))
                   for j in target}
 
         # Desired pitch smoothly transitions from initial pitch to target pitch
-        desired_pitch_deg = pitch_0 + t * (pitch_tgt - pitch_0)
+        desired_pitch_deg = pitch_0 + t_eased * (pitch_tgt - pitch_0)
 
         lift_now = interp.get("shoulder_lift.pos", 0.0)
         elb_now  = interp.get("elbow_flex.pos", 0.0)
@@ -3817,18 +3821,16 @@ def main():
                     mid_base = orient_3d.get("midpoint_base")
                     raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 280.0
                     if raw_dist >= 260.0:
-                        # Distant upright bottle: pullback along reach line to center gripper squarely
-                        # on the front neck cylinder, preventing overshoot and cantilever droop
-                        excess_reach = max(0.0, raw_dist - 295.0)
-                        base_pb = -10.0 - excess_reach
-                        pullback_val = float(np.clip(base_pb, -30.0, -10.0))
+                        # Distant upright bottle: reach smoothly into the neck at ~303-305mm
+                        excess_reach = max(0.0, raw_dist - 304.0)
+                        base_pb = 0.0 - excess_reach
+                        pullback_val = float(np.clip(base_pb, -15.0, 5.0))
                         penetration_candidates = [
                             pullback_val,
-                            pullback_val + 5.0,
-                            -10.0,
-                            -5.0,
+                            pullback_val + 3.0,
                             0.0,
                             5.0,
+                            -5.0,
                         ]
                     else:
                         penetration_candidates = [
@@ -4043,13 +4045,14 @@ def main():
                         print("   📐 Rotated wrist approach (adaptive 5-DoF flat phone alignment)...")
                         smooth_move(robot, grab_pos, step_size=2.5, step_delay=0.03)
                     else:
-                        level_approach(robot, grab_pos, step_size=3.0, step_delay=0.03)
+                        print("   🌊 Smooth level approach into bottle neck...")
+                        level_approach(robot, grab_pos, step_size=1.5, step_delay=0.025)
                     time.sleep(0.4)
 
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG
                 print(f"✊ GRIPPING (closing jaws firmly to {actual_closed_grip:.1f}° with zero air gap)...")
                 grab_pos["gripper.pos"] = actual_closed_grip
-                smooth_move(robot, grab_pos, step_size=3.0, step_delay=0.02, hold_joints=[])
+                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02, hold_joints=[])
                 time.sleep(0.6)
 
                 if hover_pos is not None:
@@ -4059,13 +4062,15 @@ def main():
                     smooth_move(robot, hover_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
                     time.sleep(0.3)
                 else:
-                    # Level neck grab: lift arm slightly (+12° lift) before retracting so bottle base clears table cleanly
+                    # Level neck grab: lift arm straight up (+27mm upward in Z) before retracting so bottle base clears table cleanly
                     print("   ⬆️  Lifting bottle straight up off table...")
                     cur_j = get_pos(robot)
+                    # To lift upward in base frame, shoulder_lift angle must decrease (t1 = 90 - lift)
                     lift_pos = dict(grab_pos)
-                    lift_pos["shoulder_lift.pos"] = min(LIFT_MAX_DEG, grab_pos["shoulder_lift.pos"] + 12.0)
+                    lift_pos["shoulder_lift.pos"] = max(LIFT_MIN_DEG, grab_pos["shoulder_lift.pos"] - 14.0)
+                    lift_pos["wrist_flex.pos"] = grab_pos["wrist_flex.pos"] - 4.0
                     lift_pos["gripper.pos"] = actual_closed_grip
-                    smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
+                    smooth_move(robot, lift_pos, step_size=1.5, step_delay=0.025, hold_joints=["gripper.pos"])
                     time.sleep(0.3)
 
                 print("🏠 RETURNING...")

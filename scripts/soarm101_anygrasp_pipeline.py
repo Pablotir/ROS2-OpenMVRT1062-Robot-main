@@ -759,9 +759,9 @@ class PretrainedGraspEngine:
                 z_top = float(np.max(P_obj[:, 2]))
                 z_bot = float(np.min(P_obj[:, 2]))
                 tbl_ref = Z_table if Z_table is not None else (z_bot - 5.0)
-                # Ensure grasp is elevated at least 95mm above tabletop to reach the slim neck
-                # and prevent diving down into the body/base of the bottle
-                neck_z = max(float(z_bot + 0.82 * (z_top - z_bot)), float(tbl_ref + 95.0))
+                # Position grasp squarely at neck cylinder (~65mm above tabletop, ~65% height).
+                # Lowered by ~3cm per user feedback to eliminate hovering over the top of the bottle.
+                neck_z = max(float(z_bot + 0.65 * (z_top - z_bot)), float(tbl_ref + 65.0))
                 pinch_centers[:, 2] = neck_z
 
                 # Cap radial reach of grasp targets to 316.0mm to position fingertips squarely
@@ -1064,8 +1064,8 @@ class VectorizedSO101GraspSolver:
         # the physical fingertips maintain true level neck elevation.
         theta_pitch_deg_arr = np.degrees(theta_pitch)
         is_level = np.abs(theta_pitch_deg_arr) <= 15.0
-        droop_comp = np.where(is_level & (rho_tip > 260.0),
-                              np.clip(12.0 * (rho_tip - 260.0) / 50.0, 0.0, 15.0),
+        droop_comp = np.where(is_level & (rho_tip > 275.0),
+                              np.clip(4.0 * (rho_tip - 275.0) / 45.0, 0.0, 5.0),
                               0.0)
         zw_comp = zw + droop_comp
 

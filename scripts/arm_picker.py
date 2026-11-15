@@ -1452,8 +1452,8 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
         # Feedforward gravity droop compensation for cantilevered horizontal reaches:
         # STS3215 compliance + link flex droop compensation under D405 camera load
         droop_comp_z = 0.0
-        if abs(test_pitch) <= 15.0 and rho > 260.0:
-            droop_comp_z = float(np.clip(12.0 * (rho - 260.0) / 50.0, 0.0, 15.0))
+        if abs(test_pitch) <= 15.0 and rho > 275.0:
+            droop_comp_z = float(np.clip(4.0 * (rho - 275.0) / 45.0, 0.0, 5.0))
         effective_z = z_mm + droop_comp_z
 
         wrist_x = rho   - IK_L3 * math.cos(pitch_rad)
@@ -2610,15 +2610,15 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
 
     if is_upright:
         # Upright standing bottle: stands vertically on tabletop from live_table_z to (live_table_z + h_calc).
-        # Grasp at the slim neck cylinder directly beneath the cap (~82% of bottle height, ~35mm below cap top).
+        # Grasp at the slim neck cylinder directly beneath the cap (~65% of bottle height, ~65mm above table).
         h_bottle = 210.0
         if sizing is not None and "height_mm" in sizing:
             h_bottle = float(sizing["height_mm"])
         h_bottle = float(np.clip(h_bottle, 140.0, 290.0))
 
-        # Target neck grasp height above tabletop (slim neck zone, ~35mm below top cap):
-        neck_height_above_table = max(h_bottle - 35.0, 0.82 * h_bottle)
-        safe_z_b = max(live_table_z + neck_height_above_table, live_table_z + 95.0)
+        # Target neck grasp height above tabletop (~65mm above table / 65% height, lowered 3cm per user request):
+        neck_height_above_table = max(h_bottle - 65.0, 0.65 * h_bottle)
+        safe_z_b = max(live_table_z + neck_height_above_table, live_table_z + 65.0)
         # Clamp within safe physical workspace bounds
         safe_z_b = float(np.clip(safe_z_b, live_table_z + 40.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
@@ -4070,49 +4070,37 @@ def main():
                     smooth_move(robot, grab_pos, step_size=1.5, step_delay=0.03)
                     time.sleep(0.3)
                 else:
-                    # Standard level / rotated approach for side or shallow grasps
+                    # Single-phase smooth extension straight into grasp pose (no hovering, no awkward joint pitch warping)
                     neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
                     is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
                     if is_rotated_roll:
                         print("   📐 Rotated wrist approach (adaptive 5-DoF flat phone alignment)...")
-                        smooth_move(robot, grab_pos, step_size=2.5, step_delay=0.03)
                     else:
-                        print("   🌊 Smooth level approach into bottle neck...")
-                        level_approach(robot, grab_pos, step_size=1.5, step_delay=0.025)
-                    time.sleep(0.4)
+                        print("   🌊 Smooth extension directly into bottle neck...")
+                    smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.025)
+                    time.sleep(0.3)
 
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG
                 print(f"✊ GRIPPING (closing jaws firmly to {actual_closed_grip:.1f}° with zero air gap)...")
                 grab_pos["gripper.pos"] = actual_closed_grip
                 smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02, hold_joints=[])
-                time.sleep(0.6)
+                time.sleep(0.5)
 
                 if hover_pos is not None:
-                    # Stage 3: Vertical lift before returning to avoid dragging against table
+                    # Stage 3: Vertical lift before returning to avoid dragging against table (claw machine only)
                     print("   ⬆️  Vertical lift: lifting object straight up off table...")
                     hover_pos["gripper.pos"] = actual_closed_grip
                     smooth_move(robot, hover_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
                     time.sleep(0.3)
-                else:
-                    # Level neck grab: lift arm straight up (+27mm upward in Z) before retracting so bottle base clears table cleanly
-                    print("   ⬆️  Lifting bottle straight up off table...")
-                    cur_j = get_pos(robot)
-                    # To lift upward in base frame, shoulder_lift angle must decrease (t1 = 90 - lift)
-                    lift_pos = dict(grab_pos)
-                    lift_pos["shoulder_lift.pos"] = max(LIFT_MIN_DEG, grab_pos["shoulder_lift.pos"] - 14.0)
-                    lift_pos["wrist_flex.pos"] = grab_pos["wrist_flex.pos"] - 4.0
-                    lift_pos["gripper.pos"] = actual_closed_grip
-                    smooth_move(robot, lift_pos, step_size=1.5, step_delay=0.025, hold_joints=["gripper.pos"])
-                    time.sleep(0.3)
 
-                print("🏠 RETURNING...")
+                print("🏠 RETREATING back to position...")
                 drop_pos = dict(START_POS)
                 drop_pos["gripper.pos"] = actual_closed_grip
                 # Maintain the grasp wrist roll so the wrist never twists while carrying the bottle:
                 drop_pos["wrist_roll.pos"] = grab_pos.get("wrist_roll.pos", target_roll)
                 smooth_move(robot, drop_pos, step_size=2.0, step_delay=0.03,
                             hold_joints=["gripper.pos"])
-                time.sleep(0.8)
+                time.sleep(0.6)
     
                 print("🖐 DROPPING...")
                 drop_pos["gripper.pos"] = 60.0

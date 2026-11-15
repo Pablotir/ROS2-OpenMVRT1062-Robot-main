@@ -1480,8 +1480,8 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
             if m_lift < -90.0: continue
 
             # For forward reaching and grasping, reject configurations where the elbow
-            # remains folded tightly backward against the upper arm (m_elbow > 45° is a stow fold, not a reach)
-            if m_elbow > 45.0: continue
+            # remains folded tightly backward against the upper arm (m_elbow > 90° is a stow fold, not a reach)
+            if m_elbow > 90.0: continue
 
             valid_candidates.append({
                 "shoulder_pan.pos":  pan_deg,
@@ -1509,6 +1509,12 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
                 best_solution = c
 
         if best_solution is not None:
+            # For horizontal (pitch≈0°) upright grasps, reject solutions where Lift > 30°
+            # (high Lift means top-down forearm approach which overshoots and grazes bottle top)
+            if abs(test_pitch) < 5.0 and best_solution["shoulder_lift.pos"] > 30.0:
+                best_solution = None
+                best_cost = float('inf')
+                continue
             # Found a valid configuration for this pitch
             print(f"   ✅ IK matched at pitch {test_pitch:.1f}° (Lift={best_solution['shoulder_lift.pos']:+.1f}°, Elb={best_solution['elbow_flex.pos']:+.1f}°, Wst={best_solution['wrist_flex.pos']:+.1f}°)")
             return best_solution
@@ -3798,16 +3804,15 @@ def main():
                         0.0,                       # neutral zero fallback
                     ]
                 else:
-                    # Upright bottle: level horizontal approach backed up by 15mm so claw pads grip neck without overextending
-                    # Upright object: level horizontal approach with proper silicone pad depth (~20mm).
-                    # Pads are 20mm behind fingertips (IK_L3); 20mm penetration centers pads firmly on object.
+                    # Upright bottle: level horizontal approach — start conservative, work deeper
                     penetration_candidates = [
-                        20.0,                         # +20.0mm: optimal deep grip (pads centered on bottle waist)
-                        18.0,                         # +18.0mm: robust fallback
+                        5.0,                          # +5.0mm: shallow grip (avoids overextension for near bottles)
+                        8.0,                          # +8.0mm: standard grip
+                        12.0,                         # +12.0mm: moderate grip
                         15.0,                         # +15.0mm: firm grip
-                        22.0,                         # +22.0mm: deep grip for distant bottles
-                        12.0,                         # +12.0mm: fallback
-                        8.0,                          # +8.0mm: fallback
+                        18.0,                         # +18.0mm: deep grip
+                        0.0,                          # 0.0mm: surface touch fallback
+                        -10.0,                        # -10.0mm: pullback for over-reach scenarios
                     ]
                 grab_pos = None
                 final_target = None
@@ -3891,8 +3896,9 @@ def main():
                         arm_z = min_safe_z
 
                     # Multi-height candidate search for standing upright bottle:
-                    # Tries optimal slim neck beneath cap (~82% height) first, falling back to 75% or 70% if needed
-                    z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0] if orient_3d.get("is_upright") else [arm_z]
+                    # Tries optimal grasp height first, then steps progressively lower to find
+                    # a geometry that gives a low Lift angle (true side approach, not top-down)
+                    z_candidates = [arm_z, arm_z - 15.0, arm_z - 30.0, arm_z - 50.0, arm_z - 70.0] if orient_3d.get("is_upright") else [arm_z]
                     for trial_z in z_candidates:
                         cur_z = max(trial_z, min_safe_z)
                         if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:

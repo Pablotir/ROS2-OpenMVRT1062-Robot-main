@@ -3860,14 +3860,15 @@ def main():
                     # Shifts claw strictly to the robot's LEFT (-sin(pan), +cos(pan)) away from the static right pincer.
                     # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
                     tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
-                    if orient_3d.get("is_upright"):
-                        lat_offset = GRAB_LATERAL_OFFSET_STANDING_MM   # ~3.0 inches (76.2mm)
+                    body_w = sizing.get("body_width_mm", 40.0) if sizing is not None else 40.0
+                    if orient_3d.get("is_upright") or abs(target_pitch) > 60.0:
+                        lat_offset = body_w / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
                     elif abs(tilt_val) >= 55.0:
-                        lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 91.2mm (76.2mm + 15.0mm extra left offset for horizontal flat)
+                        lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 50.0mm for horizontal flat
                     elif tilt_val <= -20.0:
-                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 76.2mm (tested and verified benchmark for angled)
+                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 35.0mm for pointed-right
                     else:
-                        lat_offset = GRAB_LATERAL_OFFSET_MM            # 78.0mm (63.0mm + 15.0mm extra left offset for vertical flat)
+                        lat_offset = GRAB_LATERAL_OFFSET_MM            # 40.0mm for vertical flat
 
                     if abs(lat_offset) > 0.01:
                         pan_t = math.atan2(arm_y, arm_x)

@@ -899,10 +899,16 @@ class VectorizedSO101GraspSolver:
         z_approach = T_grasps[:, :3, 2]
         theta_pitch = np.arcsin(np.clip(z_approach[:, 2], -1.0, 1.0))
 
-        # 2. Continuous lateral offset delta_lat(pitch)
-        # Smooth trigonometric bridge from +76.2mm (upright standing) to +91.2mm (flat table)
+        # 2. Width-Aware Asymmetric Pincer Offset delta_lat(w, pitch)
+        # Places stationary horn exactly (w/2 + 3.0mm) from object center for claw plunge,
+        # exactly matching the simulation geometry so the static tip almost touches the bottle.
+        w_val = widths if widths is not None else 40.0
+        delta_lat_claw = w_val / 2.0 + 3.0   # 3mm clearance: static tip rests right against bottle surface
+        delta_lat_side = np.clip(w_val / 2.0 + 12.0, 20.0, 35.0)  # Moderate side clearance for level lunges
+
+        cos_sq_pitch = np.cos(theta_pitch) ** 2
         sin_sq_pitch = np.sin(theta_pitch) ** 2
-        delta_lat = GRAB_LATERAL_OFFSET_STANDING_MM + (GRAB_LATERAL_OFFSET_FLAT_MM - GRAB_LATERAL_OFFSET_STANDING_MM) * sin_sq_pitch
+        delta_lat = delta_lat_side * cos_sq_pitch + delta_lat_claw * sin_sq_pitch
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), np.full(N, RADIAL_PULLBACK_MM), np.ones(N)], axis=-1)

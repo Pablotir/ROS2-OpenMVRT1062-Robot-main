@@ -3891,9 +3891,9 @@ def main():
                         arm_z = min_safe_z
 
                     # Multi-height candidate search for standing upright bottle:
-                    # Tries optimal slim neck height elevated by +30mm (+3cm) first
+                    # Tries optimal slim neck height elevated by +50mm (+5cm) first (depth reduced by 2cm)
                     # to guarantee the gripper never plunges down into the body of the bottle
-                    z_candidates = [arm_z + 30.0, arm_z + 15.0, arm_z] if orient_3d.get("is_upright") else [arm_z]
+                    z_candidates = [arm_z + 50.0, arm_z + 35.0, arm_z + 20.0] if orient_3d.get("is_upright") else [arm_z]
                     for trial_z in z_candidates:
                         cur_z = max(trial_z, min_safe_z)
                         if not workspace_in_bounds(arm_x, arm_y, cur_z) and not do_manual_lunge:
@@ -4025,6 +4025,15 @@ def main():
                     print("   ⬆️  Vertical lift: lifting object straight up off table...")
                     hover_pos["gripper.pos"] = actual_closed_grip
                     smooth_move(robot, hover_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
+                    time.sleep(0.3)
+                else:
+                    # Level neck grab: lift arm slightly (+12° lift) before retracting so bottle base clears table cleanly
+                    print("   ⬆️  Lifting bottle straight up off table...")
+                    cur_j = get_pos(robot)
+                    lift_pos = dict(grab_pos)
+                    lift_pos["shoulder_lift.pos"] = min(LIFT_MAX_DEG, grab_pos["shoulder_lift.pos"] + 12.0)
+                    lift_pos["gripper.pos"] = actual_closed_grip
+                    smooth_move(robot, lift_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
                     time.sleep(0.3)
 
                 print("🏠 RETURNING...")

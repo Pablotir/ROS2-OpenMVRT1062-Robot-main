@@ -957,12 +957,9 @@ class VectorizedSO101GraspSolver:
 
         # Multi-objective hypothesis selection:
         # 1. Primary: prioritize substantial table clearance difference (> 12mm)
-        # 2. Secondary: if clearances are equal (e.g. flat objects), select reachable hypothesis inside 2-link envelope
+        # 2. Secondary: if clearances are equal (e.g. standing bottles / level grasps), ALWAYS select nominal Hypothesis 1 (shift to LEFT away from static horn)
         table_diff = clearance_2 - clearance_1
-        use_hyp2 = np.where(
-            table_diff > 12.0, True,
-            np.where(table_diff < -12.0, False, r2 < r1)
-        )
+        use_hyp2 = table_diff > 12.0
         chosen_hypotheses = np.where(use_hyp2, 2, 1)
 
         # Batched assignment of selected wrist targets

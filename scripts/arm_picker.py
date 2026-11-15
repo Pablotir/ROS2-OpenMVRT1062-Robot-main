@@ -308,6 +308,7 @@ GRAB_LATERAL_OFFSET_RIGHT_MM = 35.0      # Reduced proportionally for pointed-ri
 # Measured physical limits: Closed = 1585 ticks (+4.14°), Open = 2748 ticks (+91.58°)
 GRIPPER_CLOSED_POS_DEG = 4.14   # °: Target angle when closing the claw (1585 ticks, firm clamp on bottle)
 GRIPPER_OPEN_POS_DEG   = 91.58  # °: Fully open jaws (2748 ticks)
+LIFT_MAX_DEG           = 85.0   # °: Maximum safe shoulder lift hardware limit
 
 
 def workspace_in_bounds(x_mm: float, y_mm: float, z_mm: float) -> bool:

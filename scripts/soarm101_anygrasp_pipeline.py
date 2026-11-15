@@ -114,6 +114,13 @@ GRIPPER_NOMINAL_WIDTH_MM = 40.0   # Nominal pinch width
 GRIPPER_CLEARANCE_MARGIN_MM = 6.0 # Safety margin past stationary right finger
 RADIAL_PULLBACK_MM = -15.0        # Pullback along local approach vector (pads center)
 TABLETOP_CLEARANCE_GUARD_MM = 8.0 # Minimum finger tip clearance above table
+Z_TABLE_ELEVATION_MM = -150.0     # Nominal tabletop elevation (mm)
+Z_FLOOR_LIMIT = -250.0            # Hardware safety floor bound (mm)
+
+
+def angle_for_width(width_mm: float) -> float:
+    """Map object width in mm to Feetech gripper servo position in degrees."""
+    return float(np.clip(width_mm * 1.2, 30.0, 95.0))
 
 
 # =============================================================================
@@ -722,7 +729,9 @@ class PretrainedGraspEngine:
                 # Side approach unreachable due to arm geometry/collisions;
                 # Use 2-stage top-down claw plunge at the neck.
                 # Depth reduced by another 2cm (elevated target by +20mm) per user request:
-                neck_z = max(float(com[2] + 100.0), float(np.max(P_obj[:, 2]) + 25.0))
+                z_top = float(np.max(P_obj[:, 2]))
+                z_bot = float(np.min(P_obj[:, 2]))
+                neck_z = min(z_top - 15.0, z_bot + 0.82 * (z_top - z_bot))
                 pinch_centers[:, 2] = neck_z
 
                 pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
@@ -749,10 +758,17 @@ class PretrainedGraspEngine:
                 z_top = float(np.max(P_obj[:, 2]))
                 z_bot = float(np.min(P_obj[:, 2]))
                 tbl_ref = Z_table if Z_table is not None else (z_bot - 5.0)
-                # Ensure grasp is elevated at least 85mm above tabletop to reach the neck
-                # and prevent diving down into the base of the bottle
-                neck_z = max(float(z_bot + 0.80 * (z_top - z_bot)), float(tbl_ref + 85.0))
+                # Ensure grasp is elevated at least 95mm above tabletop to reach the slim neck
+                # and prevent diving down into the body/base of the bottle
+                neck_z = max(float(z_bot + 0.82 * (z_top - z_bot)), float(tbl_ref + 95.0))
                 pinch_centers[:, 2] = neck_z
+
+                # Cap radial reach of grasp targets to 298.0mm to prevent overshooting
+                # past the bottle neck and sagging under cantilever torque load
+                r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
+                excess_r = np.maximum(0.0, r_pinch - 298.0)
+                pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
+                pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 
                 # Level horizontal approach pitch: strictly 0 deg to -3 deg (NO downward diving!)
                 pitches = np.linspace(np.radians(0.0), np.radians(-3.0), num_grasps)
@@ -801,7 +817,9 @@ class PretrainedGraspEngine:
             z_span_obj = float(np.ptp(P_obj[:, 2]))
             if is_cylinder_name or z_span_obj >= 35.0:
                 # Upright/tall object in claw plunge: elevate grasp to neck/top (+10cm above body CoM, reduced depth by 2cm)
-                neck_z = max(float(com[2] + 100.0), float(np.max(P_obj[:, 2]) + 25.0))
+                z_top = float(np.max(P_obj[:, 2]))
+                z_bot = float(np.min(P_obj[:, 2]))
+                neck_z = min(z_top - 15.0, z_bot + 0.82 * (z_top - z_bot))
                 pinch_centers[:, 2] = neck_z
             else:
                 # Pure flat object (e.g. phone lying flat): pull back along reach line if outside 2-link reach envelope
@@ -1038,14 +1056,33 @@ class VectorizedSO101GraspSolver:
 
         # 4. Closed-form 2-link analytical IK
         rho_tip = np.sqrt(xw**2 + yw**2)
-        rho_pivot = rho_tip - IK_L3 * np.cos(theta_pitch)
-        z_pivot = zw - IK_L3 * np.sin(theta_pitch)
 
-        D_sq = rho_pivot**2 + z_pivot**2
-        D = np.sqrt(D_sq)
+        # Feedforward gravity droop compensation for cantilevered horizontal reaches:
+        # Feetech STS3215 compliance + PETG link deflection under D405 camera load
+        # causes ~12-15mm physical sag at reach > 260mm. Elevating z_pivot guarantees
+        # the physical fingertips maintain true level neck elevation.
+        theta_pitch_deg_arr = np.degrees(theta_pitch)
+        is_level = np.abs(theta_pitch_deg_arr) <= 15.0
+        droop_comp = np.where(is_level & (rho_tip > 260.0),
+                              np.clip(12.0 * (rho_tip - 260.0) / 50.0, 0.0, 15.0),
+                              0.0)
+        zw_comp = zw + droop_comp
+
+        rho_pivot = rho_tip - IK_L3 * np.cos(theta_pitch)
+        z_pivot = zw_comp - IK_L3 * np.sin(theta_pitch)
 
         D_max = IK_L1 + IK_L2 - 1.0
         D_min = abs(IK_L1 - IK_L2) + 1.0
+
+        # Reach boundary clamping: prevent IK_REJECT_UNREACHABLE on distant targets
+        # and eliminate overshooting/slumping past the bottle neck by pulling back rho_pivot
+        # strictly into the reachable 2-link boundary (D <= D_max - 2.0mm)
+        max_rho_sq = np.maximum(0.0, (D_max - 2.0)**2 - z_pivot**2)
+        max_rho = np.sqrt(max_rho_sq)
+        rho_pivot = np.minimum(rho_pivot, max_rho)
+
+        D_sq = rho_pivot**2 + z_pivot**2
+        D = np.sqrt(D_sq)
         reach_mask = (D >= D_min) & (D <= D_max)
 
         cos_t2 = (D_sq - IK_L1**2 - IK_L2**2) / (2.0 * IK_L1 * IK_L2)
@@ -1165,8 +1202,8 @@ class VectorizedSO101GraspSolver:
             is_claw_plunge = theta_pitch_deg <= -60.0
             if R_obj < 250.0:
                 # Close standing cylinder:
-                # Claw plunge grasps target neck (+10cm above body CoM, reduced depth by 2cm)
-                target_z = max(float(com[2] + 100.0), float(np.max(P_obj_base[:, 2]) + 25.0))
+                # Claw plunge grasps target neck (~15mm below top cap, ~82% height)
+                target_z = min(float(np.max(P_obj_base[:, 2]) - 15.0), float(np.min(P_obj_base[:, 2]) + 0.82 * total_height))
                 dist_z = np.abs(pinch_centers[:, 2] - target_z)
                 score_claw = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
 
@@ -1205,8 +1242,8 @@ class VectorizedSO101GraspSolver:
         else:
             if has_vert_height:
                 if R_obj < 250.0:
-                    # Upright object in claw plunge: reward neck elevation (+10cm above body CoM, reduced depth by 2cm)
-                    target_z = max(float(com[2] + 100.0), float(np.max(P_obj_base[:, 2]) + 25.0))
+                    # Upright object in claw plunge: reward neck elevation (~15mm below top cap, ~82% height)
+                    target_z = min(float(np.max(P_obj_base[:, 2]) - 15.0), float(np.min(P_obj_base[:, 2]) + 0.82 * total_height))
                     dist_z = np.abs(pinch_centers[:, 2] - target_z)
                     S_height_com = np.exp(-(dist_z ** 2) / (2.0 * (15.0 ** 2)))
                 else:

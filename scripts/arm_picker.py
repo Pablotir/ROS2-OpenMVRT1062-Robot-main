@@ -1444,13 +1444,27 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
         pitch_rad = math.radians(test_pitch)
 
         # ── Back out the wrist contribution ──────────────────────────────────
+        # Feedforward gravity droop compensation for cantilevered horizontal reaches:
+        # STS3215 compliance + link flex droop compensation under D405 camera load
+        droop_comp_z = 0.0
+        if abs(test_pitch) <= 15.0 and rho > 260.0:
+            droop_comp_z = float(np.clip(12.0 * (rho - 260.0) / 50.0, 0.0, 15.0))
+        effective_z = z_mm + droop_comp_z
+
         wrist_x = rho   - IK_L3 * math.cos(pitch_rad)
-        wrist_z = z_mm  - IK_L3 * math.sin(pitch_rad)
+        wrist_z = effective_z - IK_L3 * math.sin(pitch_rad)
 
         # ── 2-link IK for J2 + J3 ────────────────────────────────────────────
         D = math.sqrt(wrist_x**2 + wrist_z**2)
         D_max = IK_L1 + IK_L2 - 1.0
         D_min = abs(IK_L1 - IK_L2) + 1.0
+
+        # Reach boundary clamping: pull back wrist_x so D <= D_max - 2.0mm
+        # Preserves target elevation while preventing singularity and overshooting
+        if D > (D_max - 2.0):
+            max_wx_sq = max(0.0, (D_max - 2.0)**2 - wrist_z**2)
+            wrist_x = min(wrist_x, math.sqrt(max_wx_sq))
+            D = math.sqrt(wrist_x**2 + wrist_z**2)
         
         if D > D_max or D < D_min:
             continue  # Try next pitch
@@ -2583,9 +2597,9 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
             h_bottle = float(sizing["height_mm"])
         h_bottle = float(np.clip(h_bottle, 140.0, 290.0))
 
-        # Target neck grasp height above tabletop:
-        neck_height_above_table = max(h_bottle - 38.0, 0.82 * h_bottle)
-        safe_z_b = live_table_z + neck_height_above_table
+        # Target neck grasp height above tabletop (slim neck zone, ~35mm below top cap):
+        neck_height_above_table = max(h_bottle - 35.0, 0.82 * h_bottle)
+        safe_z_b = max(live_table_z + neck_height_above_table, live_table_z + 95.0)
         # Clamp within safe physical workspace bounds
         safe_z_b = float(np.clip(safe_z_b, live_table_z + 40.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
@@ -3799,16 +3813,31 @@ def main():
                         0.0,                       # neutral zero fallback
                     ]
                 else:
-                    # Upright bottle: level horizontal approach — start conservative, work deeper
-                    penetration_candidates = [
-                        5.0,                          # +5.0mm: shallow grip (avoids overextension for near bottles)
-                        8.0,                          # +8.0mm: standard grip
-                        12.0,                         # +12.0mm: moderate grip
-                        15.0,                         # +15.0mm: firm grip
-                        18.0,                         # +18.0mm: deep grip
-                        0.0,                          # 0.0mm: surface touch fallback
-                        -10.0,                        # -10.0mm: pullback for over-reach scenarios
-                    ]
+                    # Upright bottle: level horizontal approach
+                    mid_base = orient_3d.get("midpoint_base")
+                    raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 280.0
+                    if raw_dist >= 260.0:
+                        # Distant upright bottle: pullback along reach line to center gripper squarely
+                        # on the front neck cylinder, preventing overshoot and cantilever droop
+                        excess_reach = max(0.0, raw_dist - 295.0)
+                        base_pb = -10.0 - excess_reach
+                        pullback_val = float(np.clip(base_pb, -30.0, -10.0))
+                        penetration_candidates = [
+                            pullback_val,
+                            pullback_val + 5.0,
+                            -10.0,
+                            -5.0,
+                            0.0,
+                            5.0,
+                        ]
+                    else:
+                        penetration_candidates = [
+                            0.0,
+                            5.0,
+                            8.0,
+                            -5.0,
+                            -10.0,
+                        ]
                 grab_pos = None
                 final_target = None
                 current_j = get_pos(robot)
@@ -3862,8 +3891,10 @@ def main():
                     # Strictly preserves radial reach distance (rho) so the arm NEVER overshoots or undershoots!
                     tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
                     body_w = sizing.get("body_width_mm", 40.0) if sizing is not None else 40.0
+                    grasp_w = sizing.get("grasp_width_mm", body_w) if sizing is not None else body_w
                     if orient_3d.get("is_upright") or abs(target_pitch) > 60.0:
-                        lat_offset = body_w / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
+                        target_w = grasp_w if orient_3d.get("is_upright") else body_w
+                        lat_offset = target_w / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
                     elif abs(tilt_val) >= 55.0:
                         lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 50.0mm for horizontal flat
                     elif tilt_val <= -20.0:

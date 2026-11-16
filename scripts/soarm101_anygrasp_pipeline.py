@@ -507,8 +507,7 @@ class SemanticConfirmationGate:
         if "shoulder_pan.pos" in q_joints and N_obj > 0:
             q1_servo = math.radians(-q_joints["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
             u_center = float(np.mean(u_obj)) if len(u_obj) > 0 else cx
-            # Clamp delta_azimuth to [-6°, +6°] so minor bbox edge offsets cannot distort azimuth or cause dev_mask rejection
-            delta_azimuth = float(np.clip(-(u_center - cx) / fx, math.radians(-6.0), math.radians(6.0)))
+            delta_azimuth = -(u_center - cx) / fx
             q1_true = q1_servo + delta_azimuth
 
             q1_cam_cloud = float(np.arctan2(np.mean(P_obj_base[:, 1]), np.mean(P_obj_base[:, 0])))
@@ -709,11 +708,22 @@ class PretrainedGraspEngine:
         tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj[:, 2]) - 5.0)
         h_above_table = float(np.max(P_obj[:, 2]) - tbl_ref)
 
-        # Distinguish standing upright cylinder vs flat lying object:
-        # A standing bottle stands tall above table (h >= 105mm or z_span >= 85mm) with vertical axis (|v_main[2]| >= 0.55).
-        # A lying bottle / flat object has horizontal axis (|v_main[2]| < 0.45) and low height above table (h < 100mm).
-        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
-        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
+        # Distinguish standing upright cylinder vs flat lying object vs tilted 3D object:
+        # A standing cylinder MUST have its principal axis pointing vertically (|v_main[2]| >= 0.55),
+        # significant vertical height (z_span >= 75mm or h_above_table >= 95mm), and elongated aspect ratio.
+        is_standing_cylinder = (
+            is_cylinder_name
+            and (abs(v_main[2]) >= 0.55)
+            and (z_span_obj >= 75.0 or h_above_table >= 95.0)
+            and (aspect_ratio >= 1.15)
+        )
+
+        # A flat lying object has its principal axis horizontal in the table plane (|v_main[2]| < 0.45)
+        # OR has a low vertical span / profile (z_span < 75mm and h_above_table < 90mm).
+        is_flat_lying = (not is_standing_cylinder) and (
+            (abs(v_main[2]) < 0.45)
+            or (z_span_obj < 75.0 and h_above_table < 90.0)
+        )
 
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 40.0) or is_standing_cylinder
         is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.25) and (L_major >= 50.0))
@@ -794,11 +804,11 @@ class PretrainedGraspEngine:
             pinch_centers[:, 2] = target_z
 
             if R_obj >= 250.0:
-                # Distant lying object: approach angled steeply down (-35° to -60°) to tilt wrist down
-                pitches = np.linspace(np.radians(-35.0), np.radians(-60.0), num_grasps)
+                # Distant lying object: approach angled steeply down (-45° to -75°) or claw plunge (-85°)
+                pitches = np.linspace(np.radians(-45.0), np.radians(-85.0), num_grasps)
             else:
-                # Close lying object: steep top-down claw plunge (-88° to -70°)
-                pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
+                # Close lying object: steep top-down claw plunge (-70° to -88°)
+                pitches = np.linspace(np.radians(-70.0), np.radians(-88.0), num_grasps)
             np.random.shuffle(pitches)
 
             # Align gripper closing axis perpendicular to the bottle's horizontal long axis in tabletop plane
@@ -1220,8 +1230,17 @@ class VectorizedSO101GraspSolver:
         tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj_base[:, 2]) - 5.0)
         h_above_table = float(np.max(P_obj_base[:, 2]) - tbl_ref)
 
-        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
-        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
+        is_standing_cylinder = (
+            is_cylinder_name
+            and (abs(v_main[2]) >= 0.55)
+            and (z_span_obj >= 75.0 or h_above_table >= 95.0)
+            and (aspect_ratio >= 1.15)
+        )
+
+        is_flat_lying = (not is_standing_cylinder) and (
+            (abs(v_main[2]) < 0.45)
+            or (z_span_obj < 75.0 and h_above_table < 90.0)
+        )
 
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 40.0) or is_standing_cylinder
         is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.4) and (total_height >= 75.0))
@@ -1343,12 +1362,9 @@ class VectorizedSO101GraspSolver:
         # but rewards downward angled wrist poses for lying objects
         theta_pitch_deg_arr = np.degrees(ik_results["theta_pitch"])
         if is_flat_lying:
-            if R_obj >= 250.0:
-                # For distant lying objects, peak reward at downward angle of -50.0 deg (wrist flex tilted down)
-                S_level = np.exp(-((theta_pitch_deg_arr - (-50.0)) ** 2) / (2.0 * (15.0 ** 2)))
-            else:
-                # For close lying objects, peak reward at top-down claw plunge (-80.0 deg)
-                S_level = np.exp(-((theta_pitch_deg_arr - (-80.0)) ** 2) / (2.0 * (15.0 ** 2)))
+            # Reward steep downward wrist tilt (-60° to -85° claw plunge) for lying objects
+            target_lying_pitch = -75.0 if R_obj < 250.0 else -60.0
+            S_level = np.exp(-((theta_pitch_deg_arr - target_lying_pitch) ** 2) / (2.0 * (20.0 ** 2)))
         elif is_standing_cylinder:
             if R_obj < 250.0:
                 S_level = np.ones(N, dtype=np.float64)

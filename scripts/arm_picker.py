@@ -1591,19 +1591,6 @@ def depth_to_arm_target(xyz_cam: tuple[float, float, float],
 
     x_base, y_base, z_base = float(P_base[0]), float(P_base[1]), float(P_base[2])
 
-    # Enforce optical line-of-sight base azimuth alignment:
-    # Eliminates azimuth skew caused by hand-eye calibration matrix errors (reprojection error).
-    # Since visual servoing actively centers the object on camera optical axis (cx, cy),
-    # the true line-of-sight in base frame is anchored to the servoed shoulder pan angle!
-    if "shoulder_pan.pos" in cur:
-        q1_servo = math.radians(-cur["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
-        # Angular deviation in camera azimuth: -atan2(x_cam, approach_z)
-        delta_phi = -math.atan2(x_cam, max(approach_z, 1.0))
-        q1_true = q1_servo + delta_phi
-        rho = math.hypot(x_base, y_base)
-        x_base = rho * math.cos(q1_true)
-        y_base = rho * math.sin(q1_true)
-
     if verbose:
         print(f"   🔗 P_cam=({x_cam:+.0f},{y_cam:+.0f},{z_cam:.0f})mm → "
               f"P_wrist=({P_wrist[0]:+.0f},{P_wrist[1]:+.0f},{P_wrist[2]:.0f})mm → "
@@ -2886,9 +2873,7 @@ class ObjectTracker:
                     cur_cy = (self.smooth_box[1] + self.smooth_box[3]) / 2.0
                     dist = math.hypot(cand_cx - cur_cx, cand_cy - cur_cy)
 
-                    # Stricter spatial gating when locked on target to reject peripheral false detections
-                    max_allowed_dist = 85.0 if self.locked and self.confirmed_frames >= 3 else 180.0
-                    if iou >= 0.10 or dist < max_allowed_dist:
+                    if iou >= 0.10 or dist < 250.0:
                         score = iou * 0.65 + max(0.0, 1.0 - (dist / float(fw))) * 0.35
                         valid_candidates.append((score, cand_box, cand_area, poly))
                 else:
@@ -3642,7 +3627,6 @@ def main():
             color_aligned = None
             seg_mask = None
             best_box = tracker.last_box if tracker.last_box is not None else (x1, y1, x2, y2)
-            converged_px, converged_py = obj_px, obj_py
 
             for _ in range(3):
                 c_snap, _, _ = cap.read()
@@ -3651,19 +3635,15 @@ def main():
                     res_snap = detect_with_rotation(model, color_aligned, conf=YOLO_CONF, iou=0.45, target_class_ids=TARGET_CLASS_IDS)
                     found_snap, _, _, _ = tracker.detect(color_aligned, res_snap, TARGET_CLASS_IDS)
                     if found_snap and tracker.last_box is not None:
-                        # Spatial gating: ensure consensus candidate remains close to converged visual servoing center
-                        cand_cx = (tracker.last_box[0] + tracker.last_box[2]) / 2.0
-                        cand_cy = (tracker.last_box[1] + tracker.last_box[3]) / 2.0
-                        if math.hypot(cand_cx - converged_px, cand_cy - converged_py) <= 65.0:
-                            best_box = tracker.last_box
-                            if hasattr(tracker, 'last_mask_polygon') and tracker.last_mask_polygon is not None:
-                                h_s, w_s = color_aligned.shape[:2]
-                                m = np.zeros((h_s, w_s), dtype=np.uint8)
-                                cv2.fillPoly(m, [tracker.last_mask_polygon.astype(np.int32)], 255)
-                                n_px = int(np.sum(m == 255))
-                                MAX_MASK_PIXELS = int(h_s * w_s * 0.15)
-                                if n_px <= MAX_MASK_PIXELS:
-                                    seg_mask = m
+                        best_box = tracker.last_box
+                        if hasattr(tracker, 'last_mask_polygon') and tracker.last_mask_polygon is not None:
+                            h_s, w_s = color_aligned.shape[:2]
+                            m = np.zeros((h_s, w_s), dtype=np.uint8)
+                            cv2.fillPoly(m, [tracker.last_mask_polygon.astype(np.int32)], 255)
+                            n_px = int(np.sum(m == 255))
+                            MAX_MASK_PIXELS = int(h_s * w_s * 0.15)
+                            if n_px <= MAX_MASK_PIXELS:
+                                seg_mask = m
                 time.sleep(0.02)
 
             if color_aligned is None:
@@ -3671,17 +3651,6 @@ def main():
             h_a, w_a = color_aligned.shape[:2]
 
             x1_a, y1_a, x2_a, y2_a = best_box
-            # Gating safeguard: if consensus box center drifted, anchor it squarely to the converged center
-            cur_cx = (x1_a + x2_a) / 2.0
-            cur_cy = (y1_a + y2_a) / 2.0
-            if math.hypot(cur_cx - converged_px, cur_cy - converged_py) > 50.0:
-                half_w = (x2_a - x1_a) / 2.0
-                half_h = (y2_a - y1_a) / 2.0
-                x1_a = int(round(converged_px - half_w))
-                x2_a = int(round(converged_px + half_w))
-                y1_a = int(round(converged_py - half_h))
-                y2_a = int(round(converged_py + half_h))
-
             x1_a, y1_a = max(0, x1_a), max(0, y1_a)
             x2_a, y2_a = min(w_a, x2_a), min(h_a, y2_a)
 

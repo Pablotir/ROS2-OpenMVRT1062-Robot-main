@@ -2616,9 +2616,9 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
             h_bottle = float(sizing["height_mm"])
         h_bottle = float(np.clip(h_bottle, 140.0, 290.0))
 
-        # Target neck grasp height above tabletop (~65mm above table / 65% height, lowered 3cm per user request):
-        neck_height_above_table = max(h_bottle - 65.0, 0.65 * h_bottle)
-        safe_z_b = max(live_table_z + neck_height_above_table, live_table_z + 65.0)
+        # Target neck grasp height above tabletop (~46mm above table / 50% height):
+        neck_height_above_table = max(h_bottle - 84.0, 0.50 * h_bottle)
+        safe_z_b = max(live_table_z + neck_height_above_table, live_table_z + 46.0)
         # Clamp within safe physical workspace bounds
         safe_z_b = float(np.clip(safe_z_b, live_table_z + 40.0, WS_Z_MAX_MM - 20.0))
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)

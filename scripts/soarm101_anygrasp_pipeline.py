@@ -706,16 +706,18 @@ class PretrainedGraspEngine:
 
         z_span_obj = float(np.ptp(P_obj[:, 2]))
         is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
+        tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj[:, 2]) - 5.0)
+        h_above_table = float(np.max(P_obj[:, 2]) - tbl_ref)
 
-        # Determine if bottle/cylinder is lying flat on table (e.g. fallen bottle):
-        # A lying bottle has small vertical height (z_span < 45mm) AND large horizontal extent (L_major >= 75mm)
-        # AND principal axis nearly horizontal (abs(v_main[2]) < 0.25).
-        is_flat_lying = (z_span_obj < 45.0) and (L_major >= 75.0 or aspect_ratio >= 1.6) and (abs(v_main[2]) < 0.25)
+        # Distinguish standing upright cylinder vs flat lying object:
+        # A standing bottle stands tall above table (h >= 105mm or z_span >= 85mm) with vertical axis (|v_main[2]| >= 0.55).
+        # A lying bottle / flat object has horizontal axis (|v_main[2]| < 0.45) and low height above table (h < 100mm).
+        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
+        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
 
-        is_standing_cylinder = is_cylinder_name and not is_flat_lying
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 40.0) or is_standing_cylinder
-        is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and (aspect_ratio >= 1.25) and (L_major >= 50.0))
-        is_compact = is_standing_or_tilted and not is_tall_elongated
+        is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.25) and (L_major >= 50.0))
+        is_compact = is_standing_or_tilted and not is_tall_elongated and not is_flat_lying
 
         # Sample pinch centers across object points
         sample_indices = np.random.choice(N, size=num_grasps, replace=(N < num_grasps))
@@ -724,12 +726,11 @@ class PretrainedGraspEngine:
         # Construct SE(3) transforms
         T_grasps = np.tile(np.eye(4, dtype=np.float64), (num_grasps, 1, 1))
 
-        if is_tall_elongated:
+        if is_standing_cylinder:
             if R_obj < 250.0:
                 # ── CLOSE STANDING CYLINDER (R_obj < 250mm) ──────────────────────────
                 # Side approach unreachable due to arm geometry/collisions;
-                # Use 2-stage top-down claw plunge at the neck.
-                # Depth reduced by another 2cm (elevated target by +20mm) per user request:
+                # Use top-down claw plunge at the neck.
                 z_top = float(np.max(P_obj[:, 2]))
                 z_bot = float(np.min(P_obj[:, 2]))
                 neck_z = min(z_top - 15.0, z_bot + 0.82 * (z_top - z_bot))
@@ -755,13 +756,10 @@ class PretrainedGraspEngine:
             else:
                 # ── FARTHER STANDING CYLINDER (R_obj >= 250mm) ────────────────────────
                 # Extend straight forward to grab the bottle's neck! (NO claw machine plunge)
-                # Target the bottle's upper neck cylinder (elevated well above table floor)
+                # Target the bottle's upper neck cylinder squarely below the cap (~46mm above table, ~50% height)
                 z_top = float(np.max(P_obj[:, 2]))
                 z_bot = float(np.min(P_obj[:, 2]))
-                tbl_ref = Z_table if Z_table is not None else (z_bot - 5.0)
-                # Position grasp squarely at neck cylinder (~65mm above tabletop, ~65% height).
-                # Lowered by ~3cm per user feedback to eliminate hovering over the top of the bottle.
-                neck_z = max(float(z_bot + 0.65 * (z_top - z_bot)), float(tbl_ref + 65.0))
+                neck_z = max(float(z_bot + 0.50 * (z_top - z_bot)), float(tbl_ref + 46.0))
                 pinch_centers[:, 2] = neck_z
 
                 # Cap radial reach of grasp targets to 316.0mm to position fingertips squarely
@@ -788,6 +786,36 @@ class PretrainedGraspEngine:
                 # Closing vector perpendicular in horizontal plane -> locks neutral roll (+29.27°)
                 x_closing = np.tile(np.array([u_tx, u_ty, 0.0]), (num_grasps, 1))
                 y_thickness = np.cross(z_approach, x_closing)
+
+        elif is_flat_lying:
+            # ── FLAT / LYING OBJECT OR FALLEN BOTTLE ───────────────────────────────
+            # Position grasp at bottle body center, safely above table floor
+            target_z = max(float(tbl_ref + 30.0), float(np.mean(P_obj[:, 2])))
+            pinch_centers[:, 2] = target_z
+
+            if R_obj >= 250.0:
+                # Distant lying object: approach angled steeply down (-35° to -60°) to tilt wrist down
+                pitches = np.linspace(np.radians(-35.0), np.radians(-60.0), num_grasps)
+            else:
+                # Close lying object: steep top-down claw plunge (-88° to -70°)
+                pitches = np.linspace(np.radians(-88.0), np.radians(-70.0), num_grasps)
+            np.random.shuffle(pitches)
+
+            # Align gripper closing axis perpendicular to the bottle's horizontal long axis in tabletop plane
+            theta_obj = float(np.arctan2(v_main[1], v_main[0]))
+            close_rad = theta_obj + math.pi / 2.0
+            x_close_base = np.array([math.cos(close_rad), math.sin(close_rad), 0.0])
+
+            u_rad = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
+            z_app_x = np.cos(pitches) * u_rad[0]
+            z_app_y = np.cos(pitches) * u_rad[1]
+            z_app_z = np.sin(pitches)
+            z_approach = np.stack([z_app_x, z_app_y, z_app_z], axis=-1)
+
+            dot_zx = np.sum(z_approach * x_close_base, axis=-1, keepdims=True)
+            x_closing = x_close_base - dot_zx * z_approach
+            x_closing /= (np.linalg.norm(x_closing, axis=-1, keepdims=True) + 1e-8)
+            y_thickness = np.cross(z_approach, x_closing)
 
         elif is_compact:
             # Compact 3D objects (balls, cubes, apples, mugs):
@@ -920,7 +948,8 @@ class VectorizedSO101GraspSolver:
             P_obj_base=P_obj_base,
             q_current=q_current,
             valid_mask=valid_mask,
-            target_label=target_label
+            target_label=target_label,
+            Z_table=Z_table
         )
 
         best_joint_dict = {
@@ -967,10 +996,11 @@ class VectorizedSO101GraspSolver:
         theta_pitch = np.arcsin(np.clip(z_approach[:, 2], -1.0, 1.0))
 
         # 2. Width-Aware Asymmetric Pincer Offset delta_lat(w, pitch)
-        # Places stationary horn exactly (w/2 + 3.0mm) from object center,
-        # exactly matching the simulation geometry so the static tip almost touches the bottle.
+        # Level horizontal reaches (standing bottles) shift left by +18mm to guarantee the stationary
+        # right horn clears the right side of the bottle neck completely, eliminating cap/body grazing.
+        # Downward angled reaches (lying down objects / claw plunge) use +3mm clearance centered over body.
         w_val = widths if widths is not None else 40.0
-        delta_lat = w_val / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
+        delta_lat = np.where(theta_pitch > np.radians(-25.0), w_val / 2.0 + 18.0, w_val / 2.0 + 3.0)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         # Level grasps use neutral 0.0mm pullback to reach bottle neck squarely at ~303-305mm without being short;
@@ -1149,7 +1179,8 @@ class VectorizedSO101GraspSolver:
                                        P_obj_base: np.ndarray,
                                        q_current: Dict[str, float],
                                        valid_mask: np.ndarray,
-                                       target_label: str = "bottle") -> Tuple[int, np.ndarray, Dict[str, np.ndarray]]:
+                                       target_label: str = "bottle",
+                                       Z_table: Optional[float] = None) -> Tuple[int, np.ndarray, Dict[str, np.ndarray]]:
         """
         Optimal Grasp Height, CoM, and Anti-Overshoot Scoring Function.
         Composite Score:
@@ -1186,12 +1217,15 @@ class VectorizedSO101GraspSolver:
 
         is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
         z_span_obj = float(np.ptp(P_obj_base[:, 2]))
-        is_flat_lying = (z_span_obj < 45.0) and (L_major >= 75.0 or aspect_ratio >= 1.6) and (abs(v_main[2]) < 0.25)
-        is_standing_cylinder = is_cylinder_name and not is_flat_lying
+        tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj_base[:, 2]) - 5.0)
+        h_above_table = float(np.max(P_obj_base[:, 2]) - tbl_ref)
+
+        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
+        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
 
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 40.0) or is_standing_cylinder
-        is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and (aspect_ratio >= 1.4) and (total_height >= 75.0))
-        is_compact = is_standing_or_tilted and not is_tall_elongated
+        is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.4) and (total_height >= 75.0))
+        is_compact = is_standing_or_tilted and not is_tall_elongated and not is_flat_lying
 
         S_height_com = np.zeros(N, dtype=np.float64)
         theta_pitch_deg = np.degrees(ik_results["theta_pitch"])
@@ -1199,7 +1233,7 @@ class VectorizedSO101GraspSolver:
         R_obj = math.hypot(com[0], com[1])
         has_vert_height = (z_span_obj >= 35.0)
 
-        if is_tall_elongated:
+        if is_standing_cylinder:
             is_claw_plunge = theta_pitch_deg <= -60.0
             if R_obj < 250.0:
                 # Close standing cylinder:
@@ -1230,6 +1264,16 @@ class VectorizedSO101GraspSolver:
                 # Strictly disqualify any downward plunge for distant standing tall objects!
                 steep_pitch = theta_pitch_deg < -4.0
                 S_height_com[steep_pitch] = -10.0
+
+        elif is_flat_lying:
+            # Flat Object / Lying Down Cylinder (bottle lying on table, phone, horizontal container):
+            # Optimal grasp: centered within 20mm of 3D Center of Mass
+            dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
+            S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (20.0 ** 2)))
+
+            # Penalize horizontal flat approaches for lying objects (requires downward wrist tilt)
+            flat_pitch = theta_pitch_deg > -25.0
+            S_height_com[flat_pitch] = -5.0
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1295,14 +1339,27 @@ class VectorizedSO101GraspSolver:
 
         S_joint = 0.60 * S_dist + 0.40 * S_limits
 
-        # 5. Pitch Level Score — penalizes steep plunges for distant objects (R_obj >= 250mm),
-        # but allows claw plunge for close objects (R_obj < 250mm)
+        # 5. Pitch Level Score — penalizes steep plunges for distant standing objects,
+        # but rewards downward angled wrist poses for lying objects
         theta_pitch_deg_arr = np.degrees(ik_results["theta_pitch"])
-        if R_obj < 250.0:
-            S_level = np.ones(N, dtype=np.float64)
+        if is_flat_lying:
+            if R_obj >= 250.0:
+                # For distant lying objects, peak reward at downward angle of -50.0 deg (wrist flex tilted down)
+                S_level = np.exp(-((theta_pitch_deg_arr - (-50.0)) ** 2) / (2.0 * (15.0 ** 2)))
+            else:
+                # For close lying objects, peak reward at top-down claw plunge (-80.0 deg)
+                S_level = np.exp(-((theta_pitch_deg_arr - (-80.0)) ** 2) / (2.0 * (15.0 ** 2)))
+        elif is_standing_cylinder:
+            if R_obj < 250.0:
+                S_level = np.ones(N, dtype=np.float64)
+            else:
+                # Gaussian peak at strictly level horizontal approach (0.0°) with 4° tolerance
+                S_level = np.exp(-(theta_pitch_deg_arr ** 2) / (2.0 * (4.0 ** 2)))
         else:
-            # Gaussian peak at strictly level horizontal approach (0.0°) with 4° tolerance
-            S_level = np.exp(-(theta_pitch_deg_arr ** 2) / (2.0 * (4.0 ** 2)))
+            if R_obj < 250.0:
+                S_level = np.ones(N, dtype=np.float64)
+            else:
+                S_level = np.exp(-(theta_pitch_deg_arr ** 2) / (2.0 * (8.0 ** 2)))
 
         # 6. Composite Vectorized Score
         composite_score = (0.35 * scores +
@@ -1641,12 +1698,12 @@ def run_unit_tests():
     T_grasps_roll = np.tile(np.eye(4), (len(rolls), 1, 1))
     for idx, r_deg in enumerate(rolls):
         r_rad = math.radians(r_deg)
-        R_roll = np.array([
-            [math.cos(r_rad), -math.sin(r_rad), 0.0],
-            [math.sin(r_rad),  math.cos(r_rad), 0.0],
-            [0.0,             0.0,              1.0]
-        ])
-        T_grasps_roll[idx, :3, :3] = R_roll
+        x_c = np.array([math.cos(r_rad), math.sin(r_rad), 0.0])
+        z_a = np.array([0.0, 0.0, -1.0])
+        y_t = np.cross(z_a, x_c)
+        T_grasps_roll[idx, :3, 0] = x_c
+        T_grasps_roll[idx, :3, 1] = y_t
+        T_grasps_roll[idx, :3, 2] = z_a
         T_grasps_roll[idx, :3, 3] = [230.0, 50.0, -80.0]
 
     widths = np.full(len(rolls), 40.0)

@@ -2770,20 +2770,29 @@ def detect_with_rotation(model, frame: np.ndarray, conf: float = 0.35, iou: floa
     if target_found:
         return results
 
-    # Step 2: Test single 90° rotation fallback (caps latency, prevents 3-5 FPS tanking)
+    # Step 2: Test rotated views where non-upright objects appear upright to YOLO
     orig_h, orig_w = frame.shape[:2]
-    rot_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    with ctx:
-        res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
-    if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
-        has_match = False
-        for box in res_rot[0].boxes:
-            if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
-                has_match = True
-                break
-        if has_match:
-            derotated_res = derotate_detections(res_rot[0], "rot90_cw", orig_w, orig_h)
-            return [derotated_res]
+    rotations = [
+        ("rot90_cw", lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
+        ("rot90_ccw", lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        ("rot180", lambda img: cv2.rotate(img, cv2.ROTATE_180)),
+        ("rot45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), 45.0, 1.0), (orig_w, orig_h))),
+        ("rot_neg45", lambda img: cv2.warpAffine(img, cv2.getRotationMatrix2D((orig_w / 2.0, orig_h / 2.0), -45.0, 1.0), (orig_w, orig_h))),
+    ]
+
+    for rot_name, rot_fn in rotations:
+        rot_frame = rot_fn(frame)
+        with ctx:
+            res_rot = model(rot_frame, verbose=False, conf=conf, iou=iou)
+        if res_rot and len(res_rot) > 0 and res_rot[0].boxes is not None and len(res_rot[0].boxes) > 0:
+            has_match = False
+            for box in res_rot[0].boxes:
+                if target_class_ids is None or int(box.cls[0].item()) in target_class_ids:
+                    has_match = True
+                    break
+            if has_match:
+                derotated_res = derotate_detections(res_rot[0], rot_name, orig_w, orig_h)
+                return [derotated_res]
 
     return results
 
@@ -3681,9 +3690,9 @@ def main():
                         target_closed_grip = GRIPPER_CLOSED_POS_DEG
                         target_pitch = anygrasp_plan.get("pitch_deg", 0.0)
                         target_roll = anygrasp_j.get("wrist_roll.pos", target_roll)
-                        best_w = anygrasp_plan.get("best_wrist_pose")
-                        if best_w is not None:
-                            final_target = (float(best_w[0, 3]), float(best_w[1, 3]), float(best_w[2, 3]), anygrasp_plan.get("delta_lat_mm", 0.0))
+                        best_g = anygrasp_plan.get("best_grasp_pose")
+                        if best_g is not None:
+                            final_target = (float(best_g[0, 3]), float(best_g[1, 3]), float(best_g[2, 3]), anygrasp_plan.get("delta_lat_mm", 0.0))
                         dur = anygrasp_plan["latencies_ms"].get("Total Grasp Pipeline", 0.0)
                         w_target = anygrasp_plan.get("target_width", 40.0)
                         print(f"✅ [TIER 2 ANYGRASP] Optimal grasp trajectory generated in {dur:.1f} ms! (Target width: {w_target:.1f}mm -> Grip angle: {target_closed_grip:.1f}°)")

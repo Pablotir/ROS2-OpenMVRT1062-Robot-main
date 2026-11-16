@@ -446,11 +446,18 @@ class SemanticConfirmationGate:
             raise ValueError(f"Insufficient valid depth points in object mask ({len(v_obj)} points)")
 
         z_raw_obj = depth_mm[v_obj, u_obj]
-        z_min_bound = np.percentile(z_raw_obj, 5)
-        # Filter points that see through clear plastic / glass directly onto the background table
-        front_shell = z_raw_obj <= (z_min_bound + 65.0)
-        v_obj = v_obj[front_shell]
-        u_obj = u_obj[front_shell]
+        # Reject foreground camera / claw noise (< 120mm in scan pose)
+        valid_obj_depths = z_raw_obj[z_raw_obj >= 120.0]
+        if len(valid_obj_depths) >= 20:
+            med_z = float(np.median(valid_obj_depths))
+        else:
+            med_z = float(np.median(z_raw_obj))
+
+        # Anchor depth filter to true object cluster, rejecting foreground noise (<120mm) and background table (>med_z + 45mm)
+        front_shell = (z_raw_obj >= med_z - 45.0) & (z_raw_obj <= med_z + 45.0)
+        if np.sum(front_shell) >= 20:
+            v_obj = v_obj[front_shell]
+            u_obj = u_obj[front_shell]
 
         z_obj = depth_mm[v_obj, u_obj]
         x_obj = (u_obj - cx) * z_obj / fx
@@ -799,8 +806,8 @@ class PretrainedGraspEngine:
 
         elif is_flat_lying:
             # ── FLAT / LYING OBJECT OR FALLEN BOTTLE ───────────────────────────────
-            # Position grasp at bottle body center, safely above table floor
-            target_z = max(float(tbl_ref + 30.0), float(np.mean(P_obj[:, 2])))
+            # Target object body resting on tabletop (~20-22mm above table) so jaws fully enclose body
+            target_z = float(np.clip(np.median(P_obj[:, 2]), tbl_ref + 18.0, tbl_ref + 25.0))
             pinch_centers[:, 2] = target_z
 
             if R_obj >= 250.0:
@@ -944,8 +951,20 @@ class VectorizedSO101GraspSolver:
         """
         N = T_grasps.shape[0]
 
+        z_span_obj = float(np.ptp(P_obj_base[:, 2]))
+        cov_obj = np.cov(P_obj_base, rowvar=False)
+        evals_o, evecs_o = np.linalg.eigh(cov_obj)
+        v_main = evecs_o[:, np.argmax(evals_o)]
+        tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj_base[:, 2]) - 5.0)
+        h_above_table = float(np.max(P_obj_base[:, 2]) - tbl_ref)
+        is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
+        aspect_ratio = float(np.max(evals_o) / (np.min(evals_o) + 1e-6))
+
+        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
+        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
+
         # 1. Continuous Local-Frame Asymmetric Pincer Compensation
-        T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table)
+        T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)
 
         # 2. 5-DoF Subspace Manifold Projection & Analytical IK
         ik_results, valid_mask = self.project_6dof_to_5dof_and_solve_ik(T_wrist_targets, Z_table, widths=widths)
@@ -989,11 +1008,12 @@ class VectorizedSO101GraspSolver:
     def apply_local_asymmetric_offset(self,
                                       T_grasps: np.ndarray,
                                       widths: np.ndarray,
-                                      Z_table: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                      Z_table: Optional[float] = None,
+                                      is_flat_lying: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Continuous Local-Frame Asymmetric Pincer Compensation.
         - Calculates delta_lat(w, pitch) along the local closing axis
-        - Applies -15.0 mm radial pullback along local approach vector
+        - Applies radial pullback along local approach vector
         - Evaluates dual roll-symmetric wrist hypotheses (q5 and q5 +/- pi)
         - Selects hypothesis placing stationary right finger on higher-clearance / non-table side
         ZERO Python loops: fully vectorized (N, 4, 4) tensor multiplications.
@@ -1014,8 +1034,12 @@ class VectorizedSO101GraspSolver:
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         # Level grasps use neutral 0.0mm pullback to reach bottle neck squarely at ~303-305mm without being short;
-        # Claw plunges use -15mm pullback.
-        pullbacks = np.where(theta_pitch > np.radians(-30.0), 0.0, RADIAL_PULLBACK_MM)
+        # Flat lying objects use 0.0mm pullback so jaws plunge deep enough to wrap around body without stopping in mid-air;
+        # Claw plunges on upright objects use -15mm pullback.
+        if is_flat_lying:
+            pullbacks = np.zeros(N, dtype=np.float64)
+        else:
+            pullbacks = np.where(theta_pitch > np.radians(-30.0), 0.0, RADIAL_PULLBACK_MM)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
         v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 

@@ -1493,7 +1493,7 @@ def solve_ik(x_mm: float, y_mm: float, z_mm: float,
             # Hardware limits (widened slightly to allow valid IK before hardware self-limits)
             if not (-110 <= m_lift <= 150): continue
             if not (-120 <= m_elbow <= 120): continue
-            if not (-120 <= m_wrist <= 120): continue
+            if not (-135 <= m_wrist <= 135): continue
             
             # Prevent extreme backward leaning that hits the base.
             # Lift = -90° means pointing horizontally backwards.

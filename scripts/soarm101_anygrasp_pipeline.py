@@ -96,8 +96,8 @@ LIFT_MIN_DEG        = -110.0    # Avoid leaning backward into arm base
 LIFT_MAX_DEG        =  150.0    # Forward reach limit
 ELBOW_MIN_DEG       = -120.0
 ELBOW_MAX_DEG       =  90.0     # Relaxed to allow forward reach configurations
-WRIST_FLEX_MIN_DEG  = -120.0
-WRIST_FLEX_MAX_DEG  =  120.0
+WRIST_FLEX_MIN_DEG  = -135.0
+WRIST_FLEX_MAX_DEG  =  135.0
 WRIST_ROLL_MIN_DEG  = -150.0
 WRIST_ROLL_MAX_DEG  =  150.0
 HARDWARE_NEUTRAL_ROLL_DEG = 29.27  # Physical servo neutral horizontal roll angle (homing_offset -1120)
@@ -621,19 +621,57 @@ class PretrainedGraspEngine:
         self.num_samples = num_samples
         self.device = device
         self.trt_session = None
+        self.cgn_model = None
 
         self._init_grasp_network()
 
     def _init_grasp_network(self):
-        """Loads TensorRT or ONNX Runtime session if model exists."""
+        """Loads TensorRT/ONNX session or PyTorch Contact-GraspNet model."""
+        # 1. Check for TensorRT / ONNX session
         if self.engine_path and os.path.exists(self.engine_path):
+            if self.engine_path.endswith(".onnx") or self.engine_path.endswith(".engine"):
+                try:
+                    import onnxruntime as ort
+                    providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+                    self.trt_session = ort.InferenceSession(self.engine_path, providers=providers)
+                    logger.info(f"Loaded Contact-GraspNet ONNX/TRT session: {self.engine_path}")
+                    return
+                except Exception as e:
+                    logger.warning(f"Could not load ONNX/TRT session: {e}")
+
+        # 2. Check for Contact-GraspNet PyTorch checkpoint (.pth)
+        ws_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(ws_dir)
+        cgn_candidates = [
+            self.engine_path,
+            os.path.join(ws_dir, "checkpoints", "current.pth"),
+            os.path.join(parent_dir, "checkpoints", "current.pth"),
+            os.path.join(ws_dir, "models", "current.pth"),
+            os.path.join(parent_dir, "models", "current.pth"),
+            os.path.join(ws_dir, "cgn_pytorch", "checkpoints", "current.pth"),
+            os.path.join(parent_dir, "cgn_pytorch", "checkpoints", "current.pth"),
+            "checkpoints/current.pth",
+            "models/current.pth",
+            "cgn_pytorch/checkpoints/current.pth"
+        ]
+        cgn_ckpt = next((p for p in cgn_candidates if p and os.path.exists(p) and str(p).endswith(".pth")), None)
+        if cgn_ckpt and torch is not None:
             try:
-                import onnxruntime as ort
-                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-                self.trt_session = ort.InferenceSession(self.engine_path, providers=providers)
-                logger.info(f"Loaded Contact-GraspNet ONNX/TRT session: {self.engine_path}")
+                for d in [ws_dir, parent_dir]:
+                    if d not in sys.path:
+                        sys.path.insert(0, d)
+                cgn_root = os.path.abspath(os.path.join(os.path.dirname(cgn_ckpt), "..", ".."))
+                if cgn_root not in sys.path:
+                    sys.path.insert(0, cgn_root)
+                import cgn_pytorch
+                logger.info(f"Loading Contact-GraspNet PyTorch model from: {cgn_ckpt}")
+                model, _, _ = cgn_pytorch.from_pretrained(cpu=(self.device == "cpu"), checkpoint_path=cgn_ckpt)
+                model.eval()
+                self.cgn_model = model
+                logger.info("✅ Successfully initialized Contact-GraspNet PyTorch engine!")
+                return
             except Exception as e:
-                logger.warning(f"Could not load ONNX/TRT session: {e}")
+                logger.warning(f"Could not load Contact-GraspNet PyTorch model: {e}")
 
     @staticmethod
     def downsample_point_cloud(points: np.ndarray, num_points: int = 2048) -> np.ndarray:
@@ -667,7 +705,7 @@ class PretrainedGraspEngine:
         combined_pts = P_obj_base if P_bg_base is None else np.vstack([P_obj_base, P_bg_base[:400]])
         cloud_k = self.downsample_point_cloud(combined_pts, num_points=2048)
 
-        # 2. Inference via Pretrained Contact-GraspNet / AnyGrasp
+        # 2a. Inference via Pretrained Contact-GraspNet / AnyGrasp (ONNX / TensorRT)
         if self.trt_session is not None:
             input_name = self.trt_session.get_inputs()[0].name
             pts_m = (cloud_k / 1000.0).astype(np.float32)[np.newaxis, ...]
@@ -678,7 +716,75 @@ class PretrainedGraspEngine:
             widths = outputs[2] * 1000.0
             return T_grasps[:self.num_samples], scores[:self.num_samples], widths[:self.num_samples]
 
-        # 3. High-Performance Vectorized Antipodal Synthesis Engine
+        # 2b. Inference via Native PyTorch Contact-GraspNet
+        if self.cgn_model is not None and torch is not None:
+            try:
+                com = np.mean(cloud_k, axis=0)
+                pts_m = ((cloud_k - com) / 1000.0).astype(np.float32)
+                pcd = torch.tensor(pts_m, dtype=torch.float32, device=self.device)
+                batch = torch.zeros(pcd.shape[0], dtype=torch.int64, device=self.device)
+                idx = torch.arange(pcd.shape[0], dtype=torch.int64, device=self.device)
+
+                with torch.no_grad():
+                    points, pred_grasps, confidence, pred_widths, _, _ = self.cgn_model(
+                        pcd[:, 3:], pos=pcd[:, :3], batch=batch, idx=idx
+                    )
+
+                conf = torch.sigmoid(confidence).reshape(-1).cpu().numpy()
+                T_grasps = torch.flatten(pred_grasps, start_dim=0, end_dim=1).cpu().numpy()
+                contact_pts = torch.flatten(points, start_dim=0, end_dim=1).cpu().numpy()
+
+                # Translation to world mm: contact points from centered cloud
+                T_grasps[:, :3, 3] = contact_pts * 1000.0 + com
+                raw_w = torch.flatten(pred_widths, start_dim=0, end_dim=1).cpu().numpy() * 1000.0
+                widths_mm = np.where(raw_w < 10.0, 40.0, np.clip(raw_w, 20.0, 70.0))
+
+                # Antipodal symmetry flip for parallel-jaw clamp:
+                # 1. Flip upward approaches pointing up from table (z_vert > 0)
+                # 2. Flip backward horizontal/shallow reaches pointing towards arm base (z_rad < 0 and z_vert >= -0.35)
+                p_cand = T_grasps[:, :3, 3]
+                q1_cand = np.arctan2(p_cand[:, 1], p_cand[:, 0])
+                u_rad = np.stack([np.cos(q1_cand), np.sin(q1_cand), np.zeros(len(p_cand))], axis=-1)
+                z_cand = T_grasps[:, :3, 2]
+                z_rad = np.sum(z_cand * u_rad, axis=-1)
+                z_vert = z_cand[:, 2]
+
+                flip_up = z_vert > 0.0
+                flip_bwd = (z_rad < 0.0) & (z_vert >= -0.35)
+                flip_all = flip_up | flip_bwd
+                T_grasps[flip_all, :, 1] *= -1.0
+                T_grasps[flip_all, :, 2] *= -1.0
+
+                z_cand = T_grasps[:, :3, 2]
+                z_rad = np.sum(z_cand * u_rad, axis=-1)
+                z_vert = z_cand[:, 2]
+
+                # 5-DoF kinematic subspace alignment scoring:
+                # Prioritizes grasps whose approach vector lies strictly within the reachable
+                # vertical arm plane (delta_phi <= 15 deg), since the SO-100 arm lacks wrist yaw.
+                n_cand = np.stack([-np.sin(q1_cand), np.cos(q1_cand), np.zeros(len(p_cand))], axis=-1)
+                dot_n = np.sum(z_cand * n_cand, axis=-1, keepdims=True)
+                z_proj = z_cand - dot_n * n_cand
+                norm_proj = np.linalg.norm(z_proj, axis=-1, keepdims=True) + 1e-8
+                z_proj_hat = z_proj / norm_proj
+                cos_dev = np.clip(np.sum(z_cand * z_proj_hat, axis=-1), -1.0, 1.0)
+                s_5dof = conf * (cos_dev ** 4)
+                s_5dof = np.where(cos_dev >= np.cos(np.radians(15.0)), s_5dof, s_5dof * 0.001)
+
+                # Check object geometry: for tall standing objects (z_span >= 75mm),
+                # penalize top-down plunge (z_vert < -0.6) because reaching over top of tall cylinder
+                # is mechanically outside 5-DoF 280mm reach envelope.
+                z_span = float(np.ptp(P_obj_base[:, 2]))
+                if z_span >= 75.0:
+                    is_plunge = z_vert < -0.6
+                    s_5dof = np.where(is_plunge, s_5dof * 0.05, s_5dof)
+
+                sort_idx = np.argsort(-s_5dof)
+                return T_grasps[sort_idx][:self.num_samples], s_5dof[sort_idx][:self.num_samples], widths_mm[sort_idx][:self.num_samples]
+            except Exception as e:
+                logger.warning(f"Error during Contact-GraspNet inference: {e}. Falling back to antipodal synthesis.")
+
+        # 3. High-Performance Vectorized Antipodal Synthesis Engine Fallback
         return self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label, Z_table=Z_table)
 
     def _vectorized_antipodal_synthesis(self,
@@ -967,7 +1073,7 @@ class VectorizedSO101GraspSolver:
         T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)
 
         # 2. 5-DoF Subspace Manifold Projection & Analytical IK
-        ik_results, valid_mask = self.project_6dof_to_5dof_and_solve_ik(T_wrist_targets, Z_table, widths=widths)
+        ik_results, valid_mask = self.project_6dof_to_5dof_and_solve_ik(T_wrist_targets, Z_table, widths=widths, is_flat_lying=is_flat_lying)
 
         # 3. Vectorized Grasp Height, CoM, and Anti-Overshoot Scoring
         best_idx, composite_scores, score_breakdown = self.score_and_select_optimal_grasp(
@@ -1033,13 +1139,10 @@ class VectorizedSO101GraspSolver:
         delta_lat = np.where(theta_pitch > np.radians(-25.0), w_val / 2.0 + 18.0, w_val / 2.0 + 3.0)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
-        # Level grasps use neutral 0.0mm pullback to reach bottle neck squarely at ~303-305mm without being short;
-        # Flat lying objects use 0.0mm pullback so jaws plunge deep enough to wrap around body without stopping in mid-air;
-        # Claw plunges on upright objects use -15mm pullback.
-        if is_flat_lying:
-            pullbacks = np.zeros(N, dtype=np.float64)
-        else:
-            pullbacks = np.where(theta_pitch > np.radians(-30.0), 0.0, RADIAL_PULLBACK_MM)
+        # Level grasps (theta_pitch > -25 deg) use neutral 0.0mm pullback to reach bottle neck squarely;
+        # Downward plunges (theta_pitch <= -25 deg) use -15mm pullback along local approach vector
+        # so fingertips pinch sides of object rather than plunging into the tabletop.
+        pullbacks = np.where(theta_pitch > np.radians(-25.0), 0.0, RADIAL_PULLBACK_MM)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
         v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 
@@ -1081,7 +1184,8 @@ class VectorizedSO101GraspSolver:
     def project_6dof_to_5dof_and_solve_ik(self,
                                          T_wrist_targets: np.ndarray,
                                          Z_table: float,
-                                         widths: Optional[np.ndarray] = None) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+                                         widths: Optional[np.ndarray] = None,
+                                         is_flat_lying: bool = False) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
         """
         5-DoF Subspace Manifold Projection & Analytical Closed-Form Inverse Kinematics.
         - Calculates required base pan q1 = atan2(y, x)
@@ -1179,7 +1283,9 @@ class VectorizedSO101GraspSolver:
         lowest_finger_z = (zw + 15.0 * z_proj_hat[:, 2] 
                            - 0.5 * w_val * np.abs(x_closing[:, 2]) 
                            - 8.0 * np.abs(y_thickness[:, 2]))
-        table_clearance_mask = lowest_finger_z >= (Z_table + self.table_z_margin_mm)
+        # Allow compliance margin (-5.0mm) for flat table-resting items so silicone jaws can enclose object without false safety trips
+        margin = -5.0 if is_flat_lying else self.table_z_margin_mm
+        table_clearance_mask = lowest_finger_z >= (Z_table + margin)
 
         # 7. Hardware Servo Limit Masks & Gripper Stroke Filter
         pan_mask   = (pan_deg >= PAN_MIN_DEG) & (pan_deg <= PAN_MAX_DEG)

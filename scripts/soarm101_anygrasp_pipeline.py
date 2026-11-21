@@ -925,7 +925,7 @@ class PretrainedGraspEngine:
             # ── STANDING CYLINDER / BOTTLE / CAN / CUP ───────────────────────────
             # Direct horizontal/side approach to bottle body/waist (NO claw machine plunge!)
             # Target true bottle waist/middle (~50-55% height), well below top cap and safely above table
-            z_top = float(np.max(P_obj[:, 2]))
+            z_top = float(np.percentile(P_obj[:, 2], 95))  # reject top-5% depth noise near cap
             z_bot = float(np.min(P_obj[:, 2]))
             h_span = max(10.0, z_top - z_bot)
             waist_z = float(z_bot + 0.48 * h_span)
@@ -1437,9 +1437,9 @@ class VectorizedSO101GraspSolver:
             dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
             S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (15.0 ** 2)))
 
-            # Penalize horizontal flat approaches for lying objects (requires downward wrist tilt)
-            flat_pitch = theta_pitch_deg > -25.0
-            S_height_com[flat_pitch] = -5.0
+            # Hard-reject any shallow / near-horizontal approach on lying objects
+            flat_pitch = theta_pitch_deg > -35.0
+            S_height_com[flat_pitch] = -1e9
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1532,6 +1532,9 @@ class VectorizedSO101GraspSolver:
         if is_standing_cylinder:
             steep_plunge = theta_pitch_deg_arr < -20.0
             composite_score[steep_plunge] = -1e9
+        if is_flat_lying:
+            shallow_lying = theta_pitch_deg_arr > -35.0
+            composite_score[shallow_lying] = -1e9
 
         best_idx = int(np.argmax(composite_score))
 

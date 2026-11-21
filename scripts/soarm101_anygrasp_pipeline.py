@@ -928,9 +928,11 @@ class PretrainedGraspEngine:
             z_top = float(np.max(P_obj[:, 2]))
             z_bot = float(np.min(P_obj[:, 2]))
             h_span = max(10.0, z_top - z_bot)
-            waist_z = float(z_bot + 0.52 * h_span)
+            waist_z = float(z_bot + 0.48 * h_span)
             min_z = float(tbl_ref + 40.0)
-            max_z = float(z_top - max(20.0, 0.25 * h_span))
+            # Enforce hard clearance from cap: never target within 40mm or 40% of h_span from the top
+            # This stops the approach vector from pointing at the cap face (head-on collision)
+            max_z = float(z_top - max(40.0, 0.40 * h_span))
             target_z = float(np.clip(waist_z, min_z, max(min_z, max_z)))
             pinch_centers[:, 2] = target_z
 
@@ -1413,11 +1415,9 @@ class VectorizedSO101GraspSolver:
             S_height_com = np.exp(-((h_rel - 0.52) ** 2) / (2.0 * (0.12 ** 2)))
 
             # 3D Anti-Overshoot Cap Guard:
-            # Hard-reject grasps in the upper 30% or within 30mm of the top cap —
-            # the static left claw has ~37mm reach from center so even a grasp
-            # at 25% from cap results in the left fingertip brushing the cap edge.
-            cap_guard_dist = max(30.0, 0.30 * total_height)
-            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.70)
+            # Strictly disqualify grasps near the top cap (upper 25% or within 25mm of top)
+            cap_guard_dist = max(25.0, 0.25 * total_height)
+            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.75)
             S_height_com[near_top_cap] = -10.0
 
             # Table proximity guard: ensure bottom of gripper clears table by >= 35mm

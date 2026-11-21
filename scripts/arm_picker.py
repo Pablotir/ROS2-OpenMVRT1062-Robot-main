@@ -936,6 +936,84 @@ def smooth_move(robot, target: dict, step_size=1.5, step_delay=0.02,
         time.sleep(step_delay)
 
 
+def cartesian_approach(robot, target: dict, step_size=1.0, step_delay=0.025):
+    """
+    Direct 3D Cartesian straight-line approach from current pose to target pose.
+    Prevents joint-space 'bulging' where the arm swings upward into caps or sweeps
+    forward at high elevation before descending into the object.
+    Falls back smoothly to smooth_move if any point along the line is unreachable.
+    """
+    cur = get_pos(robot)
+    max_delta = max(abs(target[j] - cur.get(j, 0.0)) for j in target)
+    if max_delta < 0.5:
+        return
+
+    # SO-100 kinematics
+    L1, L2, L3 = 115.8, 135.0, 149.0
+
+    def _fk(pos):
+        lift = pos.get("shoulder_lift.pos", 0.0)
+        elb  = pos.get("elbow_flex.pos", 0.0)
+        wst  = pos.get("wrist_flex.pos", 0.0)
+        t1 = math.radians(90.0 - lift)
+        t2 = math.radians(-elb - 81.0)
+        pitch = t1 + t2 - math.radians(wst + 5.0)
+        rho = L1 * math.cos(t1) + L2 * math.cos(t1 + t2) + L3 * math.cos(pitch)
+        z = L1 * math.sin(t1) + L2 * math.sin(t1 + t2) + L3 * math.sin(pitch)
+        return rho, z, pitch
+
+    def _ik(rho_tip, z_tip, pitch):
+        rho_p = rho_tip - L3 * math.cos(pitch)
+        z_p = z_tip - L3 * math.sin(pitch)
+        D_sq = rho_p**2 + z_p**2
+        cos_t2 = (D_sq - L1**2 - L2**2) / (2.0 * L1 * L2)
+        if abs(cos_t2) > 1.0:
+            return None
+        t2 = -math.acos(np.clip(cos_t2, -1.0, 1.0))
+        alpha = math.atan2(z_p, rho_p)
+        beta = math.atan2(L2 * math.sin(t2), L1 + L2 * math.cos(t2))
+        t1 = alpha - beta
+        lift = 90.0 - math.degrees(t1)
+        elb = -math.degrees(t2) - 81.0
+        wst = math.degrees(t1 + t2 - pitch) - 5.0
+        return lift, elb, wst
+
+    rho_0, z_0, pitch_0 = _fk(cur)
+    rho_1, z_1, pitch_1 = _fk(target)
+
+    n_steps = max(15, int(max_delta / step_size))
+
+    # Pre-check all waypoints to ensure Cartesian line is 100% reachable
+    trajectory = []
+    feasible = True
+    for s in range(1, n_steps + 1):
+        t = s / float(n_steps)
+        t_eased = 0.5 * (1.0 - math.cos(math.pi * t))
+        rho = rho_0 + t_eased * (rho_1 - rho_0)
+        z = z_0 + t_eased * (z_1 - z_0)
+        pitch = pitch_0 + t_eased * (pitch_1 - pitch_0)
+        sol = _ik(rho, z, pitch)
+        if sol is None:
+            feasible = False
+            break
+        interp = dict(target)
+        interp["shoulder_pan.pos"]  = cur.get("shoulder_pan.pos", 0.0) + t_eased * (target.get("shoulder_pan.pos", 0.0) - cur.get("shoulder_pan.pos", 0.0))
+        interp["shoulder_lift.pos"] = sol[0]
+        interp["elbow_flex.pos"]    = sol[1]
+        interp["wrist_flex.pos"]    = sol[2]
+        interp["wrist_roll.pos"]    = cur.get("wrist_roll.pos", 29.27) + t_eased * (target.get("wrist_roll.pos", 29.27) - cur.get("wrist_roll.pos", 29.27))
+        interp["gripper.pos"]       = target.get("gripper.pos", GRIPPER_OPEN_POS_DEG)
+        trajectory.append(interp)
+
+    if feasible and len(trajectory) == n_steps:
+        for cmd in trajectory:
+            robot.send_action(cmd)
+            time.sleep(step_delay)
+    else:
+        # Fallback to smooth_move if straight-line is mathematically blocked by workspace limits
+        smooth_move(robot, target, step_size=step_size, step_delay=step_delay)
+
+
 def level_approach(robot, target: dict, step_size=1.5, step_delay=0.025):
     """
     Move all joints simultaneously toward *target* with smooth S-curve easing while
@@ -4091,7 +4169,7 @@ def main():
                     print(f"   📐 Rotated wrist approach (adaptive 5-DoF {TARGET_DESC} alignment)...")
                 else:
                     print(f"   🌊 Smooth direct extension into {TARGET_DESC}...")
-                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02)
+                cartesian_approach(robot, grab_pos, step_size=1.0, step_delay=0.025)
                 time.sleep(0.3)
 
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG

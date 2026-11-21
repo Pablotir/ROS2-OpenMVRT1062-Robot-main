@@ -970,12 +970,18 @@ class PretrainedGraspEngine:
             pinch_centers[:, 1] = com[1]   # snap Y to centroid
             pinch_centers[:, 2] = target_z
 
-            if R_obj >= 250.0:
-                # Distant lying object: approach angled steeply down (-45° to -75°) or claw plunge (-85°)
-                pitches = np.linspace(np.radians(-45.0), np.radians(-85.0), num_grasps)
-            else:
-                # Close lying object: steep top-down claw plunge (-70° to -88°)
-                pitches = np.linspace(np.radians(-70.0), np.radians(-88.0), num_grasps)
+            # Cap radial reach of grasp targets to 390.0mm (safe physical reach limit of SO-ARM101)
+            r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
+            excess_r = np.maximum(0.0, r_pinch - 390.0)
+            pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
+            pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
+
+            # Dynamically compute steepest pitch physically reachable at R_obj
+            # 5-DoF reach constraint: R_max(pitch) = 250.8 + 149 * cos(pitch)
+            cos_limit = float(np.clip((R_obj - 245.0) / 149.0, 0.0, 1.0))
+            steepest_pitch_rad = -math.acos(cos_limit) if cos_limit > 0.0 else np.radians(-85.0)
+            shallowest_pitch_rad = np.radians(-15.0) if R_obj >= 300.0 else np.radians(-30.0)
+            pitches = np.linspace(steepest_pitch_rad, shallowest_pitch_rad, num_grasps)
             np.random.shuffle(pitches)
 
             # Align gripper closing axis perpendicular to the bottle's horizontal long axis in tabletop plane
@@ -1437,9 +1443,14 @@ class VectorizedSO101GraspSolver:
             dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
             S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (15.0 ** 2)))
 
-            # Hard-reject any shallow / near-horizontal approach on lying objects
-            flat_pitch = theta_pitch_deg > -35.0
-            S_height_com[flat_pitch] = -1e9
+            # For close objects (R < 280mm), enforce downward plunge (reject > -35°).
+            # For distant objects (R >= 280mm), shallower pitch is kinematically required to reach.
+            if R_obj < 280.0:
+                flat_pitch = theta_pitch_deg > -35.0
+                S_height_com[flat_pitch] = -1e9
+            else:
+                pure_flat = theta_pitch_deg > -8.0
+                S_height_com[pure_flat] = -5.0
 
         elif is_compact:
             # Compact 3D Object (balls, apples, mugs, short cups, blocks, tape rolls):
@@ -1509,9 +1520,11 @@ class VectorizedSO101GraspSolver:
         # but rewards downward angled wrist poses for lying objects
         theta_pitch_deg_arr = np.degrees(ik_results["theta_pitch"])
         if is_flat_lying:
-            # Reward steep downward wrist tilt (-60° to -85° claw plunge) for lying objects
-            target_lying_pitch = -75.0 if R_obj < 250.0 else -60.0
-            S_level = np.exp(-((theta_pitch_deg_arr - target_lying_pitch) ** 2) / (2.0 * (20.0 ** 2)))
+            # Reward steepest reachable pitch for lying objects at R_obj
+            cos_lim = float(np.clip((R_obj - 245.0) / 149.0, 0.0, 1.0))
+            best_lying_pitch = -math.degrees(math.acos(cos_lim)) if cos_lim > 0.0 else -75.0
+            best_lying_pitch = min(-15.0, best_lying_pitch)
+            S_level = np.exp(-((theta_pitch_deg_arr - best_lying_pitch) ** 2) / (2.0 * (18.0 ** 2)))
         elif is_standing_cylinder:
             # Gaussian peak at strictly level/shallow horizontal approach (-5.0°) with 12° tolerance
             S_level = np.exp(-((theta_pitch_deg_arr - (-5.0)) ** 2) / (2.0 * (12.0 ** 2)))
@@ -1532,7 +1545,7 @@ class VectorizedSO101GraspSolver:
         if is_standing_cylinder:
             steep_plunge = theta_pitch_deg_arr < -20.0
             composite_score[steep_plunge] = -1e9
-        if is_flat_lying:
+        if is_flat_lying and R_obj < 280.0:
             shallow_lying = theta_pitch_deg_arr > -35.0
             composite_score[shallow_lying] = -1e9
 

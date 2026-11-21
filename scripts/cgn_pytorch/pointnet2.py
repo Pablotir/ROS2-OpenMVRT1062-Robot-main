@@ -1,21 +1,12 @@
-from torch_geometric.nn import fps, radius, global_max_pool
-from torch_geometric.nn.conv import PointNetConv as PointConv
+from torch_geometric.nn.conv.point_conv import PointNetConv as PointConv
+from torch_geometric.nn.pool.glob import global_max_pool
 import torch
 from torch.nn import Sequential as Seq, Linear as Lin, ReLU, BatchNorm1d as BN
 import copy
 import numpy as np
 
-_USE_PYG_KNN = True
-
 def safe_knn_interpolate(x, pos_x, pos_y, batch_x=None, batch_y=None, k=3):
-    global _USE_PYG_KNN
-    if _USE_PYG_KNN:
-        try:
-            from torch_geometric.nn import knn_interpolate as pyg_knn_interpolate
-            return pyg_knn_interpolate(x, pos_x, pos_y, batch_x, batch_y, k=k)
-        except Exception:
-            _USE_PYG_KNN = False
-
+    """Pure PyTorch k-NN feature interpolation (zero Numba / pyg-lib dependency)."""
     if batch_x is None or batch_y is None or (torch.all(batch_x == 0) and torch.all(batch_y == 0)):
         diff = pos_y.unsqueeze(1) - pos_x.unsqueeze(0)
         dists_sq = torch.sum(diff * diff, dim=-1)
@@ -86,12 +77,7 @@ class PointNet(torch.nn.Module):
 
 
 def safe_fps(pos, batch=None, ratio=0.5, random_start=False):
-    try:
-        from torch_geometric.nn import fps as pyg_fps
-        return pyg_fps(pos, batch, ratio=ratio, random_start=random_start)
-    except Exception:
-        pass
-
+    """Pure PyTorch Farthest Point Sampling (zero Numba / pyg-lib dependency)."""
     if batch is None or torch.all(batch == 0):
         N = pos.size(0)
         num_samples = max(1, int(N * ratio))
@@ -117,12 +103,7 @@ def safe_fps(pos, batch=None, ratio=0.5, random_start=False):
 
 
 def safe_radius(x, y, r, batch_x, batch_y, max_num_neighbors=64):
-    try:
-        from torch_geometric.nn import radius as pyg_radius
-        return pyg_radius(x, y, r, batch_x, batch_y, max_num_neighbors=max_num_neighbors)
-    except Exception:
-        pass
-
+    """Pure PyTorch Ball Query / Radius Neighbor Search (zero Numba / pyg-lib dependency)."""
     r2 = r * r
     if batch_x is None or batch_y is None or (torch.all(batch_x == 0) and torch.all(batch_y == 0)):
         diff = y.unsqueeze(1) - x.unsqueeze(0)

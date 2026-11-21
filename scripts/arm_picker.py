@@ -3376,6 +3376,21 @@ def main():
         pass  # ignore warmup errors — just ensure cuda graph is built
     print("   ✅ YOLO warmup complete")
 
+    # ── Contact-GraspNet 6-DoF warmup BEFORE arm connect & RealSense stream ─────
+    # Initializes PyTorch Contact-GraspNet weights, CUDA kernels, and PyG modules
+    # in the main thread before RealSense worker thread starts, preventing multi-threaded
+    # runtime conflicts or segfaults during live visual servoing.
+    if USE_TIER2_ANYGRASP:
+        print("   🔥 Warming up Contact-GraspNet 6-DoF Pipeline on GPU...")
+        try:
+            from soarm101_anygrasp_pipeline import get_global_pipeline
+            _cgn_pipe = get_global_pipeline()
+            _dummy_pts = np.random.uniform(-100.0, 100.0, (500, 3)).astype(np.float32)
+            _cgn_pipe.stage2_engine.synthesize_6dof_grasps(_dummy_pts, _dummy_pts, target_label="warmup")
+            print("   ✅ Contact-GraspNet 6-DoF warmup complete")
+        except Exception as e:
+            print(f"   ⚠️ Contact-GraspNet warmup completed with note: {e}")
+
     # ── Robot arm ─────────────────────────────────────────────────────────────
     try:
         robot = connect_robot()

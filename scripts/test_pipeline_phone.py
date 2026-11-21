@@ -57,7 +57,8 @@ for sc, label, roll_deg, pitch_deg, yaw_deg in [
     ("Flat Phone (0 deg)", "phone", 0.0, 0.0, 0.0),
     ("Rotated Phone (45 deg yaw)", "phone", 0.0, 0.0, 45.0),
     ("Tilted Phone (45 deg tilt)", "phone", 0.0, 45.0, 0.0),
-    ("Standing Bottle", "bottle", 0.0, 0.0, 0.0)
+    ("Standing Bottle", "bottle", 0.0, 0.0, 0.0),
+    ("Lying Down Bottle", "bottle", 90.0, 0.0, 0.0)
 ]:
     print(f"\n==========================================")
     print(f"Testing Contact-GraspNet Pipeline on '{sc}'")
@@ -81,6 +82,7 @@ for sc, label, roll_deg, pitch_deg, yaw_deg in [
     print(f"Valid candidates: {solver_result['valid_candidate_count']} / {solver_result['total_candidate_count']}")
     print(f"Composite score: {solver_result['composite_score']:.2f}")
     print(f"Target joints: {solver_result['target_joints']}")
+    print(f"Standoff joints: {solver_result.get('standoff_joints') is not None}")
     print(f"Pitch deg: {solver_result.get('pitch_deg', 0.0):.1f}°")
     print(f"Delta phi deg: {solver_result.get('delta_phi_deg', 0.0):.1f}°")
 

@@ -3668,6 +3668,7 @@ def main():
             obj_py = int((y1_a + y2_a) / 2)
             print(f"   🔒 Target Track Locked in Memory: box=({x1_a},{y1_a},{x2_a},{y2_a}) stable_center=({obj_px},{obj_py})")
             grab_pos = None
+            standoff_pos = None
             final_target = None
             target_pitch = PREFERRED_GRAB_PITCH_DEG
             target_roll = START_POS.get("wrist_roll.pos", 29.27)
@@ -3687,6 +3688,7 @@ def main():
                     )
                     if anygrasp_j is not None and anygrasp_plan.get("success"):
                         grab_pos = anygrasp_j
+                        standoff_pos = anygrasp_plan.get("standoff_joints")
                         target_closed_grip = GRIPPER_CLOSED_POS_DEG
                         target_pitch = anygrasp_plan.get("pitch_deg", 0.0)
                         target_roll = anygrasp_j.get("wrist_roll.pos", target_roll)
@@ -4023,6 +4025,12 @@ def main():
                 print("\n🦾 APPROACHING (jaws wide open)...")
                 grab_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
 
+                if standoff_pos is not None:
+                    print(f"   🛫 Moving to pre-grasp standoff pose (height-clearing waypoint)...")
+                    standoff_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
+                    smooth_move(robot, standoff_pos, step_size=2.0, step_delay=0.025)
+                    time.sleep(0.15)
+
                 # Smooth direct extension straight into grasp pose (no mid-air hovering, no claw machine drop)
                 neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
                 is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
@@ -4030,7 +4038,7 @@ def main():
                     print(f"   📐 Rotated wrist approach (adaptive 5-DoF {TARGET_DESC} alignment)...")
                 else:
                     print(f"   🌊 Smooth direct extension into {TARGET_DESC}...")
-                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.025)
+                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02)
                 time.sleep(0.3)
 
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG

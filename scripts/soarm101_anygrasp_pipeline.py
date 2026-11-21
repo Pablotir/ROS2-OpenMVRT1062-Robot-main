@@ -773,16 +773,29 @@ class PretrainedGraspEngine:
                 s_5dof = conf * (cos_dev ** 4)
                 s_5dof = np.where(cos_dev >= np.cos(np.radians(15.0)), s_5dof, s_5dof * 0.001)
 
-                # Check object geometry: for tall standing objects (z_span >= 75mm),
-                # penalize top-down plunge (z_vert < -0.6) because reaching over top of tall cylinder
-                # is mechanically outside 5-DoF 280mm reach envelope.
-                z_span = float(np.ptp(P_obj_base[:, 2]))
-                if z_span >= 75.0:
-                    is_plunge = z_vert < -0.6
-                    s_5dof = np.where(is_plunge, s_5dof * 0.05, s_5dof)
+                # Cylinders / bottles / cups / cans: strictly penalize top-down plunges (z_vert < -0.35)
+                # because 5-DoF arm lacks wrist yaw and reaching over the top cuts off 50mm reach
+                # and collides with the cap. Bottles MUST be grasped horizontally from the side!
+                is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
+                if is_cylinder_name:
+                    is_plunge = z_vert < -0.35
+                    s_5dof = np.where(is_plunge, s_5dof * 1e-6, s_5dof)
+                else:
+                    z_span = float(np.ptp(P_obj_base[:, 2]))
+                    if z_span >= 60.0:
+                        is_plunge = z_vert < -0.5
+                        s_5dof = np.where(is_plunge, s_5dof * 0.01, s_5dof)
 
                 sort_idx = np.argsort(-s_5dof)
-                return T_grasps[sort_idx][:self.num_samples], s_5dof[sort_idx][:self.num_samples], widths_mm[sort_idx][:self.num_samples]
+                top_T = T_grasps[sort_idx][:self.num_samples]
+                top_s = s_5dof[sort_idx][:self.num_samples]
+                top_w = widths_mm[sort_idx][:self.num_samples]
+                if is_cylinder_name and np.sum(top_s > 1e-4) < 20:
+                    T_syn, s_syn, w_syn = self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label, Z_table=Z_table)
+                    top_T = np.concatenate([top_T, T_syn], axis=0)
+                    top_s = np.concatenate([top_s, s_syn], axis=0)
+                    top_w = np.concatenate([top_w, w_syn], axis=0)
+                return top_T, top_s, top_w
             except Exception as e:
                 logger.warning(f"Error during Contact-GraspNet inference: {e}. Falling back to antipodal synthesis.")
 
@@ -824,20 +837,13 @@ class PretrainedGraspEngine:
         h_above_table = float(np.max(P_obj[:, 2]) - tbl_ref)
 
         # Distinguish standing upright cylinder vs flat lying object vs tilted 3D object:
-        # A standing cylinder has its principal axis pointing vertically (|v_main[2]| >= 0.40),
-        # or significant vertical height (z_span >= 35mm or h_above_table >= 45mm).
-        is_standing_cylinder = (
-            is_cylinder_name
-            and (abs(v_main[2]) >= 0.40 or z_span_obj >= 35.0 or h_above_table >= 45.0)
-            and not (abs(v_main[2]) < 0.35 and z_span_obj < 30.0)
-        )
-
-        # A flat lying object has its principal axis horizontal in the table plane (|v_main[2]| < 0.45)
-        # OR has a low vertical span / profile (z_span < 35mm and h_above_table < 45mm).
-        is_flat_lying = (not is_standing_cylinder) and (
-            (abs(v_main[2]) < 0.45)
-            or (z_span_obj < 35.0 and h_above_table < 45.0)
-        )
+        if is_cylinder_name:
+            is_knocked_over = (abs(v_main[2]) < 0.25) and (L_major >= 60.0) and (z_span_obj < 40.0)
+            is_standing_cylinder = not is_knocked_over
+            is_flat_lying = is_knocked_over
+        else:
+            is_standing_cylinder = False
+            is_flat_lying = (abs(v_main[2]) < 0.45) or (z_span_obj < 35.0 and h_above_table < 45.0)
 
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 35.0) or is_standing_cylinder
         is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.25) and (L_major >= 50.0))
@@ -1043,15 +1049,16 @@ class VectorizedSO101GraspSolver:
         is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
         aspect_ratio = float(np.max(evals_o) / (np.min(evals_o) + 1e-6))
 
-        is_standing_cylinder = (
-            is_cylinder_name
-            and (abs(v_main[2]) >= 0.40 or z_span_obj >= 35.0 or h_above_table >= 45.0)
-            and not (abs(v_main[2]) < 0.35 and z_span_obj < 30.0)
-        )
-        is_flat_lying = (not is_standing_cylinder) and (
-            (abs(v_main[2]) < 0.45)
-            or (z_span_obj < 35.0 and h_above_table < 45.0)
-        )
+        dims_o = 4.0 * np.sqrt(np.maximum(evals_o, 1e-6))
+        L_major = float(dims_o[2])
+
+        if is_cylinder_name:
+            is_knocked_over = (abs(v_main[2]) < 0.25) and (L_major >= 60.0) and (z_span_obj < 40.0)
+            is_standing_cylinder = not is_knocked_over
+            is_flat_lying = is_knocked_over
+        else:
+            is_standing_cylinder = False
+            is_flat_lying = (abs(v_main[2]) < 0.45) or (z_span_obj < 35.0 and h_above_table < 45.0)
 
         # 1. Continuous Local-Frame Asymmetric Pincer Compensation
         T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)
@@ -1344,16 +1351,13 @@ class VectorizedSO101GraspSolver:
         tbl_ref = Z_table if Z_table is not None else float(np.min(P_obj_base[:, 2]) - 5.0)
         h_above_table = float(np.max(P_obj_base[:, 2]) - tbl_ref)
 
-        is_standing_cylinder = (
-            is_cylinder_name
-            and (abs(v_main[2]) >= 0.40 or z_span_obj >= 35.0 or h_above_table >= 45.0)
-            and not (abs(v_main[2]) < 0.35 and z_span_obj < 30.0)
-        )
-
-        is_flat_lying = (not is_standing_cylinder) and (
-            (abs(v_main[2]) < 0.45)
-            or (z_span_obj < 35.0 and h_above_table < 45.0)
-        )
+        if is_cylinder_name:
+            is_knocked_over = (abs(v_main[2]) < 0.25) and (L_major >= 60.0) and (z_span_obj < 40.0)
+            is_standing_cylinder = not is_knocked_over
+            is_flat_lying = is_knocked_over
+        else:
+            is_standing_cylinder = False
+            is_flat_lying = (abs(v_main[2]) < 0.45) or (z_span_obj < 35.0 and h_above_table < 45.0)
 
         is_standing_or_tilted = (abs(v_main[2]) > 0.35) or (z_span_obj >= 35.0) or is_standing_cylinder
         is_tall_elongated = is_standing_cylinder or (is_standing_or_tilted and not is_flat_lying and (aspect_ratio >= 1.4) and (total_height >= 50.0))
@@ -1483,6 +1487,9 @@ class VectorizedSO101GraspSolver:
                            0.10 * S_level)
 
         composite_score[~valid_mask] = -1e9
+        if is_standing_cylinder:
+            steep_plunge = theta_pitch_deg_arr < -20.0
+            composite_score[steep_plunge] = -1e9
 
         best_idx = int(np.argmax(composite_score))
 

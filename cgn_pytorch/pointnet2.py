@@ -49,6 +49,45 @@ class PointNet(torch.nn.Module):
         return x
 
 
+def safe_radius(x, y, r, batch_x, batch_y, max_num_neighbors=64):
+    try:
+        from torch_geometric.nn import radius as pyg_radius
+        return pyg_radius(x, y, r, batch_x, batch_y, max_num_neighbors=max_num_neighbors)
+    except Exception:
+        pass
+
+    r2 = r * r
+    if batch_x is None or batch_y is None or (torch.all(batch_x == 0) and torch.all(batch_y == 0)):
+        diff = y.unsqueeze(1) - x.unsqueeze(0)
+        dists_sq = torch.sum(diff * diff, dim=-1)
+        k = min(max_num_neighbors, x.size(0))
+        top_dists, top_indices = torch.topk(dists_sq, k=k, dim=1, largest=False)
+        valid = (top_dists <= r2)
+        row = torch.arange(y.size(0), device=y.device).unsqueeze(1).expand_as(top_indices)[valid]
+        col = top_indices[valid]
+        return row, col
+    else:
+        row_list, col_list = [], []
+        for b in torch.unique(batch_y):
+            mask_y = (batch_y == b)
+            mask_x = (batch_x == b)
+            idx_y = torch.nonzero(mask_y, as_tuple=True)[0]
+            idx_x = torch.nonzero(mask_x, as_tuple=True)[0]
+            sub_y, sub_x = y[mask_y], x[mask_x]
+            diff = sub_y.unsqueeze(1) - sub_x.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=-1)
+            k = min(max_num_neighbors, sub_x.size(0))
+            top_dists, top_indices = torch.topk(dists_sq, k=k, dim=1, largest=False)
+            valid = (top_dists <= r2)
+            b_rows = torch.arange(sub_y.size(0), device=y.device).unsqueeze(1).expand_as(top_indices)[valid]
+            b_cols = top_indices[valid]
+            row_list.append(idx_y[b_rows])
+            col_list.append(idx_x[b_cols])
+        if len(row_list) == 0:
+            return torch.empty(0, dtype=torch.long, device=y.device), torch.empty(0, dtype=torch.long, device=y.device)
+        return torch.cat(row_list), torch.cat(col_list)
+
+
 class SAModule(torch.nn.Module):
     def __init__(self, ratio, r, nn=None):
         super(SAModule, self).__init__()
@@ -63,8 +102,8 @@ class SAModule(torch.nn.Module):
         else:
             idx = idx
 
-        row, col = radius(pos, pos[idx], self.r, batch, batch[idx],
-                          max_num_neighbors=64)
+        row, col = safe_radius(pos, pos[idx], self.r, batch, batch[idx],
+                               max_num_neighbors=64)
         edge_index = torch.stack([col, row], dim=0)
         x = self.conv(x, (pos, pos[idx]), edge_index)
         pos, batch = pos[idx], batch[idx]

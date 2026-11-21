@@ -4022,54 +4022,22 @@ def main():
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
                 print("\n🦾 APPROACHING (jaws wide open)...")
                 grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
-                # ── Check for Claw Machine Approach (steep plunge >= 60° down) ──
-                hover_pos = None
-                if target_pitch <= -60.0 and final_target is not None:
-                    fx_t, fy_t, fz_t, _ = final_target
-                    cur_j = get_pos(robot)
-                    for h_off in [50.0, 40.0, 30.0]:
-                        sol_h = solve_ik(fx_t, fy_t, fz_t + h_off,
-                                         end_pitch_deg=target_pitch,
-                                         current_joints=cur_j,
-                                         wrist_roll_deg=grab_pos.get("wrist_roll.pos", target_roll))
-                        if sol_h is not None:
-                            hover_pos = sol_h
-                            hover_pos["gripper.pos"] = grab_pos["gripper.pos"]
-                            break
 
-                if hover_pos is not None:
-                    # Stage 1: Hover directly above target in mid-air (align pan & twist wrist cleanly above object)
-                    print("   🚁 Pre-grasp hover: aligning directly above target in mid-air...")
-                    smooth_move(robot, hover_pos, step_size=2.5, step_delay=0.03)
-                    time.sleep(0.2)
-
-                    # Stage 2: Pure vertical drop onto grasp target (static claw drops straight down, zero sideways push)
-                    print("   ⬇️  Claw machine drop: descending vertically onto neck...")
-                    smooth_move(robot, grab_pos, step_size=1.5, step_delay=0.03)
-                    time.sleep(0.3)
+                # Smooth direct extension straight into grasp pose (no mid-air hovering, no claw machine drop)
+                neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
+                is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
+                if is_rotated_roll:
+                    print(f"   📐 Rotated wrist approach (adaptive 5-DoF {TARGET_DESC} alignment)...")
                 else:
-                    # Single-phase smooth extension straight into grasp pose (no hovering, no awkward joint pitch warping)
-                    neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
-                    is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
-                    if is_rotated_roll:
-                        print("   📐 Rotated wrist approach (adaptive 5-DoF flat phone alignment)...")
-                    else:
-                        print("   🌊 Smooth extension directly into bottle neck...")
-                    smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.025)
-                    time.sleep(0.3)
+                    print(f"   🌊 Smooth direct extension into {TARGET_DESC}...")
+                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.025)
+                time.sleep(0.3)
 
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG
                 print(f"✊ GRIPPING (closing jaws firmly to {actual_closed_grip:.1f}° with zero air gap)...")
                 grab_pos["gripper.pos"] = actual_closed_grip
                 smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02, hold_joints=[])
                 time.sleep(0.5)
-
-                if hover_pos is not None:
-                    # Stage 3: Vertical lift before returning to avoid dragging against table (claw machine only)
-                    print("   ⬆️  Vertical lift: lifting object straight up off table...")
-                    hover_pos["gripper.pos"] = actual_closed_grip
-                    smooth_move(robot, hover_pos, step_size=2.0, step_delay=0.03, hold_joints=["gripper.pos"])
-                    time.sleep(0.3)
 
                 print("🏠 RETREATING back to position...")
                 drop_pos = dict(START_POS)

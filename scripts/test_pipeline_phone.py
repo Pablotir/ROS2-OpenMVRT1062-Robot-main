@@ -85,4 +85,5 @@ for sc, label, roll_deg, pitch_deg, yaw_deg in [
     print(f"Delta phi deg: {solver_result.get('delta_phi_deg', 0.0):.1f}°")
 
 print("\n✅ All scenarios evaluated successfully!")
+sys.stdout.flush()
 os._exit(0)

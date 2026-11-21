@@ -242,12 +242,12 @@ PAN_MAX_DEG         =  113.8   # Far right user-preferred limit
 # Outer convex envelope limits measured in the ARM BASE frame
 # (origin = shoulder pivot, +X forward, +Y left, +Z up).
 WS_X_MIN_MM  = -140.0   # behind the robot
-WS_X_MAX_MM  =  390.0   # max forward reach (calibrated limit with 153mm gripper assembly)
+WS_X_MAX_MM  =  400.0   # max forward reach (calibrated limit with 153mm gripper assembly)
 WS_Y_MAX_MM  =  280.0   # max lateral left
 WS_Y_MIN_MM  = -280.0   # max lateral right
 WS_Z_MIN_MM  = -280.0   # lowest reachable height below shoulder pivot (supports low tables and desks)
 WS_Z_MAX_MM  =  300.0   # highest point straight up
-WS_RHO_MAX_MM =  390.0  # max horizontal extension from shoulder pivot (405mm theoretical minus margin)
+WS_RHO_MAX_MM =  400.0  # max horizontal extension from shoulder pivot (405mm theoretical minus margin)
 TABLE_FLOOR_Z_MM = -200.0  # fallback physical tabletop height (mm) below shoulder pivot when live camera depth unavailable
 
 # ── RealSense D405 — Eye-in-Hand Calibration (T_cam_wrist) ──────────────────
@@ -269,9 +269,9 @@ CAM_PITCH_DEG   =  45.0   # tilt of camera relative to wrist axis (0 = parallel)
 D405_MIN_RANGE_MM = 70.0
 
 # Maximum realistic table grab depth (mm). The maximum physical extension of the SO-ARM101
-# from shoulder pivot is 390mm (link lengths 152+153+100=405mm max). Readings larger than 380mm
+# from shoulder pivot is 405mm (link lengths 115+137.5+153=405.5mm max). Readings larger than 400mm
 # mean the depth sensor sampled background table/floor/wall noise, so we reject them.
-MAX_GRAB_DEPTH_MM = 380.0
+MAX_GRAB_DEPTH_MM = 400.0
 
 # How far PAST the object surface the gripper tip should be at grab time.
 # Gripper throat depth is ~37mm. With 20.0mm penetration, the object is placed securely

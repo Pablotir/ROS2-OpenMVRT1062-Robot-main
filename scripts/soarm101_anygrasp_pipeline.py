@@ -859,9 +859,9 @@ class PretrainedGraspEngine:
             neck_z = max(float(z_bot + 0.50 * (z_top - z_bot)), float(tbl_ref + 35.0))
             pinch_centers[:, 2] = neck_z
 
-            # Cap radial reach of grasp targets to 375.0mm (safe hardware reach limit)
+            # Cap radial reach of grasp targets to 400.0mm (max physical reach of SO-ARM101)
             r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-            excess_r = np.maximum(0.0, r_pinch - 375.0)
+            excess_r = np.maximum(0.0, r_pinch - 400.0)
             pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
             pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 

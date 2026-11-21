@@ -960,8 +960,12 @@ class PretrainedGraspEngine:
 
         elif is_flat_lying:
             # ── FLAT / LYING OBJECT OR FALLEN BOTTLE ───────────────────────────────
-            # Target object body resting on tabletop (~20-22mm above table) so jaws fully enclose body
+            # Snap all pinch centers to the 3D Centre-of-Mass projected onto the table plane
+            # so the gripper always targets the middle of the cylinder body — never the butt or cap end.
+            # Only the approach pitch/roll varies across candidates; XYZ is uniform at body center.
             target_z = float(np.clip(np.median(P_obj[:, 2]), tbl_ref + 18.0, tbl_ref + 25.0))
+            pinch_centers[:, 0] = com[0]   # snap X to centroid (eliminates butt/cap endpoint bias)
+            pinch_centers[:, 1] = com[1]   # snap Y to centroid
             pinch_centers[:, 2] = target_z
 
             if R_obj >= 250.0:
@@ -1409,9 +1413,11 @@ class VectorizedSO101GraspSolver:
             S_height_com = np.exp(-((h_rel - 0.52) ** 2) / (2.0 * (0.12 ** 2)))
 
             # 3D Anti-Overshoot Cap Guard:
-            # Strictly disqualify grasps near the top cap (upper 25% or within 25mm of top)
-            cap_guard_dist = max(25.0, 0.25 * total_height)
-            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.75)
+            # Hard-reject grasps in the upper 30% or within 30mm of the top cap —
+            # the static left claw has ~37mm reach from center so even a grasp
+            # at 25% from cap results in the left fingertip brushing the cap edge.
+            cap_guard_dist = max(30.0, 0.30 * total_height)
+            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.70)
             S_height_com[near_top_cap] = -10.0
 
             # Table proximity guard: ensure bottom of gripper clears table by >= 35mm
@@ -1425,9 +1431,11 @@ class VectorizedSO101GraspSolver:
 
         elif is_flat_lying:
             # Flat Object / Lying Down Cylinder (bottle lying on table, phone, horizontal container):
-            # Optimal grasp: centered within 20mm of 3D Center of Mass
+            # Optimal grasp: centered within 20mm of 3D Centre-of-Mass.
+            # Pinch centers are already snapped to com[X,Y] in synthesis so dist_to_com
+            # reflects only pitch/approach variation — tighten σ to 15mm to strictly reward center.
             dist_to_com = np.linalg.norm(pinch_centers - com, axis=-1)
-            S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (20.0 ** 2)))
+            S_height_com = np.exp(-(dist_to_com ** 2) / (2.0 * (15.0 ** 2)))
 
             # Penalize horizontal flat approaches for lying objects (requires downward wrist tilt)
             flat_pitch = theta_pitch_deg > -25.0

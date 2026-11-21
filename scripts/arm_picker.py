@@ -40,7 +40,23 @@ State machine: SEARCHING → VERIFYING → ALIGNING → GRABBING → RETURNING
 # ─────────────────────────────────────────────────────────────────────────────
 """
 import os, sys, yaml
+
 # ── JetPack / aarch64 CUDA Runtime & Memory Safety ───────────────────────────
+# Prevent PyTorch/OpenMP glibc heap corruption on Jetson Orin (aarch64)
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
+os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Apply glibc allocator tuning immediately in C runtime
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-1, -1)     # M_TRIM_THRESHOLD: disable aggressive sbrk heap trimming
+    _libc.mallopt(-3, 131072) # M_MMAP_THRESHOLD: 128KB threshold for direct mmap
+    _libc.mallopt(-8, 2)      # M_ARENA_MAX: limit malloc arenas to 2 to prevent thread arena thrashing
+except Exception:
+    pass
+
 # On NVIDIA Jetson, torch MUST be imported before cv2 to properly initialize
 # the CUDA runtime and OpenMP memory allocators cleanly. Importing cv2 first
 # causes native glibc heap corruption ("corrupted size vs. prev_size").
@@ -55,6 +71,16 @@ except ImportError:
     YOLO = None
 
 # Prevent PyTorch/Ultralytics Conv+BN fusion glibc heap corruption on Jetson
+try:
+    import ultralytics.nn.autobackend as _ab
+    _orig_ab_init = _ab.AutoBackend.__init__
+    def _safe_ab_init(self, *args, **kwargs):
+        kwargs["fuse"] = False
+        return _orig_ab_init(self, *args, **kwargs)
+    _ab.AutoBackend.__init__ = _safe_ab_init
+except Exception:
+    pass
+
 if torch is not None:
     try:
         import torch.nn.utils.fusion as _fusion
@@ -3369,11 +3395,20 @@ def main():
     # during warmup fires a signal into live C/CUDA code → fatal heap corruption.
     # Warm the model NOW while servos are still off the bus.
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
-    _dummy = np.zeros((480, 848, 3), dtype=np.uint8)
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+    _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    _dummy.flags.writeable = True
     try:
         model(_dummy, verbose=False, conf=YOLO_CONF)
-    except Exception:
-        pass  # ignore warmup errors — just ensure cuda graph is built
+    except Exception as e:
+        print(f"   ⚠️ YOLO warmup note: {e}")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
     print("   ✅ YOLO warmup complete")
 
     # ── Contact-GraspNet 6-DoF warmup BEFORE arm connect & RealSense stream ─────
@@ -3387,6 +3422,10 @@ def main():
             _cgn_pipe = get_global_pipeline()
             _dummy_pts = np.random.uniform(-100.0, 100.0, (500, 3)).astype(np.float32)
             _cgn_pipe.stage2_engine.synthesize_6dof_grasps(_dummy_pts, _dummy_pts, target_label="warmup")
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
             print("   ✅ Contact-GraspNet 6-DoF warmup complete")
         except Exception as e:
             print(f"   ⚠️ Contact-GraspNet warmup completed with note: {e}")

@@ -43,6 +43,16 @@ os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
 os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Apply glibc allocator tuning immediately in C runtime
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-1, -1)     # M_TRIM_THRESHOLD: disable aggressive sbrk heap trimming
+    _libc.mallopt(-3, 131072) # M_MMAP_THRESHOLD: 128KB threshold for direct mmap
+    _libc.mallopt(-8, 2)      # M_ARENA_MAX: limit malloc arenas to 2 to prevent thread arena thrashing
+except Exception:
+    pass
+
 # On NVIDIA Jetson, torch MUST be imported before cv2 to properly initialize
 # the CUDA runtime and OpenMP memory allocators cleanly. Importing cv2 first
 # causes native glibc heap corruption ("corrupted size vs. prev_size").
@@ -57,6 +67,16 @@ except ImportError:
     YOLO = None
 
 # Prevent PyTorch/Ultralytics Conv+BN fusion glibc heap corruption on Jetson
+try:
+    import ultralytics.nn.autobackend as _ab
+    _orig_ab_init = _ab.AutoBackend.__init__
+    def _safe_ab_init(self, *args, **kwargs):
+        kwargs["fuse"] = False
+        return _orig_ab_init(self, *args, **kwargs)
+    _ab.AutoBackend.__init__ = _safe_ab_init
+except Exception:
+    pass
+
 if torch is not None:
     try:
         import torch.nn.utils.fusion as _fusion

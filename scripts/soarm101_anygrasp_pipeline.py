@@ -859,10 +859,9 @@ class PretrainedGraspEngine:
             neck_z = max(float(z_bot + 0.50 * (z_top - z_bot)), float(tbl_ref + 35.0))
             pinch_centers[:, 2] = neck_z
 
-            # Cap radial reach of grasp targets to 316.0mm to position fingertips squarely
-            # at the bottle neck (reaching ~310-316mm) without being short or overextending
+            # Cap radial reach of grasp targets to 375.0mm (safe hardware reach limit)
             r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-            excess_r = np.maximum(0.0, r_pinch - 316.0)
+            excess_r = np.maximum(0.0, r_pinch - 375.0)
             pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
             pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 
@@ -1110,13 +1109,14 @@ class VectorizedSO101GraspSolver:
         # right horn clears the right side of the bottle neck completely, eliminating cap/body grazing.
         # Downward angled reaches (lying down objects / claw plunge) use +3mm clearance centered over body.
         w_val = widths if widths is not None else 40.0
-        delta_lat = np.where(theta_pitch > np.radians(-25.0), w_val / 2.0 + 18.0, w_val / 2.0 + 3.0)
+        delta_lat = np.where(theta_pitch > np.radians(-25.0), w_val / 2.0 + 6.0, w_val / 2.0 + 3.0)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
-        # Level grasps (theta_pitch > -25 deg) use neutral 0.0mm pullback to reach bottle neck squarely;
+        # Level grasps (theta_pitch > -25 deg) use +22.0mm forward penetration along local approach vector
+        # so fingertips fully enclose the bottle body between the rubber pads.
         # Downward plunges (theta_pitch <= -25 deg) use -15mm pullback along local approach vector
         # so fingertips pinch sides of object rather than plunging into the tabletop.
-        pullbacks = np.where(theta_pitch > np.radians(-25.0), 0.0, RADIAL_PULLBACK_MM)
+        pullbacks = np.where(theta_pitch > np.radians(-25.0), 22.0, RADIAL_PULLBACK_MM)
         v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
         v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 

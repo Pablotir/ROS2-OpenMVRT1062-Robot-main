@@ -49,6 +49,37 @@ class PointNet(torch.nn.Module):
         return x
 
 
+def safe_fps(pos, batch=None, ratio=0.5, random_start=False):
+    try:
+        from torch_geometric.nn import fps as pyg_fps
+        return pyg_fps(pos, batch, ratio=ratio, random_start=random_start)
+    except Exception:
+        pass
+
+    if batch is None or torch.all(batch == 0):
+        N = pos.size(0)
+        num_samples = max(1, int(N * ratio))
+        sampled_indices = torch.zeros(num_samples, dtype=torch.long, device=pos.device)
+        distance = torch.full((N,), 1e10, dtype=pos.dtype, device=pos.device)
+        farthest_idx = 0
+        for i in range(num_samples):
+            sampled_indices[i] = farthest_idx
+            centroid = pos[farthest_idx]
+            dist = torch.sum((pos - centroid) ** 2, dim=-1)
+            distance = torch.minimum(distance, dist)
+            farthest_idx = torch.argmax(distance).item()
+        return sampled_indices
+    else:
+        out = []
+        for b in torch.unique(batch):
+            mask = (batch == b)
+            idx = torch.nonzero(mask, as_tuple=True)[0]
+            sub_pos = pos[mask]
+            sub_fps = safe_fps(sub_pos, None, ratio=ratio, random_start=random_start)
+            out.append(idx[sub_fps])
+        return torch.cat(out)
+
+
 def safe_radius(x, y, r, batch_x, batch_y, max_num_neighbors=64):
     try:
         from torch_geometric.nn import radius as pyg_radius
@@ -98,7 +129,7 @@ class SAModule(torch.nn.Module):
     def forward(self, x, pos, batch, sample=True, idx=None):
         if sample is True:
             #print('now sampling farthest points for first module')
-            idx = fps(pos, batch, ratio=self.ratio)
+            idx = safe_fps(pos, batch, ratio=self.ratio)
         else:
             idx = idx
 

@@ -103,6 +103,7 @@ WRIST_FLEX_MAX_DEG  =  135.0
 WRIST_ROLL_MIN_DEG  = -150.0
 WRIST_ROLL_MAX_DEG  =  150.0
 HARDWARE_NEUTRAL_ROLL_DEG = 29.27  # Physical servo neutral horizontal roll angle (homing_offset -1120)
+ENABLE_AZIMUTH_ALIGN_OVERRIDE = False  # Natural Hand-Eye transformation (False = unskewed calibrated T_base_cam)
 GRAB_LATERAL_OFFSET_STANDING_MM = 35.0  # Reduced to prevent top-down approach (rho stays in reach envelope)
 GRAB_LATERAL_OFFSET_FLAT_MM = 50.0      # Reduced proportionally for flat table grasp
 
@@ -512,9 +513,10 @@ class SemanticConfirmationGate:
         P_bg_h = np.hstack([P_bg_cam, np.ones((N_bg, 1), dtype=np.float32)])
         P_bg_base = (T_base_cam @ P_bg_h.T).T[:, :3]
 
-        # 3b. Align azimuth of P_obj_base with the physically servoed line-of-sight:
-        # Prevents lateral grasp offset caused by skewed hand-eye rotation matrix.
-        if "shoulder_pan.pos" in q_joints and N_obj > 0:
+        # 3b. Natural Hand-Eye Transformation:
+        # Calibrated T_base_cam (T_base_wrist @ T_wrist_cam) accurately places the object
+        # in physical base frame. Azimuth override is disabled by default to prevent lateral skew.
+        if ENABLE_AZIMUTH_ALIGN_OVERRIDE and "shoulder_pan.pos" in q_joints and N_obj > 0:
             q1_servo = math.radians(-q_joints["shoulder_pan.pos"] - PAN_ZERO_OFFSET_DEG)
             u_center = float(np.mean(u_obj)) if len(u_obj) > 0 else cx
             delta_azimuth = -(u_center - cx) / fx
@@ -902,13 +904,13 @@ class PretrainedGraspEngine:
         if is_standing_cylinder:
             # ── STANDING CYLINDER / BOTTLE / CAN / CUP ───────────────────────────
             # Direct horizontal/side approach to bottle body/waist (NO claw machine plunge!)
-            # Target bottle waist (~30-35% height), well below top cap and safely above table
+            # Target true bottle waist/middle (~50-55% height), well below top cap and safely above table
             z_top = float(np.max(P_obj[:, 2]))
             z_bot = float(np.min(P_obj[:, 2]))
             h_span = max(10.0, z_top - z_bot)
-            waist_z = float(z_bot + 0.32 * h_span)
-            min_z = float(tbl_ref + 18.0)
-            max_z = float(z_top - max(15.0, min(35.0, 0.40 * h_span)))
+            waist_z = float(z_bot + 0.52 * h_span)
+            min_z = float(tbl_ref + 40.0)
+            max_z = float(z_top - max(20.0, 0.25 * h_span))
             target_z = float(np.clip(waist_z, min_z, max(min_z, max_z)))
             pinch_centers[:, 2] = target_z
 
@@ -1122,6 +1124,11 @@ class VectorizedSO101GraspSolver:
         # eliminating any possibility of grazing or hitting the top cap!
         # For flat/lying objects (downward/steep plunge):
         # Pull back 50mm upward along approach vector (or vertically +50mm) to hover above object.
+        # For standing objects:
+        # A single smooth direct extension is much more reliable and natural than
+        # an intermediate hover that jerks and cuts across the bottle.
+        # Standoff waypoint is set to None for horizontal approaches.
+        # For steep/top-down plunges on flat/lying objects, standoff hover above table is available.
         standoff_joints = None
         best_wrist_T = T_wrist_targets[best_idx]
         xw_best = float(best_wrist_T[0, 3])
@@ -1129,28 +1136,7 @@ class VectorizedSO101GraspSolver:
         zw_best = float(best_wrist_T[2, 3])
         pitch_best_deg = float(math.degrees(ik_results["theta_pitch"][best_idx]))
 
-        rho_best = math.hypot(xw_best, yw_best)
-        if pitch_best_deg > -35.0 and rho_best > 130.0:
-            # Horizontal approach: pull back 55mm radially at same height
-            pull_r = min(55.0, rho_best - 110.0)
-            q1_b = math.atan2(yw_best, xw_best)
-            xw_so = (rho_best - pull_r) * math.cos(q1_b)
-            yw_so = (rho_best - pull_r) * math.sin(q1_b)
-            zw_so = zw_best
-            T_so = np.eye(4, dtype=np.float64)
-            T_so[:3, :3] = best_wrist_T[:3, :3]
-            T_so[:3, 3] = [xw_so, yw_so, zw_so]
-            ik_so, valid_so = self.project_6dof_to_5dof_and_solve_ik(T_so[np.newaxis, ...], Z_table, widths=np.array([40.0]), is_flat_lying=False)
-            if valid_so[0]:
-                standoff_joints = {
-                    "shoulder_pan.pos":  float(ik_so["pan"][0]),
-                    "shoulder_lift.pos": float(ik_so["lift"][0]),
-                    "elbow_flex.pos":    float(ik_so["elbow"][0]),
-                    "wrist_flex.pos":    float(ik_so["wrist"][0]),
-                    "wrist_roll.pos":    float(ik_so["roll"][0]),
-                    "gripper.pos":       GRIPPER_OPEN_POS_DEG
-                }
-        elif pitch_best_deg <= -35.0:
+        if pitch_best_deg <= -45.0:
             # Steep top-down approach: hover 50mm higher above table
             zw_so = zw_best + 50.0
             T_so = np.eye(4, dtype=np.float64)
@@ -1433,18 +1419,18 @@ class VectorizedSO101GraspSolver:
 
         if is_standing_cylinder:
             # Standing Cylinder / Bottle / Cup / Can:
-            # Side approach at waist/body (~28-38% height, safely below cap/neck)
-            S_height_com = np.exp(-((h_rel - 0.32) ** 2) / (2.0 * (0.10 ** 2)))
+            # Side approach at true bottle waist/middle (~48-56% height, safely above table and below cap)
+            S_height_com = np.exp(-((h_rel - 0.52) ** 2) / (2.0 * (0.12 ** 2)))
 
             # 3D Anti-Overshoot Cap Guard:
-            # Strictly disqualify grasps near the top cap (upper 45% or within 35mm of top)
-            cap_guard_dist = max(30.0, 0.40 * total_height)
-            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.52)
+            # Strictly disqualify grasps near the top cap (upper 25% or within 25mm of top)
+            cap_guard_dist = max(25.0, 0.25 * total_height)
+            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.75)
             S_height_com[near_top_cap] = -10.0
 
-            # Table proximity guard: ensure bottom of gripper clears table by >= 10mm
-            near_table = pinch_centers[:, 2] < (tbl_ref + 15.0)
-            S_height_com[near_table] = -5.0
+            # Table proximity guard: ensure bottom of gripper clears table by >= 35mm
+            near_table = pinch_centers[:, 2] < (tbl_ref + 35.0)
+            S_height_com[near_table] = -10.0
 
             # Strictly penalize downward claw plunges on standing cylinders!
             # Standing objects should be approached horizontally or with shallow pitch

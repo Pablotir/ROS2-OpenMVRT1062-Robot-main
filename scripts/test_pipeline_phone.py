@@ -1,4 +1,7 @@
 import sys, os
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
+os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import math
 import numpy as np
 from soarm101_anygrasp_pipeline import ThreeStageAnyGraspPipeline
@@ -80,3 +83,6 @@ for sc, label, roll_deg, pitch_deg, yaw_deg in [
     print(f"Target joints: {solver_result['target_joints']}")
     print(f"Pitch deg: {solver_result.get('pitch_deg', 0.0):.1f}°")
     print(f"Delta phi deg: {solver_result.get('delta_phi_deg', 0.0):.1f}°")
+
+print("\n✅ All scenarios evaluated successfully!")
+os._exit(0)

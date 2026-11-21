@@ -5,7 +5,10 @@ import copy
 
 import torch
 import torch.nn as nn
-from cgn_pytorch.util import mesh_utils
+try:
+    from cgn_pytorch.util import mesh_utils
+except Exception:
+    mesh_utils = None
 from cgn_pytorch.pointnet2 import FPModule, SAModule, MLP
 try:
     from cgn_pytorch.util.test_meshcat_pcd import viz_pcd as V

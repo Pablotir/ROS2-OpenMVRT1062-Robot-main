@@ -38,7 +38,9 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 # -----------------------------------------------------------------------------
 # JetPack / aarch64 CUDA Runtime & Memory Safety
 # -----------------------------------------------------------------------------
-# Configure PyTorch expandable segments to eliminate CUDA virtual memory fragmentation on Jetson
+# Prevent PyTorch/OpenMP glibc heap corruption on Jetson Orin (aarch64)
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
+os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # On NVIDIA Jetson, torch MUST be imported before cv2 to properly initialize

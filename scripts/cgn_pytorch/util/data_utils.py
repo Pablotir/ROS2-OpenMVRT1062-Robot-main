@@ -3,12 +3,18 @@ import glob
 import numpy as np
 from scipy.spatial import KDTree, cKDTree
 from cgn_pytorch.util.scene_renderer import SceneRenderer
-import trimesh.transformations as tra
+try:
+    import trimesh.transformations as tra
+except ImportError:
+    tra = None
 import copy
 import torch
 from scipy import spatial
 
-from mbodios.types.sense.image import Image
+try:
+    from mbodios.types.sense.image import Image
+except (ImportError, ModuleNotFoundError):
+    Image = None
 
 def get_obj_surrounding(pcd, obj_mask, radius):
     '''

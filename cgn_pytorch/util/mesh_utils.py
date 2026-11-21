@@ -5,8 +5,12 @@ from __future__ import print_function
 import numpy as np
 import pickle
 from tqdm import tqdm
-import trimesh
-import trimesh.transformations as tra
+try:
+    import trimesh
+    import trimesh.transformations as tra
+except ImportError:
+    trimesh = None
+    tra = None
 from importlib_resources import files
 
 MESH_DIR = str(files("cgn_pytorch").joinpath("gripper/mesh"))

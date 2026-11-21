@@ -57,9 +57,6 @@ class SAModule(torch.nn.Module):
         self.conv = PointConv(nn)
 
     def forward(self, x, pos, batch, sample=True, idx=None):
-        check = copy.deepcopy(pos)
-        np.save('pts_check', check.cpu().numpy())
-
         if sample is True:
             #print('now sampling farthest points for first module')
             idx = fps(pos, batch, ratio=self.ratio)

@@ -7,6 +7,11 @@
 
 set -e
 
+# Prevent PyTorch/OpenMP glibc heap corruption on Jetson Orin (aarch64)
+export MALLOC_TRIM_THRESHOLD_=0
+export MALLOC_MMAP_THRESHOLD_=131072
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
 echo "=================================================================="
 echo "🚀 Setting up Contact-GraspNet for SO-ARM101 on NVIDIA Jetson Orin"
 echo "=================================================================="
@@ -22,10 +27,15 @@ else:
     print('⚠️ WARNING: CUDA not detected. Contact-GraspNet will run on CPU.')
 "
 
-# 2. Check and install torch-geometric dependencies if missing
+# 2. Check and install torch-geometric & trimesh dependencies if missing
 python3 -c "import torch_geometric" 2>/dev/null || {
     echo "📦 Installing torch-geometric..."
     pip3 install torch-geometric
+}
+
+python3 -c "import trimesh" 2>/dev/null || {
+    echo "📦 Installing trimesh..."
+    pip3 install trimesh
 }
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"

@@ -7,6 +7,10 @@ log/
 __pycache__/
 *.pyc
 *.pyo
+*.npy
+
+# Logs & temp
+*.log
 
 # Maps (large binary files — save separately)
 maps/*.db

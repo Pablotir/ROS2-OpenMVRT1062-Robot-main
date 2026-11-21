@@ -1,10 +1,46 @@
-from torch_geometric.nn import knn_interpolate
 from torch_geometric.nn import fps, radius, global_max_pool
 from torch_geometric.nn.conv import PointNetConv as PointConv
 import torch
 from torch.nn import Sequential as Seq, Linear as Lin, ReLU, BatchNorm1d as BN
 import copy
 import numpy as np
+
+_USE_PYG_KNN = True
+
+def safe_knn_interpolate(x, pos_x, pos_y, batch_x=None, batch_y=None, k=3):
+    global _USE_PYG_KNN
+    if _USE_PYG_KNN:
+        try:
+            from torch_geometric.nn import knn_interpolate as pyg_knn_interpolate
+            return pyg_knn_interpolate(x, pos_x, pos_y, batch_x, batch_y, k=k)
+        except Exception:
+            _USE_PYG_KNN = False
+
+    if batch_x is None or batch_y is None or (torch.all(batch_x == 0) and torch.all(batch_y == 0)):
+        diff = pos_y.unsqueeze(1) - pos_x.unsqueeze(0)
+        dists_sq = torch.sum(diff * diff, dim=-1)
+        actual_k = min(k, pos_x.size(0))
+        top_dists_sq, top_idx = torch.topk(dists_sq, k=actual_k, dim=-1, largest=False)
+        weights = 1.0 / torch.clamp(top_dists_sq, min=1e-16)
+        weights = weights / torch.sum(weights, dim=-1, keepdim=True)
+        top_feats = x[top_idx]
+        return torch.sum(top_feats * weights.unsqueeze(-1), dim=1)
+    else:
+        out = []
+        for b in torch.unique(batch_y):
+            mask_y = (batch_y == b)
+            mask_x = (batch_x == b)
+            sub_y, sub_x = pos_y[mask_y], pos_x[mask_x]
+            sub_feats = x[mask_x]
+            diff = sub_y.unsqueeze(1) - sub_x.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=-1)
+            actual_k = min(k, sub_x.size(0))
+            top_dists_sq, top_idx = torch.topk(dists_sq, k=actual_k, dim=-1, largest=False)
+            weights = 1.0 / torch.clamp(top_dists_sq, min=1e-16)
+            weights = weights / torch.sum(weights, dim=-1, keepdim=True)
+            top_feats = sub_feats[top_idx]
+            out.append(torch.sum(top_feats * weights.unsqueeze(-1), dim=1))
+        return torch.cat(out, dim=0)
 
 class FPModule(torch.nn.Module):
     def __init__(self, k, nn):
@@ -13,7 +49,7 @@ class FPModule(torch.nn.Module):
         self.nn = nn
 
     def forward(self, x, pos, batch, x_skip, pos_skip, batch_skip):
-        x = knn_interpolate(x, pos, pos_skip, batch, batch_skip, k=self.k)
+        x = safe_knn_interpolate(x, pos, pos_skip, batch, batch_skip, k=self.k)
         if x_skip is not None:
             x = torch.cat([x, x_skip], dim=1)
         x = self.nn(x)

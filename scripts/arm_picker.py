@@ -4021,7 +4021,7 @@ def main():
             else:
                 # ── Full Automatic Lunge & Grab ───────────────────────────────────
                 print("\n🦾 APPROACHING (jaws wide open)...")
-                grab_pos["gripper.pos"] = max(75.0, START_POS.get("gripper.pos", 72.6))
+                grab_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
 
                 # Smooth direct extension straight into grasp pose (no mid-air hovering, no claw machine drop)
                 neutral_roll = START_POS.get("wrist_roll.pos", 29.27)

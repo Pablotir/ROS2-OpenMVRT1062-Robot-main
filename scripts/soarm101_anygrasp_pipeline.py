@@ -852,12 +852,16 @@ class PretrainedGraspEngine:
 
         if is_standing_cylinder:
             # ── STANDING CYLINDER / BOTTLE / CAN / CUP ───────────────────────────
-            # Direct horizontal/side approach to bottle body/waist/neck (NO claw machine plunge!)
-            # Target the bottle's mid/upper cylinder squarely (~50-65% height, at least 35mm above table)
+            # Direct horizontal/side approach to bottle body/waist (NO claw machine plunge!)
+            # Target bottle waist (~30-35% height), well below top cap and safely above table
             z_top = float(np.max(P_obj[:, 2]))
             z_bot = float(np.min(P_obj[:, 2]))
-            neck_z = max(float(z_bot + 0.50 * (z_top - z_bot)), float(tbl_ref + 35.0))
-            pinch_centers[:, 2] = neck_z
+            h_span = max(10.0, z_top - z_bot)
+            waist_z = float(z_bot + 0.32 * h_span)
+            min_z = float(tbl_ref + 18.0)
+            max_z = float(z_top - max(15.0, min(35.0, 0.40 * h_span)))
+            target_z = float(np.clip(waist_z, min_z, max(min_z, max_z)))
+            pinch_centers[:, 2] = target_z
 
             # Cap radial reach of grasp targets to 400.0mm (max physical reach of SO-ARM101)
             r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
@@ -1039,8 +1043,15 @@ class VectorizedSO101GraspSolver:
         is_cylinder_name = any(kw in str(target_label).lower() for kw in ["bottle", "can", "flask", "cup", "mug"])
         aspect_ratio = float(np.max(evals_o) / (np.min(evals_o) + 1e-6))
 
-        is_standing_cylinder = is_cylinder_name and (h_above_table >= 105.0 or (z_span_obj >= 85.0 and abs(v_main[2]) >= 0.55)) and (aspect_ratio >= 1.20)
-        is_flat_lying = (not is_standing_cylinder) and ((h_above_table < 100.0) or (abs(v_main[2]) < 0.45) or (z_span_obj < 85.0))
+        is_standing_cylinder = (
+            is_cylinder_name
+            and (abs(v_main[2]) >= 0.40 or z_span_obj >= 35.0 or h_above_table >= 45.0)
+            and not (abs(v_main[2]) < 0.35 and z_span_obj < 30.0)
+        )
+        is_flat_lying = (not is_standing_cylinder) and (
+            (abs(v_main[2]) < 0.45)
+            or (z_span_obj < 35.0 and h_above_table < 45.0)
+        )
 
         # 1. Continuous Local-Frame Asymmetric Pincer Compensation
         T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)
@@ -1104,12 +1115,10 @@ class VectorizedSO101GraspSolver:
         z_approach = T_grasps[:, :3, 2]
         theta_pitch = np.arcsin(np.clip(z_approach[:, 2], -1.0, 1.0))
 
-        # 2. Width-Aware Asymmetric Pincer Offset delta_lat(w, pitch)
-        # Level horizontal reaches (standing bottles) shift left by +18mm to guarantee the stationary
-        # right horn clears the right side of the bottle neck completely, eliminating cap/body grazing.
-        # Downward angled reaches (lying down objects / claw plunge) use +3mm clearance centered over body.
-        w_val = widths if widths is not None else 40.0
-        delta_lat = np.where(theta_pitch > np.radians(-25.0), w_val / 2.0 + 6.0, w_val / 2.0 + 3.0)
+        # 2. Symmetrical Centering delta_lat(w, pitch) = 0.0
+        # Guarantees that with open jaws (84mm stroke), the object passes cleanly between
+        # both open claws with equal clearance on both sides (eliminates left static claw collision).
+        delta_lat = np.zeros(N, dtype=np.float64)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         # Level grasps (theta_pitch > -25 deg) use +22.0mm forward penetration along local approach vector
@@ -1117,8 +1126,9 @@ class VectorizedSO101GraspSolver:
         # Downward plunges (theta_pitch <= -25 deg) use -15mm pullback along local approach vector
         # so fingertips pinch sides of object rather than plunging into the tabletop.
         pullbacks = np.where(theta_pitch > np.radians(-25.0), 22.0, RADIAL_PULLBACK_MM)
-        v_stat_1 = np.stack([delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
-        v_stat_2 = np.stack([-delta_lat, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
+        w_val = widths if widths is not None else 40.0
+        v_stat_1 = np.stack([w_val / 2.0, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
+        v_stat_2 = np.stack([-w_val / 2.0, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
 
         # Stationary finger 3D coordinates in base frame
         P_stat_base_1 = np.einsum('nij,nj->ni', T_grasps, v_stat_1)[:, :3]
@@ -1357,14 +1367,18 @@ class VectorizedSO101GraspSolver:
 
         if is_standing_cylinder:
             # Standing Cylinder / Bottle / Cup / Can:
-            # Side approach at body/waist/neck (~50-75% height)
-            S_height_com = np.exp(-((h_rel - 0.62) ** 2) / (2.0 * (0.12 ** 2)))
+            # Side approach at waist/body (~28-38% height, safely below cap/neck)
+            S_height_com = np.exp(-((h_rel - 0.32) ** 2) / (2.0 * (0.10 ** 2)))
 
             # 3D Anti-Overshoot Cap Guard:
-            # Disqualify grasps within 20.0 mm of top cap along v_main
-            cap_guard_dist = min(20.0, 0.20 * total_height)
-            near_top_cap = dist_from_top_cap_mm < cap_guard_dist
-            S_height_com[near_top_cap] = -1.0
+            # Strictly disqualify grasps near the top cap (upper 45% or within 35mm of top)
+            cap_guard_dist = max(30.0, 0.40 * total_height)
+            near_top_cap = (dist_from_top_cap_mm < cap_guard_dist) | (h_rel > 0.52)
+            S_height_com[near_top_cap] = -10.0
+
+            # Table proximity guard: ensure bottom of gripper clears table by >= 10mm
+            near_table = pinch_centers[:, 2] < (tbl_ref + 15.0)
+            S_height_com[near_table] = -5.0
 
             # Strictly penalize downward claw plunges on standing cylinders!
             # Standing objects should be approached horizontally or with shallow pitch

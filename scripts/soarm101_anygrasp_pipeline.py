@@ -993,21 +993,14 @@ class PretrainedGraspEngine:
             y_thickness = np.cross(z_approach, x_closing)
 
         else:
-            # Flat objects lying on table or close standing cylinders in top-down plunge:
-            z_span_obj = float(np.ptp(P_obj[:, 2]))
-            if is_cylinder_name or z_span_obj >= 35.0:
-                # Upright/tall object in claw plunge: elevate grasp to neck/top (+10cm above body CoM, reduced depth by 2cm)
-                z_top = float(np.max(P_obj[:, 2]))
-                z_bot = float(np.min(P_obj[:, 2]))
-                neck_z = min(z_top - 15.0, z_bot + 0.82 * (z_top - z_bot))
-                pinch_centers[:, 2] = neck_z
-            else:
-                # Pure flat object (e.g. phone lying flat): pull back along reach line if outside 2-link reach envelope
-                excess_reach = max(0.0, R_obj - 248.0)
-                if excess_reach > 0.0:
-                    pullback_reach = float(np.clip(15.0 + excess_reach, 15.0, 50.0))
-                    u_radial = np.array([np.cos(q1_obj), np.sin(q1_obj), 0.0])
-                    pinch_centers -= pullback_reach * u_radial
+            # Flat objects lying on table (fallen bottle, phone, box):
+            z_top = float(np.max(P_obj[:, 2]))
+            z_bot = float(np.min(P_obj[:, 2]))
+            h_span = max(10.0, z_top - z_bot)
+            mid_z = float(z_bot + 0.50 * h_span)
+            min_z = float(tbl_ref + 8.0)
+            target_z = float(np.clip(mid_z, min_z, z_top))
+            pinch_centers[:, 2] = target_z
 
             # Approach pitch: angled for distant objects (R_obj >= 250mm), steep plunge for close
             if R_obj >= 250.0:
@@ -1124,34 +1117,8 @@ class VectorizedSO101GraspSolver:
         # eliminating any possibility of grazing or hitting the top cap!
         # For flat/lying objects (downward/steep plunge):
         # Pull back 50mm upward along approach vector (or vertically +50mm) to hover above object.
-        # For standing objects:
-        # A single smooth direct extension is much more reliable and natural than
-        # an intermediate hover that jerks and cuts across the bottle.
-        # Standoff waypoint is set to None for horizontal approaches.
-        # For steep/top-down plunges on flat/lying objects, standoff hover above table is available.
+        # Pure 1-stage AnyGrasp direct extension (no 2-stage standoff waypoints)
         standoff_joints = None
-        best_wrist_T = T_wrist_targets[best_idx]
-        xw_best = float(best_wrist_T[0, 3])
-        yw_best = float(best_wrist_T[1, 3])
-        zw_best = float(best_wrist_T[2, 3])
-        pitch_best_deg = float(math.degrees(ik_results["theta_pitch"][best_idx]))
-
-        if pitch_best_deg <= -45.0:
-            # Steep top-down approach: hover 50mm higher above table
-            zw_so = zw_best + 50.0
-            T_so = np.eye(4, dtype=np.float64)
-            T_so[:3, :3] = best_wrist_T[:3, :3]
-            T_so[:3, 3] = [xw_best, yw_best, zw_so]
-            ik_so, valid_so = self.project_6dof_to_5dof_and_solve_ik(T_so[np.newaxis, ...], Z_table, widths=np.array([40.0]), is_flat_lying=True)
-            if valid_so[0]:
-                standoff_joints = {
-                    "shoulder_pan.pos":  float(ik_so["pan"][0]),
-                    "shoulder_lift.pos": float(ik_so["lift"][0]),
-                    "elbow_flex.pos":    float(ik_so["elbow"][0]),
-                    "wrist_flex.pos":    float(ik_so["wrist"][0]),
-                    "wrist_roll.pos":    float(ik_so["roll"][0]),
-                    "gripper.pos":       GRIPPER_OPEN_POS_DEG
-                }
 
         result = {
             "best_index": int(best_idx),
@@ -1195,11 +1162,10 @@ class VectorizedSO101GraspSolver:
         delta_lat = np.zeros(N, dtype=np.float64)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
-        # Level grasps (theta_pitch > -25 deg) use +22.0mm forward penetration along local approach vector
-        # so fingertips fully enclose the bottle body between the rubber pads.
-        # Downward plunges (theta_pitch <= -25 deg) use -15mm pullback along local approach vector
-        # so fingertips pinch sides of object rather than plunging into the tabletop.
-        pullbacks = np.where(theta_pitch > np.radians(-25.0), 22.0, RADIAL_PULLBACK_MM)
+        # Symmetrical centering: pullbacks = 0.0mm places the open fingertips exactly
+        # at the target pinch center (eliminates the +22mm overextension that pushed the standing bottle away
+        # and eliminates the -15mm pullback that fell short of the lying bottle).
+        pullbacks = np.zeros(N, dtype=np.float64)
         w_val = widths if widths is not None else 40.0
         v_stat_1 = np.stack([w_val / 2.0, np.zeros(N), pullbacks, np.ones(N)], axis=-1)
         v_stat_2 = np.stack([-w_val / 2.0, np.zeros(N), pullbacks, np.ones(N)], axis=-1)

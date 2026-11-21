@@ -4040,13 +4040,7 @@ def main():
                 print("\n🦾 APPROACHING (jaws wide open)...")
                 grab_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
 
-                if standoff_pos is not None:
-                    print(f"   🛫 Moving to pre-grasp standoff pose (height-clearing waypoint)...")
-                    standoff_pos["gripper.pos"] = GRIPPER_OPEN_POS_DEG
-                    smooth_move(robot, standoff_pos, step_size=2.0, step_delay=0.025)
-                    time.sleep(0.15)
-
-                # Smooth direct extension straight into grasp pose (no mid-air hovering, no claw machine drop)
+                # Smooth direct extension straight into grasp pose (pure AnyGrasp 1-stage approach)
                 neutral_roll = START_POS.get("wrist_roll.pos", 29.27)
                 is_rotated_roll = abs(grab_pos.get("wrist_roll.pos", neutral_roll) - neutral_roll) > 25.0
                 if is_rotated_roll:
@@ -4059,7 +4053,10 @@ def main():
                 actual_closed_grip = target_closed_grip if target_closed_grip is not None else GRIPPER_CLOSED_POS_DEG
                 print(f"✊ GRIPPING (closing jaws firmly to {actual_closed_grip:.1f}° with zero air gap)...")
                 grab_pos["gripper.pos"] = actual_closed_grip
-                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02, hold_joints=[])
+                # Hold all 5 arm joints rigidly at target grab_pos so gripper actuation does not cause arm dipping/sagging
+                smooth_move(robot, grab_pos, step_size=2.0, step_delay=0.02,
+                            hold_joints=["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos"])
+                robot.send_action({"gripper.pos": actual_closed_grip})
                 time.sleep(0.5)
 
                 print("🏠 RETREATING back to position...")

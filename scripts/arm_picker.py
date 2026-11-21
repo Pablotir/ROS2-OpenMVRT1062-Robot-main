@@ -117,6 +117,10 @@ except ImportError:
 import requests
 
 # ── Native Jetson Monitor Display Setup ───────────────────────────────────────
+# Disable MIT-SHM shared memory X extension — prevents BadAccess crash in Docker
+os.environ.setdefault("QT_X11_NO_MITSHM", "1")
+os.environ.setdefault("OPENCV_UI_USE_MSMF", "0")
+
 HEADLESS = False
 
 def _setup_native_display():
@@ -205,6 +209,7 @@ def _show_frame(name: str, img: np.ndarray) -> None:
         cv2.waitKey(1)
     except Exception as e:
         print(f"⚠️  Window display error: {e}")
+        HEADLESS = True
 
 def _destroy_windows() -> None:
     try:

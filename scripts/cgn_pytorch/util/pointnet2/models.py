@@ -1,4 +1,10 @@
+"""
+PointNet++ Models (Pure PyTorch alias to cgn_pytorch.pointnet2).
+Zero PyG / Numba dependencies.
+"""
 from cgn_pytorch.pointnet2 import (
+    PurePointNetConv,
+    PointConv,
     FPModule,
     PointNet,
     SAModule,
@@ -9,7 +15,6 @@ from cgn_pytorch.pointnet2 import (
     safe_knn_interpolate
 )
 
-# For backward compatibility if any module imports fps, radius, etc. from models
 fps = safe_fps
 radius = safe_radius
 knn_interpolate = safe_knn_interpolate

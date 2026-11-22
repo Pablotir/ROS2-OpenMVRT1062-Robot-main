@@ -1197,15 +1197,16 @@ class VectorizedSO101GraspSolver:
 
         # 2. Width-Aware Asymmetric Pincer Offset delta_lat(w, pitch)
         # Upright standing objects (level / side grasps, theta_pitch > -25 deg):
-        # Shifts wrist to the LEFT by (w / 2 + 4.0mm) so the stationary right horn clears the right side of the object,
-        # preventing the static claw from poking the center or grazing the bottle during approach.
+        # Shifts wrist to the LEFT by calibrated clearance (15-18mm) so the stationary right horn
+        # clears the right side of the object without poking, while preventing over-steering left
+        # which would cause the moving claw tip to push/slide off the bottle edge.
         # Flat / lying objects: zero lateral offset so jaws descend squarely on the centroid.
         w_val = widths if widths is not None else 40.0
         if is_flat_lying:
             delta_lat = np.zeros(N, dtype=np.float64)
         else:
             delta_lat = np.where(theta_pitch > np.radians(-25.0),
-                                 w_val / 2.0 + 4.0,
+                                 np.clip(w_val / 2.0 + 2.0, 15.0, 18.0),
                                  0.0)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)

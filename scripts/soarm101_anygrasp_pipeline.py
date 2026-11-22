@@ -662,7 +662,7 @@ def classify_object_geometry(P_obj_base: np.ndarray,
         # and has significant vertical height (z_span >= 75mm or h_above_table >= 90mm).
         # A fallen/lying bottle has its long axis horizontal in the table plane (|v_main[2]| < 0.50)
         # or low profile (h_above_table <= 80mm and z_span <= 75mm).
-        is_standing_cylinder = (abs(v_main[2]) >= 0.50) and (z_span_obj >= 75.0 or h_above_table >= 90.0)
+        is_standing_cylinder = (abs(v_main[2]) >= 0.50) and (z_span_obj >= 110.0) and (h_above_table >= 100.0)
         is_flat_lying = not is_standing_cylinder
     else:
         is_standing_cylinder = False
@@ -1113,6 +1113,20 @@ class VectorizedSO101GraspSolver:
         geom = classify_object_geometry(P_obj_base, target_label=target_label, Z_table=Z_table)
         is_standing_cylinder = geom["is_standing_cylinder"]
         is_flat_lying = geom["is_flat_lying"]
+
+        # Post-synthesis: enforce centroid snap and reach clamp on ALL grasps (CGN + synthetic)
+        # CGN grasps bypass _vectorized_antipodal_synthesis so they don't get centroid-snapped there
+        if is_flat_lying:
+            com_post = geom["com"]
+            pc_all = T_grasps[:, :3, 3]
+            pc_all[:, 0] = com_post[0]
+            pc_all[:, 1] = com_post[1]
+            # Clamp to 390mm max radial reach for lying objects
+            r_all = np.hypot(pc_all[:, 0], pc_all[:, 1])
+            excess_r = np.maximum(0.0, r_all - 390.0)
+            scale = np.where(r_all > 1e-8, excess_r / (r_all + 1e-8), 0.0)
+            pc_all[:, 0] -= scale * pc_all[:, 0]
+            pc_all[:, 1] -= scale * pc_all[:, 1]
 
         # 1. Continuous Local-Frame Asymmetric Pincer Compensation
         T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)

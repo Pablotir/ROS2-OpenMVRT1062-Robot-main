@@ -45,6 +45,7 @@ import os, sys, yaml
 # Prevent PyTorch/OpenMP glibc heap corruption on Jetson Orin (aarch64)
 os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
 os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Apply glibc allocator tuning immediately in C runtime
@@ -62,6 +63,10 @@ except Exception:
 # causes native glibc heap corruption ("corrupted size vs. prev_size").
 try:
     import torch
+    if torch.cuda.is_available():
+        # Pre-initialize CUDA runtime and memory allocator in clean single-thread state
+        # before any Hugging Face / Transformers / OpenCV worker threads spawn
+        torch.cuda.init()
 except ImportError:
     torch = None
 
@@ -3489,9 +3494,12 @@ def main():
     # Warm the model NOW while servos are still off the bus.
     print("   🔥 Warming up YOLO model on GPU (first inference)...")
     if torch is not None and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            if torch.cuda.is_initialized():
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
     _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
     _dummy.flags.writeable = True
     try:
@@ -3499,9 +3507,12 @@ def main():
     except Exception as e:
         print(f"   ⚠️ YOLO warmup note: {e}")
     if torch is not None and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     print("   ✅ YOLO warmup complete")
 
     # ── Contact-GraspNet 6-DoF warmup BEFORE arm connect & RealSense stream ─────

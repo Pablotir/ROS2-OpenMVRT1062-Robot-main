@@ -41,6 +41,7 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 # Prevent PyTorch/OpenMP glibc heap corruption on Jetson Orin (aarch64)
 os.environ["MALLOC_TRIM_THRESHOLD_"] = "0"
 os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Apply glibc allocator tuning immediately in C runtime
@@ -58,6 +59,10 @@ except Exception:
 # causes native glibc heap corruption ("corrupted size vs. prev_size").
 try:
     import torch
+    if torch.cuda.is_available():
+        # Pre-initialize CUDA runtime and memory allocator in clean single-thread state
+        # before any Hugging Face / Transformers / OpenCV worker threads spawn
+        torch.cuda.init()
 except ImportError:
     torch = None
 

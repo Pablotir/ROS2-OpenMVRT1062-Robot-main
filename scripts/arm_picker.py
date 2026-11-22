@@ -2353,6 +2353,9 @@ def size_up_object(frame: np.ndarray | None,
             recommended_roll -= 180.0
         recommended_roll = float(np.clip(recommended_roll, -170.0, 170.0))
         delta_roll_val = recommended_roll - base_roll
+
+    fits_gripper = (thinnest_width_mm <= GRIPPER_SAFE_CLEARANCE_MM)
+    z_target_est = -130.0 + h_calc * (height_pct / 100.0) - 5.0
     return {
         "body_width_mm": round(body_width_mm, 1),
         "thinnest_width_mm": round(thinnest_width_mm, 1),
@@ -2948,7 +2951,7 @@ class ObjectTracker:
          for up to 15 frames (~1.0s).
       5) Locked target coordinates invariant to camera ego-motion.
     """
-    def __init__(self, ema_alpha: float = 0.65, max_memory_frames: int = 15):
+    def __init__(self, ema_alpha: float = 0.65, max_memory_frames: int = 8):
         self.smooth_box = None          # [x1, y1, x2, y2] float
         self.smooth_center = None       # (cx, cy) int
         self.last_box = None            # (x1, y1, x2, y2) int
@@ -3135,6 +3138,13 @@ def align_arm(robot, cap: RealSenseStream, model,
         wrist_cmd = float(np.clip(lift_err * ALIGN_WRIST_K * decay, -ALIGN_MAX_WRIST_DEG, ALIGN_MAX_WRIST_DEG))
         # Negative lift_err (object higher) -> shoulder lifts up (lift becomes less negative, so + cmd)
         lift_cmd  = float(np.clip(-lift_err * ALIGN_LIFT_K * decay, -ALIGN_MAX_LIFT_DEG, ALIGN_MAX_LIFT_DEG))
+
+        if src == "hold":
+            # Damping on coasting frames: if YOLO hasn't confirmed target in this frame,
+            # decelerate servos smoothly to prevent drifting into mechanical limits
+            pan_cmd *= 0.4
+            wrist_cmd *= 0.4
+            lift_cmd *= 0.4
 
         cur = get_pos(robot)
         cur_pan  = cur.get("shoulder_pan.pos", start_pan)

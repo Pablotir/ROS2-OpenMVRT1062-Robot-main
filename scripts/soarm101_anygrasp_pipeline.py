@@ -1195,10 +1195,18 @@ class VectorizedSO101GraspSolver:
         z_approach = T_grasps[:, :3, 2]
         theta_pitch = np.arcsin(np.clip(z_approach[:, 2], -1.0, 1.0))
 
-        # 2. Symmetrical Centering delta_lat(w, pitch) = 0.0
-        # Guarantees that with open jaws (84mm stroke), the object passes cleanly between
-        # both open claws with equal clearance on both sides (eliminates left static claw collision).
-        delta_lat = np.zeros(N, dtype=np.float64)
+        # 2. Width-Aware Asymmetric Pincer Offset delta_lat(w, pitch)
+        # Upright standing objects (level / side grasps, theta_pitch > -25 deg):
+        # Shifts wrist to the LEFT by (w / 2 + 4.0mm) so the stationary right horn clears the right side of the object,
+        # preventing the static claw from poking the center or grazing the bottle during approach.
+        # Flat / lying objects: zero lateral offset so jaws descend squarely on the centroid.
+        w_val = widths if widths is not None else 40.0
+        if is_flat_lying:
+            delta_lat = np.zeros(N, dtype=np.float64)
+        else:
+            delta_lat = np.where(theta_pitch > np.radians(-25.0),
+                                 w_val / 2.0 + 4.0,
+                                 0.0)
 
         # 3. Dual Roll-Symmetric Wrist Hypotheses (q5 and q5 +/- pi)
         # Symmetrical centering: pullbacks = 0.0mm places the open fingertips exactly

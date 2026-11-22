@@ -4035,7 +4035,7 @@ def main():
                     grasp_w = sizing.get("grasp_width_mm", body_w) if sizing is not None else body_w
                     if orient_3d.get("is_upright") and abs(target_pitch) < 45.0:
                         target_w = grasp_w
-                        lat_offset = target_w / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
+                        lat_offset = target_w / 2.0 + 4.0   # Static tip clears bottle with 4mm clearance (matches simulation)
                     else:
                         # Top-down plunge or angled table grasp: zero lateral offset so jaws descend squarely on centroid
                         lat_offset = 0.0

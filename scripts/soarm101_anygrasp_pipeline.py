@@ -623,6 +623,17 @@ class SemanticConfirmationGate:
             obj_com = np.mean(P_obj_base, axis=0)
             z_table = float((-best_d - best_normal[0]*obj_com[0] - best_normal[1]*obj_com[1]) / (best_normal[2] + 1e-6))
 
+        # Physical table bounds validation:
+        # 1. The tabletop surface MUST be strictly at or below the lowest object point
+        z_obj_min = float(np.min(P_obj_base[:, 2]))
+        if z_table > (z_obj_min - 2.0):
+            z_table = z_obj_min - 5.0
+
+        # 2. In SO-100 base frame, physical tabletop is below the shoulder pivot:
+        # Valid physical range is [-320.0mm, -160.0mm] (nominal ~ -220mm to -240mm)
+        if z_table > -160.0 or z_table < -320.0:
+            z_table = min(z_obj_min - 5.0, -220.0)
+
         return z_table, best_normal
 
 
@@ -662,7 +673,7 @@ def classify_object_geometry(P_obj_base: np.ndarray,
         # and has significant vertical height (z_span >= 75mm or h_above_table >= 90mm).
         # A fallen/lying bottle has its long axis horizontal in the table plane (|v_main[2]| < 0.50)
         # or low profile (h_above_table <= 80mm and z_span <= 75mm).
-        is_standing_cylinder = (abs(v_main[2]) >= 0.50) and (z_span_obj >= 110.0) and (h_above_table >= 100.0)
+        is_standing_cylinder = (abs(v_main[2]) >= 0.50) and (z_span_obj >= 80.0) and (h_above_table >= 80.0)
         is_flat_lying = not is_standing_cylinder
     else:
         is_standing_cylinder = False
@@ -874,7 +885,7 @@ class PretrainedGraspEngine:
                 top_T = T_grasps[sort_idx][:self.num_samples]
                 top_s = s_5dof[sort_idx][:self.num_samples]
                 top_w = widths_mm[sort_idx][:self.num_samples]
-                if geom["is_standing_cylinder"] and np.sum(top_s > 1e-4) < 20:
+                if geom["is_standing_cylinder"] or geom["is_flat_lying"]:
                     T_syn, s_syn, w_syn = self._vectorized_antipodal_synthesis(P_obj_base, self.num_samples, target_label=target_label, Z_table=Z_table)
                     top_T = np.concatenate([top_T, T_syn], axis=0)
                     top_s = np.concatenate([top_s, s_syn], axis=0)
@@ -936,12 +947,6 @@ class PretrainedGraspEngine:
             target_z = float(np.clip(waist_z, min_z, max(min_z, max_z)))
             pinch_centers[:, 2] = target_z
 
-            # Cap radial reach of grasp targets to 400.0mm (max physical reach of SO-ARM101)
-            r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-            excess_r = np.maximum(0.0, r_pinch - 400.0)
-            pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
-            pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
-
             # Level/shallow approach pitch: strictly 0 deg to -12 deg (NO downward claw plunges!)
             pitches = np.linspace(np.radians(0.0), np.radians(-12.0), num_grasps)
             np.random.shuffle(pitches)
@@ -969,12 +974,6 @@ class PretrainedGraspEngine:
             pinch_centers[:, 0] = com[0]   # snap X to centroid (eliminates butt/cap endpoint bias)
             pinch_centers[:, 1] = com[1]   # snap Y to centroid
             pinch_centers[:, 2] = target_z
-
-            # Cap radial reach of grasp targets to 390.0mm (safe physical reach limit of SO-ARM101)
-            r_pinch = np.hypot(pinch_centers[:, 0], pinch_centers[:, 1])
-            excess_r = np.maximum(0.0, r_pinch - 390.0)
-            pinch_centers[:, 0] -= excess_r * (pinch_centers[:, 0] / (r_pinch + 1e-8))
-            pinch_centers[:, 1] -= excess_r * (pinch_centers[:, 1] / (r_pinch + 1e-8))
 
             # Dynamically compute steepest pitch physically reachable at R_obj
             # 5-DoF reach constraint: R_max(pitch) = 250.8 + 149 * cos(pitch)
@@ -1114,19 +1113,13 @@ class VectorizedSO101GraspSolver:
         is_standing_cylinder = geom["is_standing_cylinder"]
         is_flat_lying = geom["is_flat_lying"]
 
-        # Post-synthesis: enforce centroid snap and reach clamp on ALL grasps (CGN + synthetic)
-        # CGN grasps bypass _vectorized_antipodal_synthesis so they don't get centroid-snapped there
+        # Post-synthesis: enforce centroid snap to object XY COM for flat lying objects
+        # so grasp targets the center of the bottle (not butt or cap)
         if is_flat_lying:
             com_post = geom["com"]
             pc_all = T_grasps[:, :3, 3]
             pc_all[:, 0] = com_post[0]
             pc_all[:, 1] = com_post[1]
-            # Clamp to 390mm max radial reach for lying objects
-            r_all = np.hypot(pc_all[:, 0], pc_all[:, 1])
-            excess_r = np.maximum(0.0, r_all - 390.0)
-            scale = np.where(r_all > 1e-8, excess_r / (r_all + 1e-8), 0.0)
-            pc_all[:, 0] -= scale * pc_all[:, 0]
-            pc_all[:, 1] -= scale * pc_all[:, 1]
 
         # 1. Continuous Local-Frame Asymmetric Pincer Compensation
         T_wrist_targets, delta_lats, chosen_hypotheses = self.apply_local_asymmetric_offset(T_grasps, widths, Z_table, is_flat_lying=is_flat_lying)
@@ -1313,16 +1306,19 @@ class VectorizedSO101GraspSolver:
         D_max = IK_L1 + IK_L2 - 1.0
         D_min = abs(IK_L1 - IK_L2) + 1.0
 
-        # Reach boundary clamping: prevent IK_REJECT_UNREACHABLE on distant targets
-        # and eliminate overshooting/slumping past the bottle neck by pulling back rho_pivot
-        # strictly into the reachable 2-link boundary (D <= D_max - 2.0mm)
+        # Reach boundary evaluation:
+        # Enforce physical reachability strictly. Allow at most 2.0mm numerical pullback
+        # for floating-point roundoff at the envelope boundary. Distant targets out of reach
+        # must fail reach_mask so the pipeline correctly rejects them instead of grasping thin air.
+        orig_rho_pivot = rho_pivot.copy()
         max_rho_sq = np.maximum(0.0, (D_max - 2.0)**2 - z_pivot**2)
         max_rho = np.sqrt(max_rho_sq)
+        reach_valid = orig_rho_pivot <= (max_rho + 2.0)
         rho_pivot = np.minimum(rho_pivot, max_rho)
 
         D_sq = rho_pivot**2 + z_pivot**2
         D = np.sqrt(D_sq)
-        reach_mask = (D >= D_min) & (D <= D_max)
+        reach_mask = (D >= D_min) & (D <= D_max) & reach_valid
 
         cos_t2 = (D_sq - IK_L1**2 - IK_L2**2) / (2.0 * IK_L1 * IK_L2)
         cos_t2_clipped = np.clip(cos_t2, -1.0, 1.0)

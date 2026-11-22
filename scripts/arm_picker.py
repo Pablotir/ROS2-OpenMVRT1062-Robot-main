@@ -2639,14 +2639,20 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         is_3d_diagonal = False
 
     # Approach pitch calculation:
-    # - Upright bottle: 0.0° (strictly parallel to ground)
-    # Approach pitch calculation:
     # - Upright bottle: 0.0° (strictly parallel to ground, horizontal level approach)
-    # - Lying flat bottle: -85.0° (steep top-down grasp from directly above, claw perpendicular to tabletop)
+    # - Lying flat bottle: adaptive steep plunge (-68° to -85°).
+    #   At R > 260mm, Link 3 at -85° points straight down and caps forward reach at 261mm.
+    #   Using -68° to -72° lets Link 3 extend forward by 45-55mm to reach across the bottle!
     # - 3D diagonal bottle: -(90° - elev_deg), clamped strictly to [-85.0°, -45.0°]
     if is_lying_flat:
-        target_pitch = -85.0
-        pose_desc = f"LYING FLAT (top-down grasp, tabletop tilt={tilt_deg:+.1f}°, yaw={rel_table_deg:+.1f}°)"
+        r_est = math.hypot(mid_x_b, mid_y_b)
+        if r_est >= 300.0:
+            target_pitch = -68.0
+        elif r_est >= 265.0:
+            target_pitch = -72.0
+        else:
+            target_pitch = -85.0
+        pose_desc = f"LYING FLAT (top-down grasp, pitch={target_pitch:.1f}°, tabletop tilt={tilt_deg:+.1f}°, yaw={rel_table_deg:+.1f}°)"
     elif is_3d_diagonal:
         target_pitch = -float(np.clip(90.0 - elev_deg, 45.0, 85.0))
         pose_desc = f"3D DIAGONAL (elev={elev_deg:.1f}°, yaw={rel_table_deg:+.1f}°)"
@@ -3940,12 +3946,15 @@ def main():
                 # securely between the rubber gripper pads (~17mm clearance from rear servo face).
                 # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
                 if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
-                    # Table-resting objects (top-down or steep approach):
-                    # Zero radial pullback so gripper pads reach all the way to the bottle center (no undershoot/short fall)
+                    # Table-resting objects (steep top-down grasp):
+                    # Gripper rubber pads sit ~18-22mm behind claw tips.
+                    # Drive 20-25mm forward past the outer surface so the bottle enters the throat between the rubber pads!
                     penetration_candidates = [
-                        0.0,                       # Exact centroid reach
-                        5.0,                       # Slight positive penetration
-                        -5.0,                      # Minor fallback
+                        22.0,                      # Deep grip into throat (centered on rubber pads)
+                        18.0,                      # Strong grip
+                        12.0,                      # Moderate grip
+                        6.0,                       # Shallow grip
+                        0.0,                       # Surface contact fallback
                     ]
                 else:
                     # Upright bottle: level horizontal approach

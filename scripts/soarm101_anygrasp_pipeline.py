@@ -1366,6 +1366,11 @@ class VectorizedSO101GraspSolver:
         valid_mask = (reach_mask & table_clearance_mask & pan_mask & lift_mask &
                       elbow_mask & wrist_mask & roll_mask & dev_mask & width_mask)
 
+        if np.sum(valid_mask) == 0:
+            print(f"   ⚠️ [IK_FAIL_BREAKDOWN] reach={np.sum(reach_mask)}/{N} | table={np.sum(table_clearance_mask)}/{N} | "
+                  f"pan={np.sum(pan_mask)}/{N} | lift={np.sum(lift_mask)}/{N} | elb={np.sum(elbow_mask)}/{N} | wst={np.sum(wrist_mask)}/{N} | "
+                  f"roll={np.sum(roll_mask)}/{N} | dev={np.sum(dev_mask)}/{N} | width={np.sum(width_mask)}/{N}")
+
         ik_results = {
             "pan": pan_deg,
             "lift": lift_deg,

@@ -2679,9 +2679,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         if float(np.dot(J_vec, left_ref)) < 0.0:
             J_vec = -J_vec
 
-    # Slimmer neck identification and 3D grasp location
     target_px, target_py = (cx, cy)
-    if sizing is not None and "opt_px" in sizing:
+    if is_upright and sizing is not None and "opt_px" in sizing:
         target_px, target_py = sizing["opt_px"]
 
     # Direct 3D query at optimal grasp point (target_px, target_py):
@@ -2701,8 +2700,8 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
     if sizing is not None:
         body_w = sizing.get("grasp_width_mm", sizing.get("body_width_mm", 70.0))
     cyl_dia = float(np.clip(body_w, 45.0, 85.0))
-    # Table floor surface directly under the resting bottle (supports floor/low desks up to elevated risers):
-    live_table_z = float(np.clip(z_15pct - 5.0, -250.0, -80.0))
+    # Table floor surface directly under the resting bottle (table is physically between -220mm and -150mm):
+    live_table_z = float(np.clip(z_15pct - 5.0, -220.0, -80.0))
 
     if is_upright:
         # Upright standing bottle: stands vertically on tabletop from live_table_z to (live_table_z + h_calc).
@@ -2720,21 +2719,14 @@ def analyze_3d_orientation(cap, robot, bbox: tuple[int, int, int, int],
         midpoint_base = (mid_x_b, mid_y_b, safe_z_b)
     else:
         # Lying flat / diagonal bottle:
-        # Target the slimmer cone/cap section identified by size_up_object:
-        if pt_opt_b is not None:
-            target_xy = (float(pt_opt_b[0]), float(pt_opt_b[1]))
-            measured_z = float(pt_opt_b[2])
-        elif sizing is not None and "opt_px" in sizing:
-            target_xy = (float(closest_sample[3][0]), float(closest_sample[3][1]))
-            measured_z = float(closest_sample[3][2])
-        else:
-            target_xy = (float(midpoint_b[0]), float(midpoint_b[1]))
-            measured_z = float(midpoint_b[2])
+        # Target the 3D centroid of the bottle body (NEVER the base or cap end):
+        target_xy = (float(mid_x_b), float(mid_y_b))
+        measured_z = float(midpoint_b[2])
 
         # Live vertical grasp height:
-        # Bottle resting on tabletop/floor: the centerline of the neck cylinder is physically ~18mm above table surface.
-        safe_z_b = live_table_z + 18.0
-        safe_z_b = float(np.clip(safe_z_b, -240.0, -50.0))
+        # Bottle resting on tabletop: the centerline of the body cylinder is physically ~32mm above tabletop surface.
+        safe_z_b = live_table_z + 32.0
+        safe_z_b = float(np.clip(safe_z_b, -195.0, -50.0))
         midpoint_base = (float(target_xy[0]), float(target_xy[1]), float(safe_z_b))
 
     print(f"   📐 3D Orientation: {pose_desc} | Elev={elev_deg:.1f}°, TableYaw={rel_table_deg:+.1f}° | H-Span={h_span:.0f}mm, V-Span={v_span:.0f}mm")
@@ -3845,13 +3837,17 @@ def main():
                 # Size up object to determine dimensions & orientation
                 depth_raw, d_scale = cap.get_raw_depth() if hasattr(cap, "get_raw_depth") else (None, 0.001)
                 sizing = size_up_object(color_aligned, seg_mask, (x1_a, y1_a, x2_a, y2_a), depth_mm=280.0, target_desc=TARGET_DESC, depth_frame=depth_raw, depth_scale=d_scale)
-                if sizing is not None and "opt_px" in sizing:
+                tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
+                is_lying = abs(tilt_val) >= 40.0
+                if not is_lying and sizing is not None and "opt_px" in sizing:
                     obj_px, obj_py = sizing["opt_px"]
+                else:
+                    obj_px, obj_py = ((x1_a + x2_a) // 2, (y1_a + y2_a) // 2)
                 fit_status = "✅ Fits gripper" if sizing["fits_gripper"] else "⚠️ Body too wide — targeting narrow section"
                 print(f"   📏 Object Sized Up: Body={sizing['body_width_mm']}mm | Grasp={sizing['grasp_width_mm']}mm | "
                       f"Est Height={sizing['height_mm']}mm ({sizing['height_pct']:.0f}% height) | {fit_status}")
                 print(f"   📐 Orientation: Tilt={sizing['tilt_deg']:+.1f}° | Target Roll={sizing['recommended_roll_deg']:+.1f}° (Δroll={sizing['delta_roll_deg']:+.1f}°) | Recommended Pitch={sizing['recommended_pitch_deg']:+.1f}°")
-                print(f"   🎯 Slimmer Section Grasp Point: ({obj_px},{obj_py})")
+                print(f"   🎯 Target Grasp Point: ({obj_px},{obj_py}) (Centroid mode: {is_lying})")
 
                 # ── STEP 2: Get 3-D object position in camera space ────────────────
                 # Prefer mask-based depth (object pixels only) over point sampling.

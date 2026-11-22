@@ -3945,26 +3945,11 @@ def main():
                 # If 20mm is slightly out of reach, fall back to 16mm, 12mm, or 8mm.
                 if orient_3d.get("is_lying_flat") or orient_3d.get("is_3d_diagonal"):
                     # Table-resting objects (top-down or steep approach):
-                    # Pull back along the reach line so the gripper pads land squarely
-                    # over the resting bottle neck without overshooting past it into empty air.
-                    # Base pullback of 15.0mm aligns the rubber pads (which sit behind the fingertips) with the bottle.
-                    # Farther bottles (raw_dist > 260mm) receive proportional extra pullback to keep reach inside
-                    # the ~255-260mm physical sweet spot where steep (-85°) top-down grasp is reachable.
-                    mid_base = orient_3d.get("midpoint_base")
-                    raw_dist = math.hypot(mid_base[0], mid_base[1]) if mid_base is not None else 250.0
-
-                    base_pullback = 15.0
-                    excess_dist = max(0.0, raw_dist - 260.0)
-                    needed_pullback = base_pullback + excess_dist
-                    scaled_pullback = float(np.clip(needed_pullback, 15.0, 50.0))
-
-                    flat_rad_offset = -scaled_pullback
+                    # Zero radial pullback so gripper pads reach all the way to the bottle center (no undershoot/short fall)
                     penetration_candidates = [
-                        flat_rad_offset,           # Optimal pullback into sweet spot
-                        flat_rad_offset + 5.0,     # fallback
-                        flat_rad_offset + 10.0,    # fallback
-                        flat_rad_offset + 15.0,    # fallback
-                        0.0,                       # neutral zero fallback
+                        0.0,                       # Exact centroid reach
+                        5.0,                       # Slight positive penetration
+                        -5.0,                      # Minor fallback
                     ]
                 else:
                     # Upright bottle: level horizontal approach
@@ -4043,15 +4028,12 @@ def main():
                     tilt_val = sizing.get("tilt_deg", 0.0) if sizing is not None else 0.0
                     body_w = sizing.get("body_width_mm", 40.0) if sizing is not None else 40.0
                     grasp_w = sizing.get("grasp_width_mm", body_w) if sizing is not None else body_w
-                    if orient_3d.get("is_upright") or abs(target_pitch) > 60.0:
-                        target_w = grasp_w if orient_3d.get("is_upright") else body_w
+                    if orient_3d.get("is_upright") and abs(target_pitch) < 45.0:
+                        target_w = grasp_w
                         lat_offset = target_w / 2.0 + 3.0   # Static tip touches bottle with 3mm clearance (matches simulation)
-                    elif abs(tilt_val) >= 55.0:
-                        lat_offset = GRAB_LATERAL_OFFSET_HORIZONTAL_MM # 50.0mm for horizontal flat
-                    elif tilt_val <= -20.0:
-                        lat_offset = GRAB_LATERAL_OFFSET_RIGHT_MM      # 35.0mm for pointed-right
                     else:
-                        lat_offset = GRAB_LATERAL_OFFSET_MM            # 40.0mm for vertical flat
+                        # Top-down plunge or angled table grasp: zero lateral offset so jaws descend squarely on centroid
+                        lat_offset = 0.0
 
                     if abs(lat_offset) > 0.01:
                         pan_t = math.atan2(arm_y, arm_x)

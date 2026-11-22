@@ -970,7 +970,7 @@ class PretrainedGraspEngine:
             # Snap all pinch centers to the 3D Centre-of-Mass projected onto the table plane
             # so the gripper always targets the middle of the cylinder body — never the butt or cap end.
             # Only the approach pitch/roll varies across candidates; XYZ is uniform at body center.
-            target_z = float(np.clip(np.median(P_obj[:, 2]), tbl_ref + 18.0, tbl_ref + 25.0))
+            target_z = float(np.clip(np.median(P_obj[:, 2]), tbl_ref + 25.0, tbl_ref + 38.0))
             pinch_centers[:, 0] = com[0]   # snap X to centroid (eliminates butt/cap endpoint bias)
             pinch_centers[:, 1] = com[1]   # snap Y to centroid
             pinch_centers[:, 2] = target_z
@@ -1349,9 +1349,10 @@ class VectorizedSO101GraspSolver:
         lowest_finger_z = (zw + 15.0 * z_proj_hat[:, 2] 
                            - 0.5 * w_val * np.abs(x_closing[:, 2]) 
                            - 8.0 * np.abs(y_thickness[:, 2]))
-        # Allow compliance margin (-5.0mm) for flat table-resting items so silicone jaws can enclose object without false safety trips
-        margin = -5.0 if is_flat_lying else self.table_z_margin_mm
-        table_clearance_mask = lowest_finger_z >= (Z_table + margin)
+        # Allow compliance margin (-25.0mm) for flat table-resting items so silicone jaws can enclose object without false safety trips
+        margin = -25.0 if is_flat_lying else self.table_z_margin_mm
+        hub_clearance = (zw >= (Z_table + 10.0)) if is_flat_lying else True
+        table_clearance_mask = (lowest_finger_z >= (Z_table + margin)) & hub_clearance
 
         # 7. Hardware Servo Limit Masks & Gripper Stroke Filter
         pan_mask   = (pan_deg >= PAN_MIN_DEG) & (pan_deg <= PAN_MAX_DEG)
